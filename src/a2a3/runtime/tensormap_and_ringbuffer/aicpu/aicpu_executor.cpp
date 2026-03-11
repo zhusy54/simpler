@@ -1673,12 +1673,16 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
         always_assert(rt != nullptr);
         int32_t completed = resolve_and_dispatch_pto2(runtime, thread_idx);
         DEV_INFO("Thread %d: Executed %d tasks from runtime", thread_idx, completed);
+    }
 
-        // After transition, use new core assignments for shutdown
+    // Shutdown AICore cores assigned to this thread.
+    // This must run unconditionally — if a thread skips the dispatch loop
+    // (e.g., orchestrator arriving after completed_ is set), its assigned
+    // cores still need the exit signal to avoid hanging AICore threads.
+    {
         const int32_t* shutdown_cores = core_assignments_[thread_idx];
         int32_t shutdown_count = core_count_per_thread_[thread_idx];
 #if PTO2_PROFILING
-        // Benchmark: record scheduler end timestamp before shutdown cleanup
         DEV_ALWAYS("Thread=%d end=%llu",
                    thread_idx, (unsigned long long)get_sys_cnt_aicpu());
 #endif
