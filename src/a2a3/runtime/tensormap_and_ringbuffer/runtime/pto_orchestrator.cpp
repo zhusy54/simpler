@@ -353,8 +353,9 @@ void pto2_submit_mixed_task(
         __builtin_prefetch(&payload->tensors[i], 1, 3);
         __builtin_prefetch(reinterpret_cast<char*>(&payload->tensors[i]) + 64, 1, 3);
     }
-    for (int32_t i = 0; i < params.scalar_count; i += 8) {
-        __builtin_prefetch(&payload->scalars[i], 1, 3);
+    // Prefetch dispatch.args[] area (scalar values written directly here)
+    for (int32_t j = 0; j < params.scalar_count; j += 8) {
+        __builtin_prefetch(&payload->dispatch.args[params.tensor_count + j], 1, 3);
     }
     __builtin_prefetch(payload, 1, 3);
     __builtin_prefetch(reinterpret_cast<char*>(payload) + 64, 1, 3);
@@ -375,7 +376,8 @@ void pto2_submit_mixed_task(
         slot_state.task = &task;
         slot_state.active_mask = active_mask;
         slot_state.subtask_done_mask.store(0, std::memory_order_relaxed);
-        slot_state.ring_id = ring_id;
+        slot_state.ring_id = static_cast<uint8_t>(ring_id);
+        slot_state.slot_in_ring = static_cast<uint32_t>(slot);
         scope_tasks_push(orch, &slot_state);
     } else {
         scope_tasks_push(orch, nullptr);
@@ -519,7 +521,7 @@ void pto2_submit_mixed_task(
         }
     }
 
-    payload->init(params);
+    payload->init(params, orch->func_id_to_addr, orch->func_id_count, task.kernel_id);
 
     CYCLE_COUNT_LAP_RECORD(g_orch_params_cycle, AicpuPhaseId::ORCH_PARAMS, local_id);
 #if PTO2_ORCH_PROFILING

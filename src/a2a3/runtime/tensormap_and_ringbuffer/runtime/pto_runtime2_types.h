@@ -21,6 +21,7 @@
 
 #include "pto_types.h"
 #include "pto_submit_types.h"
+#include "pto2_dispatch_payload.h"
 
 // =============================================================================
 // Profiling Configuration
@@ -68,6 +69,7 @@
 
 // Scheduler errors (100+): detected in scheduler threads
 #define PTO2_ERROR_SCHEDULER_TIMEOUT          100
+#define PTO2_ERROR_ENCODING_OVERFLOW          101
 
 // =============================================================================
 // Configuration Constants
@@ -358,9 +360,14 @@ struct PTO2TaskDescriptor {
  * Task payload data (cold path - only accessed during orchestration and dispatch)
  *
  * Layout: metadata (counts, fanin pointers) packed in the first 3 cache lines,
- * followed by bulk tensor and scalar data. This gives sequential write access
- * during orchestration and groups scheduler-hot fields (fanin_actual_count +
- * fanin_slot_states) together for on_task_release.
+ * followed by the dispatch descriptor and bulk tensor data. Scalar values are
+ * written directly into dispatch.args[] (after tensor pointers), eliminating the
+ * separate scalars[] array.
+ *
+ * The Scheduler never reads this struct — it only encodes a flat byte offset
+ * and slot_idx into the DATA_MAIN_BASE register. AICore computes the dispatch
+ * desc address from a cached base address and reads dispatch.function_bin_addrs[]
+ * + dispatch.args[] directly.
  */
 struct PTO2TaskPayload {
     // === Cache line 0 (64B) — metadata ===
@@ -369,23 +376,48 @@ struct PTO2TaskPayload {
     int32_t fanin_actual_count{0};             // Actual fanin count (without the +1 redundance)
     int32_t _reserved{0};                      // Reserved (dep_pool_mark moved to SlotState for local access)
     PTO2TaskSlotState* fanin_slot_states[PTO2_MAX_INPUTS]; // Producer slot states (used by on_task_release)
-    // === Cache lines 3-34 (2048B) — tensors (alignas(64) forces alignment) ===
+    // === Dispatch descriptor (1048B) — built by Orchestrator, read by AICore ===
+    PTO2DispatchDesc dispatch;
+    // === Tensors (2048B) — alignas(64) Tensor forces alignment ===
     Tensor tensors[PTO2_MAX_TENSOR_PARAMS];
-    // === Cache lines 35-50 (1024B) — scalars ===
-    uint64_t scalars[PTO2_MAX_SCALAR_PARAMS];
 
-    void init(const PTOParam& params) {
+    /**
+     * Initialize payload: copy tensors, build dispatch descriptor.
+     *
+     * @param params            Task parameters (tensors + scalars)
+     * @param func_id_to_addr   Kernel ID → GM function address mapping
+     * @param func_id_count     Number of entries in func_id_to_addr (for bounds check)
+     * @param kernel_ids        Per-slot kernel IDs (AIC, AIV0, AIV1); <0 = inactive
+     */
+    void init(const PTOParam& params,
+              const uint64_t* func_id_to_addr,
+              int32_t func_id_count,
+              const int32_t kernel_ids[PTO2_SUBTASK_SLOT_COUNT]) {
         tensor_count = params.tensor_count;
         scalar_count = params.scalar_count;
+
+        // 1. Copy tensors from PTOParam
         auto src_tensors = params.tensors;
         for (int32_t i = 0; i < params.tensor_count; i++) {
             tensors[i].copy(*src_tensors[i]);
         }
-        static_assert(sizeof(scalars) == sizeof(params.scalars));
-        // Round up to cache line boundary. Both arrays are 1024B so no overrun.
-        // Eliminates branches; extra bytes within the same CL have zero additional cost.
-        memcpy(scalars, params.scalars,
-               PTO2_ALIGN_UP(params.scalar_count * sizeof(uint64_t), 64));
+
+        // 2. Fill per-slot function addresses (0 for inactive or out-of-range slots)
+        for (int32_t s = 0; s < PTO2_SUBTASK_SLOT_COUNT; s++) {
+            int32_t kid = kernel_ids[s];
+            dispatch.function_bin_addrs[s] =
+                (kid >= 0 && kid < func_id_count) ? func_id_to_addr[kid] : 0;
+        }
+
+        // 3. Build dispatch.args[]: tensor pointers first, then scalar values
+        int32_t n = 0;
+        for (int32_t i = 0; i < params.tensor_count; i++) {
+            tensors[i].update_start_offset();
+            dispatch.args[n++] = reinterpret_cast<uint64_t>(&tensors[i]);
+        }
+        for (int32_t i = 0; i < params.scalar_count; i++) {
+            dispatch.args[n++] = params.scalars[i];
+        }
     }
 };
 
@@ -427,6 +459,7 @@ struct alignas(64) PTO2TaskSlotState {
     std::atomic<uint8_t> subtask_done_mask;      // Each subtask sets its done bit on completion
     uint8_t ring_id;                             // Ring layer this task belongs to (for per-ring reclamation)
     int32_t dep_pool_mark{0};                    // Dep pool top after this task's submission (orchestrator-only, local memory)
+    uint32_t slot_in_ring;                       // Index into task_payloads[ring_id][] (for register encoding)
 };
 
 static_assert(sizeof(PTO2TaskSlotState) == 64);

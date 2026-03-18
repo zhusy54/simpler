@@ -96,6 +96,11 @@ struct alignas(PTO2_ALIGN_SIZE) PTO2SharedMemoryHeader {
     std::atomic<uint64_t> graph_output_ptr;   // Address where final output was written (packed buffer)
     std::atomic<uint64_t> graph_output_size;  // Size in bytes
 
+    // === DISPATCH INIT INFO (GM-resident, read by AICore at startup) ===
+    // Must live in shared memory (GM) because AICore cannot access AICPU-local memory.
+    // Written by AICPU after PTO2Runtime creation; AICore caches the values once.
+    PTO2DispatchInitInfo dispatch_init_info;
+
     // === ERROR REPORTING ===
 
     // Orchestrator fatal error code (Orchestrator → Scheduler, AICPU → Host)
