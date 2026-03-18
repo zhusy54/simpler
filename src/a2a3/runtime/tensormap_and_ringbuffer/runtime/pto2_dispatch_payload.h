@@ -64,7 +64,8 @@ constexpr uint32_t PTO2_REG_MAX_OFFSET_FIELD   = 0x0FFFFFFBu;  // sentinel-safe 
  */
 static inline uint32_t pto2_reg_encode(uint64_t desc_byte_offset,
                                        uint32_t slot_idx, uint32_t toggle) {
-    uint32_t offset_field = static_cast<uint32_t>((desc_byte_offset >> PTO2_REG_ALIGN_SHIFT) + 1);
+    uint64_t offset_field_64 = (desc_byte_offset >> PTO2_REG_ALIGN_SHIFT) + 1;
+    uint32_t offset_field = static_cast<uint32_t>(offset_field_64);
     return (offset_field << PTO2_REG_OFFSET_SHIFT)
          | slot_idx
          | toggle;

@@ -488,16 +488,16 @@ struct AicpuExecutor {
         // Compute flat byte offset of dispatch descriptor from global base.
         uint64_t desc_addr = reinterpret_cast<uint64_t>(&slot_state.payload->dispatch);
         uint64_t desc_byte_offset = desc_addr - dispatch_base_;
-        uint32_t offset_field = static_cast<uint32_t>((desc_byte_offset >> PTO2_REG_ALIGN_SHIFT) + 1);
+        uint64_t offset_field_64 = (desc_byte_offset >> PTO2_REG_ALIGN_SHIFT) + 1;
 
         // Overflow check: offset_field must not exceed sentinel-safe upper bound.
         // If it does, the encoded register value would collide with AICORE_EXIT_SIGNAL
         // or AICORE_IDLE_TASK_ID, causing AICore to misinterpret the dispatch.
-        if (offset_field > PTO2_REG_MAX_OFFSET_FIELD) {
-            DEV_ERROR("PTO2 REG ENCODING OVERFLOW: offset_field=0x%x exceeds max 0x%x. "
+        if (offset_field_64 > PTO2_REG_MAX_OFFSET_FIELD) {
+            DEV_ERROR("PTO2 REG ENCODING OVERFLOW: offset_field=0x%llx exceeds max 0x%x. "
                       "desc_byte_offset=0x%llx ring_id=%u slot_in_ring=%u core=%d subslot=%u. "
                       "Reduce task_window_size or shared memory size.",
-                      offset_field, PTO2_REG_MAX_OFFSET_FIELD,
+                      (unsigned long long)offset_field_64, PTO2_REG_MAX_OFFSET_FIELD,
                       (unsigned long long)desc_byte_offset,
                       (unsigned)slot_state.ring_id, (unsigned)slot_state.slot_in_ring,
                       core_id, (unsigned)static_cast<uint32_t>(subslot));
