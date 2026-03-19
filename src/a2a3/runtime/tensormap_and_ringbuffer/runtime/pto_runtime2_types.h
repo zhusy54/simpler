@@ -69,7 +69,6 @@
 
 // Scheduler errors (100+): detected in scheduler threads
 #define PTO2_ERROR_SCHEDULER_TIMEOUT          100
-#define PTO2_ERROR_ENCODING_OVERFLOW          101
 
 // =============================================================================
 // Configuration Constants

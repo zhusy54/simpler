@@ -45,15 +45,12 @@ __aicore__ __attribute__((always_inline)) static void execute_task(
  * Implements the AICPU-AICore register-based dispatch protocol:
  * 1. Wait for AICPU ready signal via handshake buffer
  * 2. Report physical core ID and core type, signal AICore ready
- * 3. Read PTO2DispatchInitInfo from hank->task (one-shot, wait for non-zero)
+ * 3. Read per-core PTO2DispatchDesc pointer from hank->task (wait for non-zero)
  * 4. Poll DATA_MAIN_BASE register for task dispatch until exit signal
  *
  * Register encoding (set by AICPU scheduler) — see pto2_dispatch_payload.h:
- *   bit  [30]   = toggle bit (alternates per core, ignored during decode)
- *   bits [29:2] = offset_field = (desc_byte_offset >> 3) + 1  (28 bits, 0 = idle)
+ *   bits [31:2] = reg_task_id (monotonically increasing per core)
  *   bits [1:0]  = slot_idx  (2 bits: 0=AIC, 1=AIV0, 2=AIV1)
- *
- * Dispatch desc address = dispatch_base + decoded byte offset
  *
  * @param runtime Pointer to Runtime in global memory
  * @param block_idx Block index (core ID)
@@ -79,31 +76,18 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
 
     // Phase 3: Report core type, signal ready
     my_hank->core_type = core_type;
-    STORE_RELEASE_FENCE();
-    my_hank->aicore_done = block_idx + 1;  // Signal ready (use block_idx + 1 to avoid 0)
+    my_hank->aicore_done = 1;
+    dcci(&my_hank->aicore_done, SINGLE_CACHE_LINE, CACHELINE_OUT);
 
-    dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
-
-    // Phase 3.5: Cache dispatch init info from AICPU.
-    //
-    // Why this wait is necessary:
-    //   hank->task is set to 0 during handshake (Phase 1) because
-    //   PTO2DispatchInitInfo requires shared memory addresses that don't
-    //   exist yet — PTO2Runtime is created AFTER handshake completes.
-    //   AICPU writes &init_info to hank->task once PTO2Runtime is ready.
-    //   dcci is needed because hank->task lives in GM; without cache
-    //   invalidation, AICore would keep reading a stale cached zero.
+    // Phase 3.5: Wait for per-core dispatch descriptor pointer from AICPU.
+    // AICPU writes &s_dispatch_desc_per_core[i] to hank->task after PTO2Runtime
+    // is created. AICore caches this pointer for the entire execution lifetime.
     while (my_hank->task == 0) {
         dcci(my_hank, SINGLE_CACHE_LINE);
     }
-    __gm__ PTO2DispatchInitInfo* init_info =
-        reinterpret_cast<__gm__ PTO2DispatchInitInfo*>(my_hank->task);
-    // init_info points to a separate GM object — invalidate its cache line
-    // so we read the values AICPU wrote, not stale data.
-    dcci(init_info, SINGLE_CACHE_LINE);
-
-    uint64_t dispatch_base = init_info->dispatch_base;
-    my_hank->task = 0;  // Clear after reading (no longer needed)
+    __gm__ PTO2DispatchDesc* my_desc =
+        reinterpret_cast<__gm__ PTO2DispatchDesc*>(my_hank->task);
+    my_hank->task = 0;
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
 
     bool profiling_enabled = runtime->enable_profiling;
@@ -128,19 +112,11 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
         }
 
         {
-            // Decode register value using named constants from pto2_dispatch_payload.h.
-            // Inline decode instead of calling pto2_reg_decode_*() because ccec does not
-            // allow [aicore] code to call [host]-annotated functions.
-            uint32_t offset_field = (reg_val >> PTO2_REG_OFFSET_SHIFT) & PTO2_REG_OFFSET_MASK;
-            uint64_t desc_byte_offset = static_cast<uint64_t>(offset_field - 1) << PTO2_REG_ALIGN_SHIFT;
+            // Decode slot_idx from register value (inline, ccec cannot call host functions)
             uint32_t slot_idx = reg_val & PTO2_REG_SLOTIDX_MASK;
 
-            // Compute dispatch descriptor address from cached base + decoded offset
-            __gm__ PTO2DispatchDesc* desc = reinterpret_cast<__gm__ PTO2DispatchDesc*>(
-                dispatch_base + desc_byte_offset);
-
             // Invalidate data cache to ensure fresh read of dispatch descriptor
-            dcci(desc, ENTIRE_DATA_CACHE);
+            dcci(my_desc, ENTIRE_DATA_CACHE);
 
             write_reg(RegId::COND, MAKE_ACK_VALUE(reg_val));
 
@@ -148,7 +124,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
             uint64_t start_time = get_sys_cnt_aicore();
 
             // Execute the task
-            execute_task(desc, slot_idx);
+            execute_task(my_desc, slot_idx);
 
             // Performance profiling: record task execution
             if (profiling_enabled) {

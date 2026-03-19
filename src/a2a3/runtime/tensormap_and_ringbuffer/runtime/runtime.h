@@ -71,7 +71,7 @@ constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 
  * Field Access Patterns:
  * - aicpu_ready: Written by AICPU, read by AICore
  * - aicore_done: Written by AICore, read by AICPU
- * - task: Written by AICPU, read by AICore (0 = not ready, non-zero = PTO2DispatchInitInfo*)
+ * - task: Written by AICPU, read by AICore (0 = not ready, non-zero = PTO2DispatchDesc*)
  * - task_status: Written by both (AICPU=1 on dispatch, AICore=0 on completion)
  * - control: Written by AICPU, read by AICore (0 = continue, 1 = quit)
  * - core_type: Written by AICPU, read by AICore (CoreType::AIC or CoreType::AIV)
@@ -79,7 +79,7 @@ constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 
 struct Handshake {
     volatile uint32_t aicpu_ready;         // AICPU ready signal: 0=not ready, 1=ready
     volatile uint32_t aicore_done;         // AICore ready signal: 0=not ready, core_id+1=ready
-    volatile uint64_t task;                // Init: PTO2DispatchInitInfo* (0 until ready); runtime: unused
+    volatile uint64_t task;                // Init: PTO2DispatchDesc* (0 until ready); runtime: unused
     volatile int32_t task_status;          // Task execution status: 0=idle, 1=busy
     volatile int32_t control;              // Control signal: 0=execute, 1=quit
     volatile CoreType core_type;           // Core type: CoreType::AIC or CoreType::AIV

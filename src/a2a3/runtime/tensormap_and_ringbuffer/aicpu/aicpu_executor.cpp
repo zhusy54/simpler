@@ -70,6 +70,10 @@ constexpr int32_t PROGRESS_LOG_INTERVAL = 250;      // log every N completions a
 
 static PTO2Runtime *rt{nullptr};
 
+// Per-core dispatch descriptor array. AICPU copies the PTO2DispatchDesc here
+// before each dispatch; AICore caches a pointer to its slot at startup.
+static PTO2DispatchDesc s_dispatch_desc_per_core[RUNTIME_MAX_WORKER];
+
 // Core information for discovery (with register address for fast dispatch)
 struct CoreInfo {
     int32_t worker_id;              // Index in runtime.workers[]
@@ -183,16 +187,9 @@ struct AicpuExecutor {
     uint64_t regs_{0};
 
     // Track executing register value per core (0 = idle).
-    // The register value encodes a flat byte offset + slot_idx + toggle bit.
     int32_t executing_reg_task_ids_[MAX_AICPU_THREADS][MAX_CORES_PER_THREAD];
-    // Per-core toggle bit to guarantee consecutive dispatches differ in reg_val.
-    // Without this, ring buffer wrap-around could produce identical encodings.
-    uint32_t dispatch_toggle_by_core_[RUNTIME_MAX_WORKER]{};
-    // Dispatch base address: address of ring 0's first PTO2DispatchDesc.
-    // Used to compute byte offsets for register encoding.
-    uint64_t dispatch_base_{0};
-    // Shared memory header for error reporting during dispatch.
-    PTO2SharedMemoryHeader* sm_header_{nullptr};
+    // Per-core monotonic reg_task_id counter for unique register values.
+    uint32_t dispatch_seq_by_core_[RUNTIME_MAX_WORKER]{};
     CoreStateTracker trackers_[MAX_AICPU_THREADS];
 
     // ===== Task queue state (managed by scheduler ready queues) =====
@@ -474,8 +471,8 @@ struct AicpuExecutor {
     }
 
     /**
-     * Dispatch a subtask to an AICore and encode the register value.
-     * Returns true on success, false on fatal encoding overflow (emergency shutdown initiated).
+     * Dispatch a subtask to an AICore: copy descriptor and write register.
+     * Always returns true.
      */
     bool dispatch_subtask_to_core(
         Runtime* runtime, CoreStateTracker& tracker, int32_t* executing_reg_task_ids,
@@ -485,29 +482,9 @@ struct AicpuExecutor {
         , bool profiling_enabled, int32_t thread_idx
 #endif
     ) {
-        // Compute flat byte offset of dispatch descriptor from global base.
-        uint64_t desc_addr = reinterpret_cast<uint64_t>(&slot_state.payload->dispatch);
-        uint64_t desc_byte_offset = desc_addr - dispatch_base_;
-        uint64_t offset_field_64 = (desc_byte_offset >> PTO2_REG_ALIGN_SHIFT) + 1;
-
-        // Overflow check: offset_field must not exceed sentinel-safe upper bound.
-        // If it does, the encoded register value would collide with AICORE_EXIT_SIGNAL
-        // or AICORE_IDLE_TASK_ID, causing AICore to misinterpret the dispatch.
-        if (offset_field_64 > PTO2_REG_MAX_OFFSET_FIELD) {
-            DEV_ERROR("PTO2 REG ENCODING OVERFLOW: offset_field=0x%llx exceeds max 0x%x. "
-                      "desc_byte_offset=0x%llx ring_id=%u slot_in_ring=%u core=%d subslot=%u. "
-                      "Reduce task_window_size or shared memory size.",
-                      (unsigned long long)offset_field_64, PTO2_REG_MAX_OFFSET_FIELD,
-                      (unsigned long long)desc_byte_offset,
-                      (unsigned)slot_state.ring_id, (unsigned)slot_state.slot_in_ring,
-                      core_id, (unsigned)static_cast<uint32_t>(subslot));
-            if (sm_header_) {
-                sm_header_->sched_error_code.store(PTO2_ERROR_ENCODING_OVERFLOW, std::memory_order_release);
-            }
-            emergency_shutdown(runtime);
-            completed_.store(true, std::memory_order_release);
-            return false;
-        }
+        // Copy dispatch descriptor to per-core static slot.
+        memcpy(&s_dispatch_desc_per_core[core_id],
+               &slot_state.payload->dispatch, sizeof(PTO2DispatchDesc));
 
         executing_subslot_by_core_[core_id] = subslot;
         executing_slot_state_by_core_[core_id] = &slot_state;
@@ -521,14 +498,12 @@ struct AicpuExecutor {
             core_dispatch_counts_[core_id]++;
         }
 #endif
-        // Encode flat byte offset + slot_idx into register value.
-        // Toggle bit ensures consecutive dispatches to the same core always differ,
-        // preventing the AICore last_reg_val duplicate check from skipping a dispatch
-        // when the ring buffer wraps and the same slot is reused for the same core.
+        // Encode reg_val = (reg_task_id << 2) | slot_idx.
+        // Monotonic reg_task_id ensures consecutive dispatches to the same core
+        // always produce different reg_val, preventing AICore duplicate-skip.
         uint32_t slot_idx = static_cast<uint32_t>(subslot);
-        dispatch_toggle_by_core_[core_id] ^= (1u << PTO2_REG_TOGGLE_BIT);
-        uint32_t reg_val = pto2_reg_encode(
-            desc_byte_offset, slot_idx, dispatch_toggle_by_core_[core_id]);
+        dispatch_seq_by_core_[core_id] = pto2_next_reg_task_id(dispatch_seq_by_core_[core_id]);
+        uint32_t reg_val = pto2_reg_encode(dispatch_seq_by_core_[core_id], slot_idx);
         write_reg(core_id_to_reg_addr_[core_id], RegId::DATA_MAIN_BASE, static_cast<uint64_t>(reg_val));
         executing_reg_task_ids[core_id] = static_cast<int32_t>(reg_val);
 
@@ -872,9 +847,8 @@ int32_t AicpuExecutor::init(Runtime* runtime) {
     // Clear per-core dispatch payloads and subslot tracking
     memset(executing_subslot_by_core_, 0, sizeof(executing_subslot_by_core_));
     memset(executing_slot_state_by_core_, 0, sizeof(executing_slot_state_by_core_));
-    memset(dispatch_toggle_by_core_, 0, sizeof(dispatch_toggle_by_core_));
-    dispatch_base_ = 0;
-    sm_header_ = nullptr;
+    memset(dispatch_seq_by_core_, 0, sizeof(dispatch_seq_by_core_));
+    memset(s_dispatch_desc_per_core, 0, sizeof(s_dispatch_desc_per_core));
 
     DEV_INFO("Init: PTO2 mode, task count from shared memory");
 
@@ -1722,24 +1696,12 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                     rt->orchestrators[i].func_id_count = RUNTIME_MAX_FUNC_ID;
                 }
 
-                // Build dispatch init info in shared memory (GM) for AICore.
-                // IMPORTANT: dispatch_init_info MUST live in GM because AICore cannot
-                // access AICPU-local memory on hardware. The shared memory header is
-                // allocated in GM, so sm_handle->header->dispatch_init_info is accessible.
-                // AICore caches dispatch_base at startup, then computes dispatch desc
-                // address as: dispatch_base + decoded_byte_offset
-                PTO2DispatchInitInfo& init_info = sm_handle->header->dispatch_init_info;
-                dispatch_base_ = reinterpret_cast<uint64_t>(sm_handle->task_payloads[0]) +
-                    offsetof(PTO2TaskPayload, dispatch);
-                init_info.dispatch_base = dispatch_base_;
-                sm_header_ = sm_handle->header;
-
-                // Publish dispatch init info to all AICore handshakes.
-                // AICore waits for hank->task != 0 before reading.
+                // Publish per-core dispatch descriptor pointers to AICore.
+                // AICore waits for hank->task != 0, caches the pointer, then clears it.
                 {
                     Handshake* hank = static_cast<Handshake*>(runtime->workers);
                     for (int32_t i = 0; i < cores_total_num_; i++) {
-                        hank[i].task = reinterpret_cast<uint64_t>(&init_info);
+                        hank[i].task = reinterpret_cast<uint64_t>(&s_dispatch_desc_per_core[i]);
                     }
                 }
 
@@ -2052,9 +2014,8 @@ void AicpuExecutor::deinit(Runtime* runtime) {
     // Clear per-core subslot tracking
     memset(executing_subslot_by_core_, 0, sizeof(executing_subslot_by_core_));
     memset(executing_slot_state_by_core_, 0, sizeof(executing_slot_state_by_core_));
-    memset(dispatch_toggle_by_core_, 0, sizeof(dispatch_toggle_by_core_));
-    dispatch_base_ = 0;
-    sm_header_ = nullptr;
+    memset(dispatch_seq_by_core_, 0, sizeof(dispatch_seq_by_core_));
+    memset(s_dispatch_desc_per_core, 0, sizeof(s_dispatch_desc_per_core));
 
     completed_tasks_.store(0, std::memory_order_release);
     total_tasks_ = 0;
