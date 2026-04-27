@@ -23,6 +23,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <algorithm>
 #include "acl/acl.h"
 
 // Include HAL constants from CANN (header only, library loaded dynamically)
@@ -790,54 +791,79 @@ int DeviceRunner::prepare_orch_so(Runtime &runtime) {
     runtime.pending_orch_so_data_ = nullptr;
     runtime.pending_orch_so_size_ = 0;
 
+    uint64_t evict_hash = 0;
+
     if (host_so_data == nullptr || host_so_size == 0) {
         // Host-orchestration mode (no device SO needed).
-        runtime.set_dev_orch_so(0, 0, false);
+        runtime.set_dev_orch_so(0, 0, 0, false);
+        runtime.set_evict_orch_so_hash(0);
         return 0;
     }
 
     const uint64_t new_hash = simpler::common::utils::elf_build_id_64(host_so_data, host_so_size);
+    bool h2d_performed = false;
 
-    if (new_hash == cached_orch_so_hash_ && dev_orch_so_buffer_ != nullptr) {
+    auto it = orch_so_cache_.find(new_hash);
+    if (it != orch_so_cache_.end()) {
+        // Cache HIT — reuse existing device buffer, skip H2D.
         LOG_INFO("Orch SO cache hit (hash=0x%lx, %zu bytes)", new_hash, host_so_size);
-        runtime.set_dev_orch_so(reinterpret_cast<uint64_t>(dev_orch_so_buffer_), host_so_size, /*is_new=*/false);
-        return 0;
-    }
-
-    if (host_so_size > dev_orch_so_capacity_) {
-        if (dev_orch_so_buffer_ != nullptr) {
-            mem_alloc_.free(dev_orch_so_buffer_);
-            dev_orch_so_buffer_ = nullptr;
-            dev_orch_so_capacity_ = 0;
-        }
-        dev_orch_so_buffer_ = mem_alloc_.alloc(host_so_size);
-        if (dev_orch_so_buffer_ == nullptr) {
+        // Move to end of FIFO to avoid eviction.
+        orch_so_cache_order_.erase(
+            std::remove(orch_so_cache_order_.begin(), orch_so_cache_order_.end(), new_hash), orch_so_cache_order_.end()
+        );
+        orch_so_cache_order_.push_back(new_hash);
+    } else {
+        // Cache MISS — allocate device buffer and H2D.
+        SoCacheEntry entry;
+        entry.dev_buffer = mem_alloc_.alloc(host_so_size);
+        if (entry.dev_buffer == nullptr) {
             LOG_ERROR("Failed to allocate %zu bytes for orchestration SO buffer", host_so_size);
-            cached_orch_so_hash_ = 0;
+            runtime.set_dev_orch_so(0, 0, new_hash, false);
+            runtime.set_evict_orch_so_hash(0);
             return -1;
         }
-        dev_orch_so_capacity_ = host_so_size;
+        entry.capacity = host_so_size;
+        entry.host_copy.assign(
+            static_cast<const uint8_t *>(host_so_data), static_cast<const uint8_t *>(host_so_data) + host_so_size
+        );
+
+        int rc =
+            rtMemcpy(entry.dev_buffer, entry.capacity, entry.host_copy.data(), host_so_size, RT_MEMCPY_HOST_TO_DEVICE);
+        if (rc != 0) {
+            LOG_ERROR("rtMemcpy for orchestration SO failed: %d", rc);
+            mem_alloc_.free(entry.dev_buffer);
+            runtime.set_dev_orch_so(0, 0, new_hash, false);
+            runtime.set_evict_orch_so_hash(0);
+            return rc;
+        }
+
+        h2d_performed = true;
+        orch_so_cache_[new_hash] = std::move(entry);
+        orch_so_cache_order_.push_back(new_hash);
+        LOG_INFO(
+            "Orch SO cache miss (hash=0x%lx, %zu bytes uploaded, entries=%zu)", new_hash, host_so_size,
+            orch_so_cache_.size()
+        );
+
+        // FIFO eviction: remove the oldest entry if over capacity.
+        while (orch_so_cache_.size() > ORCH_SO_CACHE_MAX_ENTRIES) {
+            evict_hash = orch_so_cache_order_.front();
+            orch_so_cache_order_.pop_front();
+            auto evict_it = orch_so_cache_.find(evict_hash);
+            if (evict_it != orch_so_cache_.end()) {
+                if (evict_it->second.dev_buffer != nullptr) {
+                    mem_alloc_.free(evict_it->second.dev_buffer);
+                }
+                orch_so_cache_.erase(evict_it);
+                LOG_INFO("Orch SO cache evict (hash=0x%lx)", evict_hash);
+            }
+        }
     }
 
-    // Persist a host-side copy so the rtMemcpy source is independent from
-    // any Python ctypes buffer the caller may release as soon as run()
-    // returns. This is also what runtime_maker hands us by reference.
-    host_orch_so_copy_.assign(
-        static_cast<const uint8_t *>(host_so_data), static_cast<const uint8_t *>(host_so_data) + host_so_size
+    runtime.set_dev_orch_so(
+        reinterpret_cast<uint64_t>(orch_so_cache_[new_hash].dev_buffer), host_so_size, new_hash, h2d_performed
     );
-
-    int rc = rtMemcpy(
-        dev_orch_so_buffer_, dev_orch_so_capacity_, host_orch_so_copy_.data(), host_so_size, RT_MEMCPY_HOST_TO_DEVICE
-    );
-    if (rc != 0) {
-        LOG_ERROR("rtMemcpy for orchestration SO failed: %d", rc);
-        cached_orch_so_hash_ = 0;
-        return rc;
-    }
-
-    cached_orch_so_hash_ = new_hash;
-    runtime.set_dev_orch_so(reinterpret_cast<uint64_t>(dev_orch_so_buffer_), host_so_size, /*is_new=*/true);
-    LOG_INFO("Orch SO cache miss (hash=0x%lx, %zu bytes uploaded)", new_hash, host_so_size);
+    runtime.set_evict_orch_so_hash(evict_hash);
     return 0;
 }
 
@@ -873,15 +899,14 @@ int DeviceRunner::finalize() {
     func_id_to_addr_.clear();
     binaries_loaded_ = false;
 
-    // Release the cached orchestration SO buffer.
-    if (dev_orch_so_buffer_ != nullptr) {
-        mem_alloc_.free(dev_orch_so_buffer_);
-        dev_orch_so_buffer_ = nullptr;
+    // Release all cached orchestration SO buffers.
+    for (auto &pair : orch_so_cache_) {
+        if (pair.second.dev_buffer != nullptr) {
+            mem_alloc_.free(pair.second.dev_buffer);
+        }
     }
-    dev_orch_so_capacity_ = 0;
-    cached_orch_so_hash_ = 0;
-    host_orch_so_copy_.clear();
-    host_orch_so_copy_.shrink_to_fit();
+    orch_so_cache_.clear();
+    orch_so_cache_order_.clear();
 
     // Cleanup performance profiling
     if (l2_perf_collector_.is_initialized()) {

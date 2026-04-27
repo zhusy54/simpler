@@ -206,6 +206,9 @@ private:
     // metadata travels in Runtime. `has_new_orch_so_` tells AICPU to reload.
     uint64_t dev_orch_so_addr_;
     uint64_t dev_orch_so_size_;
+    uint64_t orch_so_hash_{0};
+    uint64_t evict_orch_so_hash_{0};
+    bool orch_so_h2d_performed_{false};
     bool has_new_orch_so_;
 
 public:
@@ -257,9 +260,13 @@ public:
     void set_orch_args(const ChipStorageTaskArgs &args);
 
     // Device orchestration SO binary (for dlopen on AICPU thread 3)
-    void set_dev_orch_so(uint64_t dev_addr, uint64_t size, bool is_new);
+    void set_dev_orch_so(uint64_t dev_addr, uint64_t size, uint64_t hash, bool h2d_performed);
     uint64_t get_dev_orch_so_addr() const;
     uint64_t get_dev_orch_so_size() const;
+    uint64_t get_orch_so_hash() const;
+    uint64_t get_evict_orch_so_hash() const;
+    void set_evict_orch_so_hash(uint64_t hash);
+    bool get_orch_so_h2d_performed() const;
     bool has_new_orch_so() const;
 
     uint64_t get_function_bin_addr(int func_id) const;

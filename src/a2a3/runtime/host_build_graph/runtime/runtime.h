@@ -486,17 +486,27 @@ public:
     // and unconditionally writes these fields, so they must exist.
     uint64_t dev_orch_so_addr_{0};
     uint64_t dev_orch_so_size_{0};
+    uint64_t orch_so_hash_{0};
+    uint64_t evict_orch_so_hash_{0};
+    bool orch_so_h2d_performed_{false};
     bool has_new_orch_so_{false};
 
     // Host-only staging fields (mirror tensormap_and_ringbuffer variant).
     const void *pending_orch_so_data_{nullptr};
     size_t pending_orch_so_size_{0};
 
-    void set_dev_orch_so(uint64_t dev_addr, uint64_t size, bool is_new) {
+    void set_dev_orch_so(uint64_t dev_addr, uint64_t size, uint64_t hash, bool h2d_performed) {
         dev_orch_so_addr_ = dev_addr;
         dev_orch_so_size_ = size;
-        has_new_orch_so_ = is_new;
+        orch_so_hash_ = hash;
+        orch_so_h2d_performed_ = h2d_performed;
+        has_new_orch_so_ = h2d_performed;
     }
+
+    uint64_t get_orch_so_hash() const { return orch_so_hash_; }
+    uint64_t get_evict_orch_so_hash() const { return evict_orch_so_hash_; }
+    void set_evict_orch_so_hash(uint64_t hash) { evict_orch_so_hash_ = hash; }
+    bool get_orch_so_h2d_performed() const { return orch_so_h2d_performed_; }
 };
 
 #endif  // SRC_A2A3_RUNTIME_HOST_BUILD_GRAPH_RUNTIME_RUNTIME_H_

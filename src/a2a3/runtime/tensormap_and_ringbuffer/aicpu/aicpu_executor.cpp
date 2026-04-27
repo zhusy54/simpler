@@ -21,6 +21,7 @@
 #ifdef __linux__
 #include <sys/mman.h>
 #endif
+#include <dirent.h>
 
 #include "aicpu/device_log.h"
 #include "aicpu/device_time.h"
@@ -110,7 +111,9 @@ struct AicpuExecutor {
 
     // Orchestration SO handle - defer dlclose until all tasks complete
     void *orch_so_handle_{nullptr};
-    char orch_so_path_[256]{};  // Path to orchestration SO file for cleanup
+    char orch_so_path_[512]{};       // Path to current orchestration SO file
+    uint64_t prev_orch_so_hash_{0};  // Hash of last dlopen'd SO for cache hit detection
+    char orch_so_dir_[256]{};        // Fixed directory for SO file cache (determined on first write)
 
     // Shared orchestration function pointer (loaded by first orch thread, used by all)
     DeviceOrchestrationFunc orch_func_{nullptr};
@@ -133,9 +136,22 @@ struct AicpuExecutor {
             dlclose(orch_so_handle_);
             orch_so_handle_ = nullptr;
         }
-        if (orch_so_path_[0] != '\0') {
-            unlink(orch_so_path_);
-            orch_so_path_[0] = '\0';
+        // Batch-clean all orch SO files from the cache directory.
+        if (orch_so_dir_[0] != '\0') {
+            DIR *dir = opendir(orch_so_dir_);
+            if (dir != nullptr) {
+                struct dirent *ent;
+                while ((ent = readdir(dir)) != nullptr) {
+                    // Match files named orch_so_0x<hash>.so
+                    if (strncmp(ent->d_name, "orch_so_0x", 10) == 0) {
+                        char path[512];
+                        snprintf(path, sizeof(path), "%s/%s", orch_so_dir_, ent->d_name);
+                        unlink(path);
+                    }
+                }
+                closedir(dir);
+            }
+            orch_so_dir_[0] = '\0';
         }
     }
 };
@@ -198,85 +214,136 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         if (runtime->get_orch_built_on_host()) {
             DEV_INFO("Thread %d: Host orchestration mode, no-op", thread_idx);
         } else {
-            // Two paths:
-            //   1) has_new_orch_so == true → host believes the SO identity
-            //      changed, so we drop the cached handle (if any), write the
-            //      new bytes to disk, and dlopen + dlsym a fresh handle.
-            //   2) has_new_orch_so == false → host detected a cache hit, so
-            //      we reuse `orch_so_handle_` / `orch_func_` / `orch_bind_runtime_`
-            //      from the previous run untouched. sm_handle / rt below are
-            //      always recreated because they bind this run's memory.
-            const bool reload_so = runtime->has_new_orch_so();
+            // Three-tier SO handling:
+            //   1) current_hash == prev_orch_so_hash_ → dlopen cache HIT, fully skip
+            //   2) current_hash != prev_orch_so_hash_ && file exists → file cache HIT,
+            //      dlclose old handle + dlopen from existing file + dlsym
+            //   3) current_hash != prev_orch_so_hash_ && file missing → file cache MISS,
+            //      read SO from device memory + write file + dlopen + dlsym
+            const uint64_t current_hash = runtime->get_orch_so_hash();
 
-            if (reload_so) {
-                DEV_INFO("Thread %d: New orch SO detected, (re)loading", thread_idx);
-                if (orch_so_handle_ != nullptr) {
-                    dlclose(orch_so_handle_);
-                    orch_so_handle_ = nullptr;
-                    orch_func_ = nullptr;
-                    orch_bind_runtime_ = nullptr;
-                    if (orch_so_path_[0] != '\0') {
-                        // Unlink the old file so the new open() lands on a
-                        // fresh inode — protects against SIGBUS / ETXTBSY when
-                        // the kernel still has the old mapping pinned.
-                        unlink(orch_so_path_);
-                        orch_so_path_[0] = '\0';
-                    }
-                }
-
-                const void *so_data = reinterpret_cast<const void *>(runtime->get_dev_orch_so_addr());
-                size_t so_size = runtime->get_dev_orch_so_size();
-
-                if (so_data == nullptr || so_size == 0) {
-                    DEV_ERROR("Thread %d: Device orchestration SO not set", thread_idx);
-                    // Unblock scheduler threads before returning so they don't spin forever.
-                    runtime_init_ready_.store(true, std::memory_order_release);
-                    return -1;
-                }
-
-                // Try multiple paths that may allow execution on AICPU
-                char so_path[256];
-                bool file_created = false;
+            if (current_hash == prev_orch_so_hash_) {
+                // Tier 1: dlopen cache HIT — reuse everything, skip all I/O.
+                DEV_INFO("Thread %d: Orch SO dlopen cache hit (hash=0x%lx)", thread_idx, current_hash);
+            } else {
+                // Need to switch SO. Determine the cache directory on first use.
                 const char *candidate_dirs[] = {
                     "/usr/lib64/aicpu_kernels/0/aicpu_kernels_device", "/usr/lib64", "/lib64", "/var/tmp", "/tmp"
                 };
                 const int32_t num_candidates = sizeof(candidate_dirs) / sizeof(candidate_dirs[0]);
 
-                for (int32_t i = 0; i < num_candidates && !file_created; i++) {
-                    int32_t fd = create_orch_so_file(candidate_dirs[i], so_path, sizeof(so_path));
-                    if (fd < 0) {
-                        DEV_INFO(
-                            "Thread %d: Cannot create SO at %s (errno=%d), trying next path", thread_idx, so_path, errno
-                        );
-                        continue;
+                if (orch_so_dir_[0] == '\0') {
+                    for (int32_t i = 0; i < num_candidates; i++) {
+                        int32_t fd = create_orch_so_file(candidate_dirs[i], orch_so_dir_, sizeof(orch_so_dir_));
+                        if (fd >= 0) {
+                            // Successfully created a test file — extract dir path and remove the file.
+                            // orch_so_dir_ now contains a full file path; truncate to directory.
+                            char *last_slash = strrchr(orch_so_dir_, '/');
+                            if (last_slash != nullptr) *last_slash = '\0';
+                            close(fd);
+                            unlink(orch_so_dir_);
+                            DEV_INFO("Thread %d: Orch SO cache dir: %s", thread_idx, orch_so_dir_);
+                            break;
+                        }
                     }
-                    ssize_t written = write(fd, so_data, so_size);
-                    close(fd);
-                    if (written != static_cast<ssize_t>(so_size)) {
-                        DEV_INFO(
-                            "Thread %d: Cannot write SO to %s (errno=%d), trying next path", thread_idx, so_path, errno
-                        );
-                        unlink(so_path);
-                        continue;
+                    if (orch_so_dir_[0] == '\0') {
+                        DEV_ERROR("Thread %d: Cannot determine writable dir for orch SO cache", thread_idx);
+                        runtime_init_ready_.store(true, std::memory_order_release);
+                        return -1;
                     }
-                    file_created = true;
-                    DEV_INFO("Thread %d: Created SO file at %s (%zu bytes)", thread_idx, so_path, so_size);
                 }
 
-                if (!file_created) {
-                    DEV_ERROR("Thread %d: Failed to create SO file in any candidate path", thread_idx);
-                    // Unblock scheduler threads before returning so they don't spin forever.
-                    runtime_init_ready_.store(true, std::memory_order_release);
-                    return -1;
+                // Build hash-based file path.
+                char so_path[512];
+                snprintf(so_path, sizeof(so_path), "%s/orch_so_0x%016lx.so", orch_so_dir_, current_hash);
+
+                bool file_exists = (access(so_path, F_OK) == 0);
+
+                if (!file_exists) {
+                    // File cache MISS — Host must have done H2D for valid device data.
+                    if (!runtime->get_orch_so_h2d_performed()) {
+                        DEV_ERROR(
+                            "Thread %d: File cache MISS but Host did not perform H2D "
+                            "(hash=0x%lx). Device buffer has no valid SO data.",
+                            thread_idx, current_hash
+                        );
+                        runtime_init_ready_.store(true, std::memory_order_release);
+                        return -1;
+                    }
+
+                    const void *so_data = reinterpret_cast<const void *>(runtime->get_dev_orch_so_addr());
+                    size_t so_size = runtime->get_dev_orch_so_size();
+                    if (so_data == nullptr || so_size == 0) {
+                        DEV_ERROR("Thread %d: Device orchestration SO not set", thread_idx);
+                        runtime_init_ready_.store(true, std::memory_order_release);
+                        return -1;
+                    }
+
+                    bool file_created = false;
+                    // Try orch_so_dir_ first, then fall back to other candidates.
+                    const char *write_dirs[num_candidates + 1];
+                    write_dirs[0] = orch_so_dir_;
+                    for (int32_t i = 0; i < num_candidates; i++)
+                        write_dirs[i + 1] = candidate_dirs[i];
+
+                    char write_path[512];
+                    for (int32_t i = 0; i <= num_candidates && !file_created; i++) {
+                        if (i == 0) {
+                            // Write to orch_so_dir_ using the hash-based name.
+                            int32_t fd = create_orch_so_file(write_dirs[i], write_path, sizeof(write_path));
+                            if (fd < 0) continue;
+                            ssize_t written = write(fd, so_data, so_size);
+                            close(fd);
+                            if (written != static_cast<ssize_t>(so_size)) {
+                                unlink(write_path);
+                                continue;
+                            }
+                            // Rename to hash-based path if create_orch_so_file used a temp name.
+                            if (strcmp(write_path, so_path) != 0) {
+                                rename(write_path, so_path);
+                            }
+                            file_exists = (access(so_path, F_OK) == 0);
+                            file_created = file_exists;
+                        } else {
+                            int32_t fd = create_orch_so_file(write_dirs[i], write_path, sizeof(write_path));
+                            if (fd < 0) continue;
+                            ssize_t written = write(fd, so_data, so_size);
+                            close(fd);
+                            if (written != static_cast<ssize_t>(so_size)) {
+                                unlink(write_path);
+                                continue;
+                            }
+                            file_created = true;
+                            snprintf(so_path, sizeof(so_path), "%s", write_path);
+                        }
+                    }
+
+                    if (!file_created) {
+                        DEV_ERROR(
+                            "Thread %d: Failed to write SO file in any path (hash=0x%lx)", thread_idx, current_hash
+                        );
+                        runtime_init_ready_.store(true, std::memory_order_release);
+                        return -1;
+                    }
+                    DEV_INFO("Thread %d: Orch SO file cache MISS, wrote %s (%zu bytes)", thread_idx, so_path, so_size);
+                } else {
+                    DEV_INFO("Thread %d: Orch SO file cache hit: %s", thread_idx, so_path);
                 }
 
+                // dlclose old handle (do NOT unlink the old file — keep for future reuse).
+                if (orch_so_handle_ != nullptr) {
+                    dlclose(orch_so_handle_);
+                    orch_so_handle_ = nullptr;
+                    orch_func_ = nullptr;
+                    orch_bind_runtime_ = nullptr;
+                }
+
+                // dlopen + dlsym the (new or existing) file.
                 dlerror();
                 void *handle = dlopen(so_path, RTLD_LAZY | RTLD_LOCAL);
                 const char *dlopen_err = dlerror();
                 if (handle == nullptr) {
                     DEV_ERROR("Thread %d: dlopen failed: %s", thread_idx, dlopen_err ? dlopen_err : "unknown");
-                    unlink(so_path);
-                    // Unblock scheduler threads before returning so they don't spin forever.
                     runtime_init_ready_.store(true, std::memory_order_release);
                     return -1;
                 }
@@ -300,16 +367,12 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                         "Thread %d: dlsym failed for entry symbol '%s': %s", thread_idx, entry_symbol, entry_dlsym_error
                     );
                     dlclose(handle);
-                    unlink(so_path);
-                    // Unblock scheduler threads before returning so they don't spin forever.
                     runtime_init_ready_.store(true, std::memory_order_release);
                     return -1;
                 }
                 if (orch_func == nullptr) {
                     DEV_ERROR("Thread %d: dlsym returned NULL for entry symbol '%s'", thread_idx, entry_symbol);
                     dlclose(handle);
-                    unlink(so_path);
-                    // Unblock scheduler threads before returning so they don't spin forever.
                     runtime_init_ready_.store(true, std::memory_order_release);
                     return -1;
                 }
@@ -341,13 +404,16 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 orch_bind_runtime_ = bind_runtime_func;
                 orch_config_func_ = config_func;
                 snprintf(orch_so_path_, sizeof(orch_so_path_), "%s", so_path);
-            } else {
-                DEV_INFO("Thread %d: Reusing cached orch SO handle=%p", thread_idx, orch_so_handle_);
-                if (orch_so_handle_ == nullptr || orch_func_ == nullptr) {
-                    DEV_ERROR("Thread %d: has_new_orch_so=false but no cached SO handle/func", thread_idx);
-                    // Unblock scheduler threads before returning so they don't spin forever.
-                    runtime_init_ready_.store(true, std::memory_order_release);
-                    return -1;
+                prev_orch_so_hash_ = current_hash;
+            }
+
+            // Process Host-side eviction notification (after dlopen switching completes).
+            const uint64_t evict_hash = runtime->get_evict_orch_so_hash();
+            if (evict_hash != 0 && evict_hash != current_hash) {
+                char evict_path[512];
+                snprintf(evict_path, sizeof(evict_path), "%s/orch_so_0x%016lx.so", orch_so_dir_, evict_hash);
+                if (unlink(evict_path) == 0) {
+                    DEV_INFO("Thread %d: Evicted orch SO file: %s", thread_idx, evict_path);
                 }
             }
 

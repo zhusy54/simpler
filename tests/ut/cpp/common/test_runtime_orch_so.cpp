@@ -33,15 +33,24 @@
 struct DevOrchSoFields {
     uint64_t dev_orch_so_addr_;
     uint64_t dev_orch_so_size_;
+    uint64_t orch_so_hash_;
+    uint64_t evict_orch_so_hash_;
+    bool orch_so_h2d_performed_;
     bool has_new_orch_so_;
 
-    void set_dev_orch_so(uint64_t addr, uint64_t size, bool is_new) {
+    void set_dev_orch_so(uint64_t addr, uint64_t size, uint64_t hash, bool h2d_performed) {
         dev_orch_so_addr_ = addr;
         dev_orch_so_size_ = size;
-        has_new_orch_so_ = is_new;
+        orch_so_hash_ = hash;
+        orch_so_h2d_performed_ = h2d_performed;
+        has_new_orch_so_ = h2d_performed;
     }
     uint64_t get_dev_orch_so_addr() const { return dev_orch_so_addr_; }
     uint64_t get_dev_orch_so_size() const { return dev_orch_so_size_; }
+    uint64_t get_orch_so_hash() const { return orch_so_hash_; }
+    uint64_t get_evict_orch_so_hash() const { return evict_orch_so_hash_; }
+    void set_evict_orch_so_hash(uint64_t hash) { evict_orch_so_hash_ = hash; }
+    bool get_orch_so_h2d_performed() const { return orch_so_h2d_performed_; }
     bool has_new_orch_so() const { return has_new_orch_so_; }
 };
 
@@ -49,24 +58,41 @@ TEST(RuntimeOrchSo, DefaultIsEmpty) {
     DevOrchSoFields f{};
     EXPECT_EQ(f.get_dev_orch_so_addr(), 0u);
     EXPECT_EQ(f.get_dev_orch_so_size(), 0u);
+    EXPECT_EQ(f.get_orch_so_hash(), 0u);
+    EXPECT_EQ(f.get_evict_orch_so_hash(), 0u);
+    EXPECT_FALSE(f.get_orch_so_h2d_performed());
     EXPECT_FALSE(f.has_new_orch_so());
 }
 
 TEST(RuntimeOrchSo, SetRoundTrips) {
     DevOrchSoFields f{};
-    f.set_dev_orch_so(0xdeadbeefULL, 4096, /*is_new=*/true);
+    f.set_dev_orch_so(0xdeadbeefULL, 4096, 0xabcULL, /*h2d_performed=*/true);
     EXPECT_EQ(f.get_dev_orch_so_addr(), 0xdeadbeefULL);
     EXPECT_EQ(f.get_dev_orch_so_size(), 4096u);
+    EXPECT_EQ(f.get_orch_so_hash(), 0xabcULL);
+    EXPECT_TRUE(f.get_orch_so_h2d_performed());
     EXPECT_TRUE(f.has_new_orch_so());
 
-    f.set_dev_orch_so(0xdeadbeefULL, 4096, /*is_new=*/false);  // same buffer, cache hit
+    // Same buffer, cache hit — h2d_performed=false.
+    f.set_dev_orch_so(0xdeadbeefULL, 4096, 0xabcULL, /*h2d_performed=*/false);
+    EXPECT_FALSE(f.get_orch_so_h2d_performed());
     EXPECT_FALSE(f.has_new_orch_so());
     EXPECT_EQ(f.get_dev_orch_so_addr(), 0xdeadbeefULL);
 }
 
 TEST(RuntimeOrchSo, ZeroSizeMeansNoSO) {
     DevOrchSoFields f{};
-    f.set_dev_orch_so(0, 0, false);
+    f.set_dev_orch_so(0, 0, 0, false);
     EXPECT_EQ(f.get_dev_orch_so_size(), 0u);
     EXPECT_FALSE(f.has_new_orch_so());
+}
+
+TEST(RuntimeOrchSo, EvictHashRoundTrip) {
+    DevOrchSoFields f{};
+    f.set_evict_orch_so_hash(0x1234ULL);
+    EXPECT_EQ(f.get_evict_orch_so_hash(), 0x1234ULL);
+
+    // Zero means no eviction.
+    f.set_evict_orch_so_hash(0);
+    EXPECT_EQ(f.get_evict_orch_so_hash(), 0u);
 }

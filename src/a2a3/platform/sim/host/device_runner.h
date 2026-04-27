@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <deque>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -227,11 +228,15 @@ private:
     // Kernel binary mapping (func_id -> executable memory)
     std::map<int, MappedKernel> func_id_to_addr_;
 
-    // Orchestration SO cache (host-resident in sim; see onboard for shape).
-    uint64_t cached_orch_so_hash_{0};
-    void *dev_orch_so_buffer_{nullptr};
-    size_t dev_orch_so_capacity_{0};
-    std::vector<uint8_t> host_orch_so_copy_;
+    // Multi-entry orchestration SO cache (host-resident in sim; see onboard for shape).
+    struct SoCacheEntry {
+        void *dev_buffer{nullptr};
+        size_t capacity{0};
+        std::vector<uint8_t> host_copy;
+    };
+    static constexpr size_t ORCH_SO_CACHE_MAX_ENTRIES = 8;
+    std::map<uint64_t, SoCacheEntry> orch_so_cache_;
+    std::deque<uint64_t> orch_so_cache_order_;
 
     // AICPU executor SO: load-once, matching onboard's binaries_loaded_ pattern.
     // The aicpu_executor g_aicpu_executor static lives inside the dlopen'd DSO;

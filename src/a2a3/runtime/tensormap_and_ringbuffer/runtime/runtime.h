@@ -208,11 +208,20 @@ private:
     // Device orchestration SO (for dlopen on AICPU thread 3).
     // The SO bytes themselves live in a separately-allocated device buffer
     // owned by DeviceRunner; only the metadata below travels inside Runtime.
-    // `has_new_orch_so_` tells AICPU whether the host believes the SO identity
-    // changed since the previous run — when false AICPU reuses its cached
-    // dlopen handle and skips writing the file again.
+    //
+    // Multi-entry cache protocol:
+    //   orch_so_hash_ identifies the SO for this run (ELF Build-ID based).
+    //   AICPU compares orch_so_hash_ with its own prev_orch_so_hash_ to
+    //   decide cache hit (reuse dlopen handle) or miss (switch SO).
+    //   orch_so_h2d_performed_ indicates whether Host did an H2D this run
+    //   (file cache MISS asserts this is true so device buffer is valid).
+    //   evict_orch_so_hash_ is set by Host when evicting a cache entry;
+    //   AICPU deletes the corresponding SO file after dlopen completes.
     uint64_t dev_orch_so_addr_;
     uint64_t dev_orch_so_size_;
+    uint64_t orch_so_hash_{0};
+    uint64_t evict_orch_so_hash_{0};
+    bool orch_so_h2d_performed_{false};
     bool has_new_orch_so_;
     char device_orch_func_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME];
     char device_orch_config_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME];
@@ -266,9 +275,13 @@ public:
     void set_orch_args(const ChipStorageTaskArgs &args);
 
     // Device orchestration SO binary (for dlopen on AICPU thread 3)
-    void set_dev_orch_so(uint64_t dev_addr, uint64_t size, bool is_new);
+    void set_dev_orch_so(uint64_t dev_addr, uint64_t size, uint64_t hash, bool h2d_performed);
     uint64_t get_dev_orch_so_addr() const;
     uint64_t get_dev_orch_so_size() const;
+    uint64_t get_orch_so_hash() const;
+    uint64_t get_evict_orch_so_hash() const;
+    void set_evict_orch_so_hash(uint64_t hash);
+    bool get_orch_so_h2d_performed() const;
     bool has_new_orch_so() const;
     void set_device_orch_func_name(const char *name);
     const char *get_device_orch_func_name() const;
@@ -304,7 +317,7 @@ public:
     // Host-only staging for orchestration SO. runtime_maker publishes the
     // callable-owned pointer here; DeviceRunner consumes it before launching
     // the device-side execution and replaces it with the device-resident
-    // buffer metadata (dev_orch_so_addr_, ..., has_new_orch_so_). The fields
+    // buffer metadata (dev_orch_so_addr_, orch_so_hash_, ...). The fields
     // below are zeroed on the device because DeviceRunner clears them before
     // the memcpy, but their values while running on device are irrelevant.
     const void *pending_orch_so_data_{nullptr};

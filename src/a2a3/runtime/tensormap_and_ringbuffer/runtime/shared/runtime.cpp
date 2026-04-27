@@ -52,6 +52,9 @@ Runtime::Runtime() {
     // Initialize device orchestration SO binary
     dev_orch_so_addr_ = 0;
     dev_orch_so_size_ = 0;
+    orch_so_hash_ = 0;
+    evict_orch_so_hash_ = 0;
+    orch_so_h2d_performed_ = false;
     has_new_orch_so_ = false;
     device_orch_func_name_[0] = '\0';
     device_orch_config_name_[0] = '\0';
@@ -102,11 +105,13 @@ void Runtime::set_pto2_slot_states_ptr(void *p) { pto2_slot_states_ptr_ = p; }
 void Runtime::set_orch_args(const ChipStorageTaskArgs &args) { orch_args_storage_ = args; }
 
 // Device orchestration SO metadata (bytes live in a separate device buffer
-// owned by DeviceRunner; only the address/size/dirty-flag travels in Runtime).
-void Runtime::set_dev_orch_so(uint64_t dev_addr, uint64_t size, bool is_new) {
+// owned by DeviceRunner; only the address/size/hash/flags travel in Runtime).
+void Runtime::set_dev_orch_so(uint64_t dev_addr, uint64_t size, uint64_t hash, bool h2d_performed) {
     dev_orch_so_addr_ = dev_addr;
     dev_orch_so_size_ = size;
-    has_new_orch_so_ = is_new;
+    orch_so_hash_ = hash;
+    orch_so_h2d_performed_ = h2d_performed;
+    has_new_orch_so_ = h2d_performed;
 }
 
 uint64_t Runtime::get_dev_orch_so_addr() const { return dev_orch_so_addr_; }
@@ -114,6 +119,14 @@ uint64_t Runtime::get_dev_orch_so_addr() const { return dev_orch_so_addr_; }
 uint64_t Runtime::get_dev_orch_so_size() const { return dev_orch_so_size_; }
 
 bool Runtime::has_new_orch_so() const { return has_new_orch_so_; }
+
+uint64_t Runtime::get_orch_so_hash() const { return orch_so_hash_; }
+
+uint64_t Runtime::get_evict_orch_so_hash() const { return evict_orch_so_hash_; }
+
+void Runtime::set_evict_orch_so_hash(uint64_t hash) { evict_orch_so_hash_ = hash; }
+
+bool Runtime::get_orch_so_h2d_performed() const { return orch_so_h2d_performed_; }
 
 void Runtime::set_device_orch_func_name(const char *name) {
     if (name == nullptr) {
