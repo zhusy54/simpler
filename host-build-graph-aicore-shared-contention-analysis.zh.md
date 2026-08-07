@@ -2,7 +2,7 @@
 
 | 项目 | 内容 |
 | ---- | ---- |
-| 状态 | 设计分析，供 M3/M4 实现和 A5 验证使用 |
+| 状态 | 设计分析；M3 使用 MPMC 基线契约，M8 使用 ReadyQ 候选优化与 A5 对比 |
 | 调度模型 | 共享 ReadyQ、自主 Pull、领取者本核执行 |
 | 范围 | 单 lane 正常运行热路径 |
 | 不包含 | 启动/退出、first-error/drain、M5/M6 wide/MIX/`sync_start` |
@@ -13,12 +13,12 @@
 从原始设计中的 task/wake 共享操作开始消减后，`WAITING -> READY` 和独立 claim 不进入最终
 运行期 ABI；`next_waiter` 发布并入 wake-list 注册协议。最终保留 completion、wake-list 注册、
 wake-list 关闭和 `completed_count` 四项。ReadyQ 自身另作一组，因为其内部包含 cursor、slot
-sequence 或 bitmap word 等多项原子操作。
+sequence 等多项原子操作。M8 候选实现的 bitmap word 原子操作在同文档中单独分析。
 
-| # | 共享操作 | 正确性作用 | 推荐结论 |
-| ---: | -------- | ---------- | ---------- |
+| 序号 | 共享操作 | 正确性作用 | 推荐结论 |
+| ---- | -------- | ---------- | -------- |
 | 1 | `WAITING -> READY` | 可选的重复发布诊断 | 正确 Pull 协议没有竞争，建议从正确性热路径删除 |
-| 2 | ReadySet 所有权转移 | 保证 task exactly-once | MPMC 成功 pop 或 bitmap 原子清 bit 即完成领取，不设独立 claim 字段 |
+| 2 | ReadySet 所有权转移 | 保证 task exactly-once | M3 以 MPMC 成功 pop 完成领取；M8 候选也必须复用自身唯一消费操作，不设独立 claim 字段 |
 | 3 | completion 发布 | 让其他 core 观察 kernel/DUMMY 完成 | 唯一 writer，使用 release store，不做 CAS |
 | 4 | wake-list 注册协议 | 发布 `next_waiter`，并把 waiter 挂到 producer | `next_waiter` 不做 RMW；仅对 head 做 CAS push |
 | 5 | `wake_list_head` 关闭 | completion 与 waiter 注册并发时不丢唤醒 | 保留 atomic exchange |
@@ -29,7 +29,7 @@ sequence 或 bitmap word 等多项原子操作。
 领取操作直接转移。completion 以及注册协议中的 `next_waiter` 发布主要解决跨核可见性，
 不是多 writer 热点。
 
-## 2. ReadyQ 实现选择
+## 2. MPMC 基线与 M8 ReadyQ 候选
 
 ### 2.1 本方案对 ReadyQ 的特殊约束
 
@@ -41,7 +41,8 @@ Host 在启动前已经生成完整图，因此：
 - 单 lane Pull 不会因为目标 core 不可用而重新入队；
 - 调度不要求 FIFO，只要求无丢失、exactly-once 和无饥饿。
 
-这些条件比通用 MPMC queue 更强，允许用 ready set 代替循环队列。
+这些条件比通用 MPMC queue 更强，但 M0 至 M7 仍固定使用循环 MPMC 作为可审查、
+可回退的正确性基线；ready set 替代方案只在 M8 实现和评估。
 
 ### 2.2 Vyukov bounded MPMC 基线
 
@@ -57,7 +58,7 @@ MPMC 为每种资源类型维护一个有界队列：
 摊薄 cursor CAS，但会让一个 core 一次取得多个 task，不适合直接用于“领取后同步执行”的
 单-task Pull，除非额外维护本地待执行缓存。
 
-### 2.3 其他免锁实现比较
+### 2.3 M8 其他免锁实现比较
 
 | 方案 | 原子热点 | 优点 | 主要问题 |
 | ---- | -------- | ---- | -------- |
@@ -69,7 +70,7 @@ MPMC 为每种资源类型维护一个有界队列：
 理论上，两级 ready bitmap 最匹配本方案的一次 ready/一次领取语义。它不维护 FIFO，也不
 为永不重新入队的 task 支付 sequence/generation 成本。
 
-### 2.4 两级 ready bitmap 提案
+### 2.4 M8 两级 ready bitmap 提案
 
 每个资源类型维护：
 
@@ -105,11 +106,12 @@ Pull 顺序：
 同一 word 上不同 task bit 的 `fetch_or/fetch_and` 仍会串行，因此 bitmap 不是“无竞争”，而是
 把全局 cursor 热点分散到多个 word。收益取决于 ready task 的分布、core 数和 A5 原子代价。
 
-### 2.5 理论推荐和采用条件
+### 2.5 M8 理论推荐和采用条件
 
-理论推荐使用两级 ready bitmap，原因是它直接表达固定 task 集合的 ready/unacquired 状态，
-内存约为 1 bit/task，且原子清除 bit 本身就是 exactly-once 领取。Vyukov MPMC 保留为正确性和
-性能基线，在 A5 证据形成前不从主方案删除。
+M8 的理论候选是两级 ready bitmap，因为它直接表达固定 task 集合的
+ready/unacquired 状态，内存约为 1 bit/task，且原子清除 bit 本身就是 exactly-once
+领取。Vyukov MPMC 是 M0 至 M7 的交付实现和 M8 对比基线，候选方案只有在 M8
+形成完整 A5 证据后才能替换它。
 
 bitmap 只有同时满足以下条件才替换 MPMC：
 
@@ -288,23 +290,24 @@ MPMC 方案必须把“task 只 push 一次”提升为正式不变量：initial
   O(busy period 数)。最后一批任务完成后，执行 core 必然回到调度循环、完成一次空闲扫描并
   提交剩余 delta，因此不会漏计；新任务在提交后出现也只会进入下一批，不会提前完成。
 
-## 5. DFX 和验证
+## 5. M3 基线与 M8 候选的 DFX 和验证
 
 每 core 记录局部 counters，结束时汇总，避免 DFX 自身制造共享热点：
 
 - MPMC enqueue/dequeue CAS attempt、fail、sequence wait cycle；
-- bitmap L0/L1 atomic、bit-clear retry、fallback scan、hot-word max retry；
-- MPMC pop winner、bitmap duplicate-set/clear-bit winner；
+- M8 增加 bitmap L0/L1 atomic、bit-clear retry、fallback scan、hot-word max retry；
+- MPMC pop winner；M8 增加 bitmap duplicate-set/clear-bit winner；
 - wake register CAS retry、close-race reclassify；
 - completion publish、completed-batch flush count/size/atomic cycle。
 
 CPU 模型必须覆盖：
 
 - READY 重复发布、重复 queue entry 和 ReadySet 唯一领取；
-- bitmap set/acquire、L1 清位与 producer set 的全部交错；
+- M8 覆盖 bitmap set/acquire、L1 清位与 producer set 的全部交错；
 - wake 注册协议中 `next_waiter` 发布、head CAS 与 exchange close 的全部交错；
 - 乱序完成、busy/idle 反复切换以及 flush 后立即出现新任务时，批量计数无漏计、重复或提前退出。
 
-A5 对比 workload 至少包括 root burst、单 producer 多 waiter、高 fanin、随机 DAG、稀疏尾部、
-热点 bitmap word 和非 64 对齐任务数。报告 MPMC、sharded MPMC 和 bitmap 的 atomic 次数、
-CAS retry、ready-to-start、调度周期、总时延和各 core 任务分布。
+M3 和 M4 以 root burst、单 producer 多 waiter、高 fanin 和随机 DAG 验证基础 MPMC，
+报告 atomic 次数、CAS retry、ready-to-start、调度周期、总时延和各 core 任务分布。
+M8 再增加稀疏尾部、热点 bitmap word、热点 shard 和非 64 对齐任务数，对比 MPMC、
+sharded MPMC 和 bitmap 的完整正确性与性能证据。

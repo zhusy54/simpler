@@ -103,7 +103,7 @@ Orchestrator 语义。新增 sidecar 只承载 AICore 调度需要的设备 ABI�
 | `AicoreTaskRecord` | 只读 | task id、kernel id、fanin、资源 shape、block 数、predicate、参数元数据 |
 | `AicoreTaskControl` | 可变 | completion、wake head、next waiter，以及 M5/M6 使用的 task epoch、参与者计数和错误码 |
 | `AicoreRunControl` | 可变 | `expected_task_count`、批量更新的全局 `completed_count`、first-error 和退出状态 |
-| `TaskReadySet` | 可变 | 基线为只保存 task id 的 Vyukov bounded MPMC；候选为按 task id 索引的两级 ready bitmap |
+| `TaskReadySet` | 可变 | M0 至 M7 固定使用只保存 task id 的 Vyukov bounded MPMC；sharded MPMC 和 ready bitmap 属于 M8 候选优化 |
 | `WorkerExecutionSlot` | 每核私有可变 | 领取者本地物化的 tensor/scalar 参数、`LocalContext` 和 `GlobalContext`；单 lane 路径无跨核发布 |
 | `AicoreSchedulerDfx` | 可变 | 分类、领取、空轮询、等待、完成、重分类、冲突和错误计数 |
 
@@ -144,21 +144,18 @@ Orchestrator 语义。新增 sidecar 只承载 AICore 调度需要的设备 ABI�
 
 - 基线使用有界 MPMC 队列，slot 采用 sequence counter 防 ABA。
 - MPMC payload 是稳定 task id；弹出后通过 graph base 定位 record/control。
-- MPMC 在构图结束时按“该类型可能同时进入队列的任务数”计算最坏容量并向上取 2 的幂；
-  bitmap 按固定 task 数建立 L0/L1，不存在运行期 queue full。
+- MPMC 在构图结束时按“该类型可能同时进入队列的任务数”计算最坏容量并向上取 2 的幂。
 - MPMC 的 DUMMY 容量必须覆盖所有可能受 predicate 控制的任务，不能假定多数 predicate 为真。
 - 任一容量或总 sidecar 内存超过配置上限，Host 在启动设备前失败。
 - 队列选择采用 executable-first：先过滤当前 core/cluster 能执行的 shape，再在可执行队列间
   round-robin，避免固定优先级长期饿死某类任务。
 - 单 lane ReadyQ 按 AIC/AIV 类型共享；任务入队时不绑定具体 core，空闲 core 只轮询自身可执行的
-  queue。MPMC 成功 pop 或 bitmap 成功清除 ready bit 后，领取者直接执行，不再进行二次 core
-  选择或 task-local claim。
+  queue。MPMC 成功 pop 后，领取者直接执行，不再进行二次 core 选择或 task-local claim。
 - MPMC `push` 返回 full 属于内部容量计算错误，设置 first-error，不能无限自旋。
 
-完整图中每个 task 只 ready/领取一次，因此 M3/M4 还需把两级 ready bitmap 作为候选实现，
-与 Vyukov MPMC、sharded MPMC 做 CPU 模型、A5sim 和 A5 对比。理论上 bitmap 更贴合固定任务
-集合且不需要 cursor/slot generation，但只有在无丢 bit、无饥饿且稀疏尾部和总时延均通过
-验收后才能替换 MPMC 基线。具体协议和采用条件见
+M0 至 M7 的交付实现固定为 Vyukov bounded MPMC。M8 再基于固定正确性和性能基线，
+对比 sharded MPMC、per-shard 非空 bitmask 和两级 ready bitmap，并按正确性、公平性、
+A5 可见性与性能证据决定是否替换基线。具体协议和采用条件见
 [AICore 共享竞争与 ReadyQ 替代方案分析](host-build-graph-aicore-shared-contention-analysis.zh.md)。
 
 ### 2.6 AIC/AIV 单 lane 调度
@@ -168,8 +165,9 @@ Orchestrator 语义。新增 sidecar 只承载 AICore 调度需要的设备 ABI�
 直接在本 core 上执行该任务。任务在入队时不绑定具体 core，不存在“scheduler core 领取后再
 选择目标 lane”的二次派发。
 
-ReadySet 的唯一消费操作就是 task 所有权转移：MPMC 成功 pop 的 core 取得对应 task 所有权；
-bitmap 中成功原子清除 ready bit 的 core 取得所有权。单 lane 不维护独立 claim 字段或二次
+M0 至 M7 中，ReadySet 的唯一消费操作就是 task 所有权转移：MPMC 成功 pop 的 core
+取得对应 task 所有权。M8 候选实现也必须保留“候选结构的唯一消费操作即所有权转移”
+的约束。单 lane 不维护独立 claim 字段或二次
 claim CAS。exactly-once 依赖“每 task 只发布一次”和“每 ReadySet 元素只被领取一次”两个
 不变量。单 lane 不 requeue/retry，也不会因为“目标 lane 不可用”重新入队。core 只有在未执行
 任务时才进入调度循环，因此空闲状态由控制流隐式保证，不维护共享 AIC/AIV idle bitmap。
@@ -291,7 +289,7 @@ AICPU 不再扫描 fanin、不维护 ready queue，也不逐任务选择执行 c
 | AICore 编译器不支持现有 C++ 原语 | 无法直接复用 MPMC/wake 代码 | 建立最小 atomic ABI 封装和独立编译探针 | WP1 前完成工具链探针 |
 | 动态函数入口或链接不稳定 | kernel 无法调用或调用错误版本 | per-callable 直链接、强 identity、链接期 hook 校验 | image identity UT + A5 smoke |
 | 多 scheduler 原子热点 | 调度开销抵消收益 | 分类分片、task-id 队列、可执行队列 RR、冲突 DFX | 性能 profile，不设统一硬门槛 |
-| ReadyQ 实现选择错误 | MPMC cursor 串行或 bitmap 丢 bit/尾部扫描过慢 | MPMC 基线、bitmap 模型检查、A5 多负载对比 | M4 前冻结交付实现 |
+| ReadyQ 基线成为性能热点 | MPMC cursor 串行抵消多 scheduler 收益 | M0 至 M7 保持 MPMC 正确性基线并采集竞争 DFX；M8 模型检查并对比候选优化 | M8 冻结是否替换基线 |
 | graph/queue 最坏容量过大 | HBM 占用不可控或启动失败 | Host 精确预估、配置 cap、启动前 fail | 容量边界 UT/ST |
 | MIX/wide 部分资源持有 | 环路死锁 | 全局预留顺序、all-or-rollback、task epoch barrier | 模型检查 + 故障注入 |
 | 多 callable 镜像泄漏 | Worker 长时间运行内存增长 | Worker 生命周期缓存、数量/字节统计、上限 | 生命周期 ST |
@@ -304,15 +302,15 @@ AICPU 不再扫描 fanin、不维护 ready queue，也不逐任务选择执行 c
 
 下列问题已经完成决策，是实现基线；任何变更应重新进行架构评审。
 
-| # | 设计选择问题 | 已批准决策 |
-| ---: | ------------ | ---------- |
+| 序号 | 设计选择问题 | 已批准决策 |
+| ---- | ------------ | ---------- |
 | 1 | 修改 HBG 还是新增 Runtime？ | 新增显式 `host_build_graph_aicore`，保留 HBG |
 | 2 | 首发平台覆盖哪些架构？ | A5sim、A5；本计划不覆盖 A2/A3 |
 | 3 | Orchestrator 在哪里、如何运行？ | Host 同步运行到结束，设备启动前完成全图 |
 | 4 | 是否建立第二套图格式？ | 复用 HBG 图，增加 AICore execution sidecar |
 | 5 | 解依赖使用 refcount 还是扫描 fanin？ | 扫描 fanin，等待首个未完成 producer，wake relay 后重分类 |
 | 6 | 首次分类在哪里完成？ | AICore 多核并行分类，完成后全局 barrier |
-| 7 | ReadyQ 使用什么实现？ | Vyukov bounded MPMC 作为基线，只保存 task id；M3/M4 对比 sharded MPMC 和两级 ready bitmap，按正确性、公平性与 A5 性能闸门决定是否替换 |
+| 7 | ReadyQ 使用什么实现？ | M0 至 M7 固定使用只保存 task id 的 Vyukov bounded MPMC；M8 对比 sharded MPMC、per-shard 非空 bitmask 和两级 ready bitmap，再决定是否替换 |
 | 8 | task shape 如何递进？ | M1 至 M4 完成 AIC/AIV 单 lane；M5 交付 wide；M6 交付 MIX 和 `sync_start` |
 | 9 | wide task 如何组织？ | leader + participant cores + block tickets |
 | 10 | MIX 的协调者是谁？ | cluster AIC leader，必要时为纯协调角色 |
@@ -324,7 +322,7 @@ AICPU 不再扫描 fanin、不维护 ready queue，也不逐任务选择执行 c
 | 16 | 完整图超过容量如何处理？ | 设备启动前失败，不运行期扩容 |
 | 17 | 任务失败后是否重试或回退？ | first-failure fail-stop，不重试、不回退 AICPU |
 | 18 | 多 ready queue 如何仲裁？ | executable-first，再 round-robin |
-| 19 | 单 lane 任务如何选择执行 core？ | 空闲 core 从兼容共享 ReadyQ 主动 Pull；MPMC pop/bitmap 清 bit 的 winner 直接执行，不维护额外 task 所有权字段、idle bitmap 或跨核派发 |
+| 19 | 单 lane 任务如何选择执行 core？ | 空闲 core 从兼容共享 ReadyQ 主动 Pull；M0 至 M7 中 MPMC pop winner 直接执行，不维护额外 task 所有权字段、idle bitmap 或跨核派发 |
 | 20 | 如何使用 `simpler-dist` 测试？ | 复用验证思想和契约，不复制源码或业务工作负载 |
 | 21 | 验证顺序是什么？ | A5sim 第一阶段，A5 真机第二阶段 |
 | 22 | 正确性 oracle 是什么？ | HBG 的图、输出和错误强差分 |
@@ -369,7 +367,7 @@ AICPU 不再扫描 fanin、不维护 ready queue，也不逐任务选择执行 c
 | WP1 AICore 原语探针 | 验证 atomic load/CAS/exchange/fetch-or/fetch-and、DCCI、barrier、函数链接和 128B 布局 | WP0 | A5sim/A5 probe；不支持的原语有替代封装 |
 | WP2 Host sidecar builder | 冻结图、容量计算、record/control/queue/slot 布局、重定位 | WP0 | Host UT 覆盖零任务、上限、溢出、地址重定位 |
 | WP3 per-callable 构建 | 直链接 scheduler+adapter+kernels；强缓存 identity；Worker 映射 | WP1 | 多 callable 重复运行和缓存生命周期 UT |
-| WP4 AICore scheduler | initial classify、barrier、MPMC 基线、ready bitmap 候选、唯一 Pull、单 lane、wake relay、完成 | WP1、WP2 | CPU 模型、A5sim 随机 DAG 和长压力通过；A5 完成 ReadyQ 选择 |
+| WP4 AICore scheduler | initial classify、barrier、MPMC 基线、唯一 Pull、单 lane、wake relay、完成 | WP1、WP2 | CPU 模型、A5sim 随机 DAG 和长压力通过；A5 完成 MPMC 正确性闭环 |
 | WP5 端到端控制面 | AICPU launch/drain、Worker 集成、状态返回、公开 API 兼容 | WP3、WP4 | HBG 差分 ST；故障能有限时退出 |
 | WP6 可见性闭环 | mandatory adapter、MB-2/MB-8 seam、真实 tensor 链 | WP3、WP5 | A5 真机压力无旧读/丢写/邻居 clobber |
 | WP7 高级资源调度 | MIX leader、wide tickets、all-or-rollback、`sync_start` epoch | WP5、WP6 | M5/M6 分别完成 wide 和 MIX/sync 独立验收 |
@@ -437,8 +435,8 @@ AICPU 不再扫描 fanin、不维护 ready queue，也不逐任务选择执行 c
 
 - AIC/AIV 多 scheduler 并行 initial classify，并在全核 barrier 后开始执行。
 - 交付有界 MPMC、ReadySet exactly-once 领取、兼容队列 round-robin 和领取者本核执行。
-- 完成 MPMC、sharded MPMC 和两级 ready bitmap 的 CPU/A5sim 正确性及压力对比，不在本阶段
-  仅凭 sim cache 行为决定最终实现。
+- 交付基础 Vyukov bounded MPMC 的 CPU/A5sim 正确性和压力证据，不在本阶段引入
+  sharded MPMC、ready bitmap 或 bitmask 优化。
 - 支持随机 DAG、queue wrap、多 root 并发、公平进展和 first-error 后有限时 drain。
 
 独立验证和性能对比：
@@ -460,8 +458,8 @@ AICPU 不再扫描 fanin、不维护 ready queue，也不逐任务选择执行 c
 
 - MB-2、MB-5、MB-8 等价 seam 在 A5 重复压力下无旧读、丢写或邻居 clobber。
 - M0 至 M3 的适用用例全部在 A5 复验；真实单 lane callable 与 HBG 强差分。
-- 在 root burst、wake burst、热点 word 和稀疏尾部 workload 上完成三种 ReadyQ 的 A5 对比，
-  按无丢任务/饥饿、atomic retry、ready-to-start、尾延迟和总时延确定交付实现。
+- 在 root burst、wake burst 和长压力 workload 上验证基础 MPMC 的无丢任务/饥饿、A5 可见性、
+  atomic retry、ready-to-start、尾延迟和总时延，并保存供 M8 对比的固定基线。
 - 比较 A5sim、A5、M3 和 HBG，量化 atomic contention、adapter/DCCI、调度与总时延。
 
 完成 M4 后，AIC/AIV 单 lane 能力才形成可独立签收的正确性闭环。
@@ -506,7 +504,30 @@ AICPU 不再扫描 fanin、不维护 ready queue，也不逐任务选择执行 c
 
 - 运行固定版本的完整回归矩阵，确认 HBG 默认行为、公开 API 和既有业务结果无变化。
 - 输出 HBG 与 HBG-AICore 的构图、H2D、分类、ready-to-start、执行、完成传播、drain 和总时延对比。
-- 汇总 M0 至 M7 的趋势，解释所有显著退化并登记后续优化项；性能采集本身不能改变调度语义。
+- 汇总 M0 至 M7 的趋势，解释所有显著退化并形成 M8 优化基线；性能采集本身不能改变调度语义。
+
+#### M8：SIMT、CompletionQ 和 MPMC 优化
+
+新增功能：
+
+- 使用 SIMT 并行处理 graph image/sidecar 启动初始化、task 区间分类和 fanin 扫描，减少大图
+  启动与 initial classify 串行周期；task 只分类一次、waiter 只挂一条链和全核 barrier 语义不变。
+- 增加可独立开关的 CompletionQ：执行 core 发布输出和 completion 后入队稳定 task id，
+  scheduler core 批量消费并执行 wake-list close、wake relay 和后继重新分类，使执行与完成传播解耦。
+- 在 Vyukov bounded MPMC 正确性基线上评估 sharded MPMC、per-shard 非空 bitmask/两级 summary、
+  旋转 local-first 扫描、批量 enqueue reservation 和 cursor/slot cache-line 隔离。成功 pop 仍是
+  task 所有权转移的唯一线性化点，不增加 task-local claim CAS。具体候选和采用门槛见
+  [AICore 共享竞争与 ReadyQ 替代方案分析](host-build-graph-aicore-shared-contention-analysis.zh.md)。
+
+独立验证和性能对比：
+
+- SIMT 覆盖线程间归并、非整齐 task/fanin 数、长 fanin、wake head 热点和 barrier 可见性，
+  对比 M7 的启动、分类、注册竞争和 ready-to-start 时延。
+- CompletionQ 覆盖 task 单次发布/消费、completion-before-enqueue、queue 满、突发 fanout 和尾部
+  drain，对比 M7 直接 relay 的原子次数、完成传播延迟和总时延。
+- MPMC 候选覆盖 wrap/ABA、并发 push/pop、稀疏尾部、热点 shard、无饥饿和 A5 可见性，
+  对比 M7 的 atomic 次数、CAS retry、ready-to-start、尾延迟和总时延。
+- 三项优化均可独立启停和回退；组合启用时 M0 至 M7 的完整回归、强差分和 A5 长压力继续通过。
 
 ## 5. 功能验证方案
 
@@ -528,8 +549,8 @@ AICPU 不再扫描 fanin、不维护 ready queue，也不逐任务选择执行 c
 
 - sidecar 字节布局、对齐、重定位和图容量计算。
 - MPMC queue 的空、满、wrap、ABA、并发 push/pop 和 task-id 有效性。
-- 两级 ready bitmap 的 set/acquire、summary 清位竞态、fallback scan、热点 word、公平性和
-  非 64 对齐任务数。
+- M8 候选 ReadySet 的 set/acquire、summary 清位竞态、fallback scan、热点 word、
+  公平性和非 64 对齐任务数；这些用例不属于 M0 至 M7 基线。
 - wake list 的注册/关闭竞态、关闭后重扫、重复唤醒和长 fanin。
 - initial classify 的区间分片、预完成 producer、隐藏分配和 barrier。
 - task 单次 ready 发布、ReadySet exactly-once 领取和 first-error 幂等性。
@@ -561,9 +582,9 @@ hidden allocation、多 callable 连续运行和容量边界。
 
 这里的“相同用例”指验证相同内部契约，不要求使用相同实现或业务源码。
 
-| MB | `simpler-dist` 契约 | 本方案等价用例 | 阶段 |
-| ---: | ------------------- | -------------- | ---- |
-| MB-1 | sharded claim 恰一 winner、无跳号 | 多 scheduler 竞争 ReadySet，检查 MPMC slot/bitmap bit 恰一 winner 和 task-id 连续性 | M3 |
+| MB ID | `simpler-dist` 契约 | 本方案等价用例 | 阶段 |
+| ----- | ------------------- | -------------- | ---- |
+| MB-1 | sharded claim 恰一 winner、无跳号 | 多 scheduler 竞争 ReadySet；M3 检查 MPMC slot 恰一 winner 和 task-id 连续性，M8 对候选实现做同等检查 | M3 基线，M8 候选 |
 | MB-2 | 64B completion flag，邻居无 clobber | 相邻 task control 高频完成/重分类，检查完成位和错误位不丢失 | M3 模型，M4 A5 |
 | MB-4 | `block.won` 多 lane 协作 | MIX leader/participants 竞争、唯一 leader、参数发布和最后 participant 完成 | M6，A5 必测 |
 | MB-5 | shared map 定序、seq 和回收 | 多核读取同一 immutable graph record/control，验证发布 epoch、task-id 映射和无旧 generation | M3 模型，M4 A5 |
@@ -581,7 +602,8 @@ graph signature、Runtime identity、image build identity、平台和迭代次�
 - 先运行构建、加载、initial classify 和单 lane 端到端 smoke。
 - 运行 HBG 双 Runtime 差分图族。
 - 对随机 DAG 做多 seed、多 scheduler 数和多 queue wrap 压力。
-- 注入 queue full、非法/重复 task id、bitmap summary 错误、adapter 返回错误、kernel 错误和超时。
+- 注入 queue full、非法/重复 task id、adapter 返回错误、kernel 错误和超时；bitmap
+  summary 错误注入属于 M8 候选实现验证。
 - M5 增加 wide participant 迟到和资源不足；M6 增加 MIX、`sync_start` 和异构资源不足。
 
 A5sim 的退出标准是功能和状态机覆盖完整，不把 sim 的 cache 行为作为 A5 可见性结论。
@@ -608,8 +630,8 @@ seed、重复次数、首错和 DFX 摘要。短 smoke 通过后再逐级提高�
 - task 总数、initial-ready、initial-waiting、completed、dummy-completed。
 - fanin 扫描次数/边数、wake 注册/关闭/重分类次数、关闭竞态重试。
 - 各 ready queue push/pop/full/empty、最大深度和回退次数。
-- MPMC cursor/sequence atomic 和 CAS retry；bitmap L0/L1 atomic、bit-clear retry、fallback scan
-  和 hot-word 最大重试。
+- MPMC cursor/sequence atomic 和 CAS retry；M8 候选实现增加 bitmap L0/L1 atomic、
+  bit-clear retry、fallback scan 和 hot-word 最大重试。
 - ReadySet acquire success/retry、重复 ready 检测、各 core Pull/执行任务数；M5/M6 增加 idle
   bitmap 预留/回滚。
 - adapter before/after 次数和周期、scheduler 周期、kernel 周期、完成传播周期。
@@ -626,10 +648,11 @@ seed、重复次数、首错和 DFX 摘要。短 smoke 通过后再逐级提高�
 ### 5.8 最终验收清单
 
 - [ ] 新 Runtime 只能显式启用，HBG 默认行为和回归测试无变化。
-- [ ] M0 至 M7 均可独立构建、验证和回退，且保留固定 workload 的 HBG/前序性能基线。
+- [ ] M0 至 M8 均可独立构建、验证和回退，且保留固定 workload 的 HBG/前序性能基线。
 - [ ] Host Orchestrator 构造完整图后才启动设备 scheduler。
 - [ ] AICore 完成首次分类、依赖等待、wake relay、任务领取和完成传播。
-- [ ] ReadyQ 交付实现通过 MPMC/bitmap 的 CPU 模型、A5sim 和 A5 对比，且无丢任务、重复领取或饥饿。
+- [ ] M0 至 M7 的 MPMC 交付实现通过 CPU 模型、A5sim 和 A5 验证，且无丢任务、
+  重复领取或饥饿；M8 另行完成候选 ReadySet 的对比和采用决策。
 - [ ] 公开 Orchestrator/submit/Worker API 未改变。
 - [ ] HBG normalized graph、输出和错误强差分通过。
 - [ ] MB-1/MB-2、MB-4 至 MB-9 等价契约均有明确用例和证据；未到对应里程碑的能力均明确拒绝。
