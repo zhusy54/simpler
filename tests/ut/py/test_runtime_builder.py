@@ -67,6 +67,12 @@ class TestRuntimeBuilderDiscovery:
         runtimes = builder.list_runtimes()
         assert "host_build_graph" in runtimes
 
+    def test_discovers_a5_host_build_graph_aicore_only(self):
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+        assert "host_build_graph_aicore" in RuntimeBuilder(platform="a5sim").list_runtimes()
+        assert "host_build_graph_aicore" not in RuntimeBuilder(platform="a2a3sim").list_runtimes()
+
     def test_runtime_dir_resolves_to_project_root(self, default_test_platform, test_arch):
         """runtime_dir resolves to src/{arch}/runtime/ under the project root."""
         from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
