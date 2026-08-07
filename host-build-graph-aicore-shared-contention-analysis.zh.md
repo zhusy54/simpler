@@ -2,10 +2,12 @@
 
 | 项目 | 内容 |
 | ---- | ---- |
-| 状态 | 设计分析；M3 使用 MPMC 基线契约，M8 使用 ReadyQ 候选优化与 A5 对比 |
+| 状态 | 设计分析；M3 使用复制后的 HBG MPMC，M4～M9 使用 v1 MPMC，O3 才评估 ReadyQ 候选 |
 | 调度模型 | 共享 ReadyQ、自主 Pull、领取者本核执行 |
 | 范围 | 单 lane 正常运行热路径 |
-| 不包含 | 启动/退出、first-error/drain、M5/M6 wide/MIX/`sync_start` |
+| 实现归属 | 与 HBG 平级的 `host_build_graph_aicore`；M0 冻结复制后独立维护，不共享 runtime-specific 源码 |
+| 原子实现参考 | `../simpler-dist/src/a5/runtime/fully_distributed_within_core/runtime/dist_engine/common/atomic.h`；复制裁剪后独立维护 |
+| 不包含 | 启动/退出、first-error/drain、M7/M8 wide/MIX/`sync_start` |
 | 关联计划 | [Host 提前构图与 AICore 解依赖调度实现计划书](host-build-graph-aicore-scheduler-plan.zh.md) |
 
 ## 1. 结论
@@ -13,13 +15,13 @@
 从原始设计中的 task/wake 共享操作开始消减后，`WAITING -> READY` 和独立 claim 不进入最终
 运行期 ABI；`next_waiter` 发布并入 wake-list 注册协议。最终保留 completion、wake-list 注册、
 wake-list 关闭和 `completed_count` 四项。ReadyQ 自身另作一组，因为其内部包含 cursor、slot
-sequence 等多项原子操作。M8 候选实现的 bitmap word 原子操作在同文档中单独分析。
+sequence 等多项原子操作。O3 候选实现的 bitmap word 原子操作在同文档中单独分析。
 
 | 序号 | 共享操作 | 正确性作用 | 推荐结论 |
 | ---- | -------- | ---------- | -------- |
 | 1 | `WAITING -> READY` | 可选的重复发布诊断 | 正确 Pull 协议没有竞争，建议从正确性热路径删除 |
-| 2 | ReadySet 所有权转移 | 保证 task exactly-once | M3 以 MPMC 成功 pop 完成领取；M8 候选也必须复用自身唯一消费操作，不设独立 claim 字段 |
-| 3 | completion 发布 | 让其他 core 观察 kernel/DUMMY 完成 | 唯一 writer，使用 release store，不做 CAS |
+| 2 | ReadySet 所有权转移 | 保证 task exactly-once | M3 以 HBG MPMC 成功 pop 完成领取；O3 候选也必须复用自身唯一消费操作，不设独立 claim 字段 |
+| 3 | completion 发布 | 让其他 core 观察 kernel/DUMMY 完成 | 唯一 writer，使用 publish store + DCCI/barrier，不做 CAS |
 | 4 | wake-list 注册协议 | 发布 `next_waiter`，并把 waiter 挂到 producer | `next_waiter` 不做 RMW；仅对 head 做 CAS push |
 | 5 | `wake_list_head` 关闭 | completion 与 waiter 注册并发时不丢唤醒 | 保留 atomic exchange |
 | 6 | `completed_count` | 判断整图完成 | 每核本地累计；完整空闲扫描后批量 `fetch_add` |
@@ -29,7 +31,28 @@ sequence 等多项原子操作。M8 候选实现的 bitmap word 原子操作在�
 领取操作直接转移。completion 以及注册协议中的 `next_waiter` 发布主要解决跨核可见性，
 不是多 writer 热点。
 
-## 2. MPMC 基线与 M8 ReadyQ 候选
+### 1.1 v0 ABI view 与 FDWIC atomic 参考边界
+
+现有 HBG 的调度热状态由 `std::atomic<T>`、已经重定位的设备指针和固定布局对象承载。v0 不
+复制一套平行 wire 对象，而是在 AICore 侧定义 CCEC 可编译的 ABI view，以 raw integer/GM 地址
+访问同一块 HBG graph image。Host 编译单元必须用 `sizeof`、`alignof` 和关键 `offsetof` 断言
+证明 view 与复制后的 HBG 类型一致；AICore 通过 runtime-local wrapper 执行 A5 GM 原子。
+
+实现允许从 `simpler-dist` FDWIC 的 `runtime/dist_engine/common/atomic.h` 和
+`runtime_state.h` 复制以下已验证模式，再在新目录独立维护：
+
+- load：CCEC 使用返回旧值的 `atomicAdd(addr, 0)`，适用的 signed-64 路径可使用
+  `atomicMax(addr, INT64_MIN)` identity；
+- CAS：使用 `atomicCAS` 并返回 observed old value，不伪装成 `std::atomic` 的 bool 接口；
+- exchange/fetch-add：分别使用 `atomicExch`/`atomicAdd`；
+- first-error：CAS 首个非零 error code，显式 store barrier 后再发布 fatal。
+
+该 wrapper 只提供本方案实际需要的原语，不复制 FDWIC 的 claim cursor、任务环或固定
+`DistGlobal`。CCEC 分支不能仅靠 `memory_order` 参数声明跨核可见性；completion、wake
+registration 和 first-error 的 DCCI/barrier 位置仍由各自协议明确规定。v0 保持 HBG 现有
+64B `PTO2TaskSlotState`；独立 128B task control 及其邻居 clobber seam 从 v1/M4 开始生效。
+
+## 2. MPMC 基线与 O3 ReadyQ 候选
 
 ### 2.1 本方案对 ReadyQ 的特殊约束
 
@@ -41,24 +64,28 @@ Host 在启动前已经生成完整图，因此：
 - 单 lane Pull 不会因为目标 core 不可用而重新入队；
 - 调度不要求 FIFO，只要求无丢失、exactly-once 和无饥饿。
 
-这些条件比通用 MPMC queue 更强，但 M0 至 M7 仍固定使用循环 MPMC 作为可审查、
-可回退的正确性基线；ready set 替代方案只在 M8 实现和评估。
+这些条件比通用 MPMC queue 更强，但 M1～M3 固定使用复制后的 HBG 循环 MPMC，M4～M9
+使用 v1 task-id MPMC；ready set 替代方案只在 M9 验收后的 O3 实现和评估。
 
 ### 2.2 Vyukov bounded MPMC 基线
 
-MPMC 为每种资源类型维护一个有界队列：
+v0 为每种资源类型使用复制自 HBG 的有界队列：
 
 - producer CAS `enqueue_pos`，再以 release store 发布 slot `sequence`；
 - consumer CAS `dequeue_pos`，以 acquire load 读取 `sequence`；
 - slot generation 防止环回后的 ABA；
-- task id 是普通 payload，不保存设备指针。
+- slot 保存已重定位的 `PTO2TaskSlotState*` 和 `task_id_snapshot`；AICore ABI view 访问相同字节
+  布局，不另建 task-id queue。
+
+v1 才把 payload 收敛为稳定 task id，弹出后通过 graph base 定位 record/control。两者共享
+Vyukov cursor/sequence 算法和“成功 pop 即 ownership 转移”的不变量。
 
 优点是算法成熟、支持任意入队顺序和 slot 复用。主要成本是每次 push/pop 都访问全局 cursor
 和 per-slot sequence；大量 core 同时 Pull 时，`dequeue_pos` 是集中热点。batch push/pop 可以
 摊薄 cursor CAS，但会让一个 core 一次取得多个 task，不适合直接用于“领取后同步执行”的
 单-task Pull，除非额外维护本地待执行缓存。
 
-### 2.3 M8 其他免锁实现比较
+### 2.3 O3 其他免锁实现比较
 
 | 方案 | 原子热点 | 优点 | 主要问题 |
 | ---- | -------- | ---- | -------- |
@@ -70,7 +97,7 @@ MPMC 为每种资源类型维护一个有界队列：
 理论上，两级 ready bitmap 最匹配本方案的一次 ready/一次领取语义。它不维护 FIFO，也不
 为永不重新入队的 task 支付 sequence/generation 成本。
 
-### 2.4 M8 两级 ready bitmap 提案
+### 2.4 O3 两级 ready bitmap 提案
 
 每个资源类型维护：
 
@@ -106,11 +133,11 @@ Pull 顺序：
 同一 word 上不同 task bit 的 `fetch_or/fetch_and` 仍会串行，因此 bitmap 不是“无竞争”，而是
 把全局 cursor 热点分散到多个 word。收益取决于 ready task 的分布、core 数和 A5 原子代价。
 
-### 2.5 M8 理论推荐和采用条件
+### 2.5 O3 理论推荐和采用条件
 
-M8 的理论候选是两级 ready bitmap，因为它直接表达固定 task 集合的
+O3 的理论候选是两级 ready bitmap，因为它直接表达固定 task 集合的
 ready/unacquired 状态，内存约为 1 bit/task，且原子清除 bit 本身就是 exactly-once
-领取。Vyukov MPMC 是 M0 至 M7 的交付实现和 M8 对比基线，候选方案只有在 M8
+领取。Vyukov MPMC 是 M1 至 M9 的交付实现和 O3 对比基线，候选方案只有在 O3
 形成完整 A5 证据后才能替换它。
 
 bitmap 只有同时满足以下条件才替换 MPMC：
@@ -125,7 +152,8 @@ bitmap 只有同时满足以下条件才替换 MPMC：
 ## 3. Task 状态是否需要直接 CAS
 
 技术上可以，但 Pull 正确性不需要独立 task state CAS。依赖子系统通过 fanin、wake list 和
-ReadySet 判断 task 所在位置；任务所有权由 ReadySet 自身的唯一领取操作转移：
+ReadySet 判断 task 所在位置；任务所有权由 ReadySet 自身的唯一领取操作转移。v0 ReadyQ
+元素是 HBG slot pointer/tag，v1 才是 task id：
 
 ```text
 逻辑位置：wake list -> ReadyQ/bitmap -> executing -> complete
@@ -180,7 +208,8 @@ MPMC 方案必须把“task 只 push 一次”提升为正式不变量：initial
 
 ### 4.2 ReadySet 所有权转移
 
-- **在做什么**：空闲 core 从共享 ReadySet 取得 task id 后，直接成为该 task 的唯一执行者，
+- **在做什么**：空闲 core 从共享 ReadySet 取得 v0 slot pointer 或 v1 task id 后，直接成为该
+  task 的唯一执行者，
   随后物化本地 execution slot并调用 kernel。这里仍有“领取”这个逻辑动作，但不再有独立
   所有权字段或第二次原子操作。
 - **为什么需要唯一所有权**：kernel、completion 和 wake relay 都不能执行两次。exactly-once
@@ -209,10 +238,11 @@ MPMC 方案必须把“task 只 push 一次”提升为正式不变量：initial
 - **竞争在哪里**：ReadySet exactly-once 领取保证只有一个 completion writer，因此没有 writer-writer
   竞争；竞争表现为一个 core 发布时，多个 classifier/relayer core 并发 acquire-load 同一个
   completion word。它是发布/观察同步点，而不是 CAS winner 竞争。
-- **为什么同步有必要**：A5 普通 GM 不提供可假定的跨核自动一致性。需要 `after_task` 对输出
-  做 DCCI clean 加 barrier，再以 release 语义发布 completion；reader acquire 观察完成后，
-  `before_task` 负责 invalidate 对应输入。只有这条 happens-before 链能把数据和控制状态关联。
-- **如何消减**：completion 由唯一 writer 用 release store，不使用 exchange/CAS；fanin 扫描
+- **为什么同步有必要**：A5 普通 GM 不提供可假定的跨核自动一致性。v0 沿用 HBG 的通用
+  DCCI/barrier 顺序：先发布输出，再以 release 语义发布 completion；reader acquire 观察完成后，
+  在读取 payload/输入前执行对应观察操作。只有这条 happens-before 链能把数据和控制状态关联。
+- **如何消减**：completion 由唯一 writer 用 runtime-local publish store 加明确的
+  DCCI/barrier，不使用 exchange/CAS；fanin 扫描
   遇到第一个未完成 producer 即停止，减少 completion load；每 task 独立 control cache line，
   避免相邻 task 的 DCCI 或原子访问互相覆盖。
 - **为什么有效**：release store 保留所需的单向发布顺序，但避免 RMW 带来的独占 cache-line
@@ -234,9 +264,10 @@ MPMC 方案必须把“task 只 push 一次”提升为正式不变量：initial
   head，分别写入自己的 node，后写者覆盖先写者，其中一条 waiter 链永久丢失。CAS push 把
   “观察旧 head、把 next 指向旧 head、安装新 head”线性化。同时必须保证 `next_waiter` 先于
   head 对完成 core 可见，否则 head CAS 虽然正确，producer 仍可能只能遍历到链首。
-- **完整操作顺序**：读取旧 head；写 `waiter.next_waiter = old_head`；用 release atomic store
-  或明确的 DCCI clean + barrier 发布 next；CAS `wake_list_head`。CAS 失败后使用返回的新 head
-  重写 `next_waiter` 并重试。`next_waiter` 保存稳定 task id，不保存设备指针，也不单独做 CAS。
+- **完整操作顺序**：读取旧 head；写 `waiter.next_waiter = old_head`；用 runtime-local publish
+  store 或明确的 DCCI clean + barrier 发布 next；CAS `wake_list_head`。CAS 失败后使用返回的新
+  head 重写 `next_waiter` 并重试。v0 的 head/next 保存已重定位的 HBG GM pointer；v1 才保存稳定
+  task id。`next_waiter` 在两种 ABI 中都不单独做 CAS。
 - **如何消减**：第一层采用稳定的旋转 fanin 起点，例如由 consumer task id 派生扫描起点，
   使不同 consumer 不总选择同一个“第一个 fanin”。第二层可让一个 classifier shard 先把同一
   producer 的多个 waiter 串成本地链，再用一次 CAS 批量挂接。只有 DFX 证明单 head 仍为热点
@@ -290,24 +321,25 @@ MPMC 方案必须把“task 只 push 一次”提升为正式不变量：initial
   O(busy period 数)。最后一批任务完成后，执行 core 必然回到调度循环、完成一次空闲扫描并
   提交剩余 delta，因此不会漏计；新任务在提交后出现也只会进入下一批，不会提前完成。
 
-## 5. M3 基线与 M8 候选的 DFX 和验证
+## 5. M3/v1 基线与 O3 候选的 DFX 和验证
 
 每 core 记录局部 counters，结束时汇总，避免 DFX 自身制造共享热点：
 
 - MPMC enqueue/dequeue CAS attempt、fail、sequence wait cycle；
-- M8 增加 bitmap L0/L1 atomic、bit-clear retry、fallback scan、hot-word max retry；
-- MPMC pop winner；M8 增加 bitmap duplicate-set/clear-bit winner；
+- O3 增加 bitmap L0/L1 atomic、bit-clear retry、fallback scan、hot-word max retry；
+- MPMC pop winner；O3 增加 bitmap duplicate-set/clear-bit winner；
 - wake register CAS retry、close-race reclassify；
 - completion publish、completed-batch flush count/size/atomic cycle。
 
 CPU 模型必须覆盖：
 
 - READY 重复发布、重复 queue entry 和 ReadySet 唯一领取；
-- M8 覆盖 bitmap set/acquire、L1 清位与 producer set 的全部交错；
+- O3 覆盖 bitmap set/acquire、L1 清位与 producer set 的全部交错；
 - wake 注册协议中 `next_waiter` 发布、head CAS 与 exchange close 的全部交错；
 - 乱序完成、busy/idle 反复切换以及 flush 后立即出现新任务时，批量计数无漏计、重复或提前退出。
 
-M3 和 M4 以 root burst、单 producer 多 waiter、高 fanin 和随机 DAG 验证基础 MPMC，
+M3 验证复制后的 HBG MPMC，M4 起验证 v1 task-id MPMC；两者都以 root burst、单 producer
+多 waiter、高 fanin 和随机 DAG
 报告 atomic 次数、CAS retry、ready-to-start、调度周期、总时延和各 core 任务分布。
-M8 再增加稀疏尾部、热点 bitmap word、热点 shard 和非 64 对齐任务数，对比 MPMC、
+O3 再增加稀疏尾部、热点 bitmap word、热点 shard 和非 64 对齐任务数，对比 MPMC、
 sharded MPMC 和 bitmap 的完整正确性与性能证据。
