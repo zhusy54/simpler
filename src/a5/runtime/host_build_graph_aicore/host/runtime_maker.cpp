@@ -215,10 +215,9 @@ static void apply_env_ring_values(
 }
 
 // ring_task_window / ring_heap / ring_dep_pool point into the #pragma pack(1)
-// RuntimeEnv wire struct (call_config.h), so their uint64_t entries are only
-// byte-aligned — runtime_env sits at offset 28 in CallConfig (after 7 int32_t),
-// i.e. 4-byte but not 8-byte aligned. Reading them as `base[idx]` is an
-// unaligned 8-byte load: UB, and fatal under UBSan (-fsanitize=alignment). Copy
+// RuntimeEnv wire struct (call_config.h), so the enclosing object provides no
+// uint64_t alignment guarantee. Reading them as `base[idx]` can be an unaligned
+// 8-byte load: UB, and fatal under UBSan (-fsanitize=alignment). Copy
 // the bytes out instead. A null base means "no per-task overrides" -> 0 (unset).
 static uint64_t read_ring_override(const uint64_t *base, int idx) {
     if (base == nullptr) {
@@ -444,6 +443,77 @@ static bool relocate_host_orch_image(
         }
     }
     return ok;
+}
+
+void release_aicore_sidecar(Runtime *runtime, const HostApi *api) {
+    if (runtime != nullptr && api != nullptr && runtime->aicore_sidecar_allocation != nullptr) {
+        api->device_free(runtime->aicore_sidecar_allocation);
+        runtime->aicore_sidecar_base = nullptr;
+        runtime->aicore_sidecar_allocation = nullptr;
+        runtime->aicore_sidecar_allocation_size = 0;
+        runtime->aicore_sidecar_layout = {};
+    }
+}
+
+bool create_empty_aicore_sidecar(Runtime *runtime, const HostApi *api) {
+    AicoreExecutionSidecarLayoutV0 layout{};
+    if (!aicore_sidecar_plan_v0(0, 0, 0, &layout) ||
+        layout.total_size > std::numeric_limits<uint64_t>::max() - (AICORE_SIDECAR_ALIGNMENT_V0 - 1)) {
+        LOG_ERROR("HBG-AICore: empty sidecar layout overflow");
+        return false;
+    }
+
+    const uint64_t allocation_size = layout.total_size + AICORE_SIDECAR_ALIGNMENT_V0 - 1;
+    void *allocation = api->device_malloc(static_cast<size_t>(allocation_size));
+    if (allocation == nullptr) {
+        LOG_ERROR("HBG-AICore: failed to allocate %" PRIu64 " sidecar bytes", allocation_size);
+        return false;
+    }
+    const uintptr_t aligned_address = (reinterpret_cast<uintptr_t>(allocation) + AICORE_SIDECAR_ALIGNMENT_V0 - 1) &
+                                      ~(static_cast<uintptr_t>(AICORE_SIDECAR_ALIGNMENT_V0) - 1);
+
+    std::vector<uint8_t> storage(static_cast<size_t>(allocation_size));
+    const uintptr_t host_aligned_address =
+        (reinterpret_cast<uintptr_t>(storage.data()) + AICORE_SIDECAR_ALIGNMENT_V0 - 1) &
+        ~(static_cast<uintptr_t>(AICORE_SIDECAR_ALIGNMENT_V0) - 1);
+    void *host_base = reinterpret_cast<void *>(host_aligned_address);
+    if (!aicore_sidecar_init_v0(host_base, layout)) {
+        api->device_free(allocation);
+        LOG_ERROR("HBG-AICore: failed to initialize empty sidecar");
+        return false;
+    }
+
+    auto *contexts = aicore_sidecar_at_v0<AicoreWorkerContextV0>(host_base, layout.worker_contexts_offset);
+    int32_t aic_rank = 0;
+    int32_t aiv_rank = 0;
+    for (int32_t i = 0; i < runtime->get_worker_count(); ++i) {
+        AicoreWorkerContextV0 &context = contexts[i];
+        context.core_type = static_cast<int32_t>(runtime->workers[i].core_type);
+        context.physical_core_id = -1;
+        context.type_rank = context.core_type == static_cast<int32_t>(CoreType::AIC) ? aic_rank++ : aiv_rank++;
+        context.active = 0;
+        context.run_control_offset = layout.run_control_offset;
+        context.task_controls_offset = layout.task_controls_offset;
+        context.aic_queue_offset = layout.aic_queue_offset;
+        context.aiv_queue_offset = layout.aiv_queue_offset;
+        context.readonly_graph_address = reinterpret_cast<uint64_t>(runtime->get_gm_sm_ptr());
+        context.sidecar_base_address = aligned_address;
+        context.dispatch_payload_offset =
+            layout.dispatch_payloads_offset + static_cast<uint64_t>(i) * sizeof(PTO2DispatchPayload);
+    }
+
+    if (api->copy_to_device(
+            reinterpret_cast<void *>(aligned_address), host_base, static_cast<size_t>(layout.total_size)
+        ) != 0) {
+        api->device_free(allocation);
+        LOG_ERROR("HBG-AICore: failed to publish empty sidecar");
+        return false;
+    }
+    runtime->aicore_sidecar_base = reinterpret_cast<void *>(aligned_address);
+    runtime->aicore_sidecar_allocation = allocation;
+    runtime->aicore_sidecar_allocation_size = allocation_size;
+    runtime->aicore_sidecar_layout = layout;
+    return true;
 }
 
 int32_t run_host_orchestration(
@@ -867,6 +937,16 @@ extern "C" int bind_callable_to_runtime_impl(
         LOG_INFO("host-orch: submitted %d tasks on host", total_tasks);
     }
 
+    // M0 deliberately accepts only an empty graph. A non-empty graph would
+    // execute real tasks and belongs to M1, even though HBG built the image.
+    if (runtime->host_total_tasks != 0) {
+        LOG_ERROR("HBG-AICore M0 accepts only an empty graph; got %d tasks", runtime->host_total_tasks);
+        return -1;
+    }
+    if (!create_empty_aicore_sidecar(runtime, api)) {
+        return -1;
+    }
+
     // Stash the layout inside the PTO2Runtime image so the AICPU can recover
     // every arena-internal offset after rtMemcpy. The runtime arena's device
     // base does NOT travel in this image — it's on the host Runtime
@@ -877,6 +957,7 @@ extern "C" int bind_callable_to_runtime_impl(
     int rc_upload = api->copy_to_device(runtime_arena_dev, host_arena.base(), layout.arena_size);
     if (rc_upload != 0) {
         LOG_ERROR("Failed to rtMemcpy prebuilt runtime arena to device (rc=%d)", rc_upload);
+        release_aicore_sidecar(runtime, api);
         return -1;
     }
     runtime->set_prebuilt_arena(runtime_arena_dev, layout.off_runtime);
@@ -986,6 +1067,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
         }
     }
     LOG_INFO("Freed %d device allocations", tensor_pair_count);
+    release_aicore_sidecar(runtime, api);
 
     // Clear the per-run dispatch-table entries staged by register_callable_impl.
     // The underlying chip-callable device buffer is pool-managed by

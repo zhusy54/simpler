@@ -35,6 +35,10 @@ Runtime::Runtime() {
     aicpu_allowed_cpu_count = 0;
     aicpu_launch_count = 0;
     host_total_tasks = 0;
+    aicore_sidecar_base = nullptr;
+    aicore_sidecar_allocation = nullptr;
+    aicore_sidecar_allocation_size = 0;
+    aicore_sidecar_layout = {};
 
     // Initialize shared-memory / orchestration argument plumbing
     gm_sm_ptr_ = nullptr;

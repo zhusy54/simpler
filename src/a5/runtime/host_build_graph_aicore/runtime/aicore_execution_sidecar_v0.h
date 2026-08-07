@@ -85,7 +85,7 @@ struct alignas(128) AicoreWorkerContextV0 {
     uint64_t aic_queue_offset;
     uint64_t aiv_queue_offset;
     uint64_t readonly_graph_address;
-    uint64_t readonly_scheduler_address;
+    uint64_t sidecar_base_address;
     uint64_t dispatch_payload_offset;
     uint64_t local_completed_delta;
     uint64_t poll_count;
@@ -172,9 +172,7 @@ inline bool aicore_sidecar_next_power_of_two_v0(uint64_t value, uint64_t *out) {
     return true;
 }
 
-inline bool aicore_sidecar_reserve_v0(
-    uint64_t *cursor, uint64_t size, uint64_t alignment, uint64_t *offset
-) {
+inline bool aicore_sidecar_reserve_v0(uint64_t *cursor, uint64_t size, uint64_t alignment, uint64_t *offset) {
     uint64_t aligned = 0;
     if (cursor == nullptr || offset == nullptr || !aicore_sidecar_checked_align_v0(*cursor, alignment, &aligned)) {
         return false;
@@ -209,29 +207,21 @@ inline bool aicore_sidecar_plan_v0(
             &cursor, sizeof(AicoreRunControlV0), alignof(AicoreRunControlV0), &next.run_control_offset
         ) ||
         !aicore_sidecar_checked_mul_v0(AICORE_WORKER_CAPACITY_V0, sizeof(AicoreWorkerContextV0), &bytes) ||
-        !aicore_sidecar_reserve_v0(
-            &cursor, bytes, alignof(AicoreWorkerContextV0), &next.worker_contexts_offset
-        ) ||
+        !aicore_sidecar_reserve_v0(&cursor, bytes, alignof(AicoreWorkerContextV0), &next.worker_contexts_offset) ||
         !aicore_sidecar_checked_mul_v0(AICORE_WORKER_CAPACITY_V0, sizeof(PTO2DispatchPayload), &bytes) ||
-        !aicore_sidecar_reserve_v0(
-            &cursor, bytes, alignof(PTO2DispatchPayload), &next.dispatch_payloads_offset
-        ) ||
+        !aicore_sidecar_reserve_v0(&cursor, bytes, alignof(PTO2DispatchPayload), &next.dispatch_payloads_offset) ||
         !aicore_sidecar_checked_mul_v0(task_count, sizeof(AicoreTaskControlV0), &bytes) ||
         !aicore_sidecar_reserve_v0(&cursor, bytes, alignof(AicoreTaskControlV0), &next.task_controls_offset) ||
         !aicore_sidecar_reserve_v0(
             &cursor, sizeof(AicoreReadyQueueV0), alignof(AicoreReadyQueueV0), &next.aic_queue_offset
         ) ||
         !aicore_sidecar_checked_mul_v0(next.aic_queue_capacity, sizeof(AicoreReadyQueueSlotV0), &bytes) ||
-        !aicore_sidecar_reserve_v0(
-            &cursor, bytes, alignof(AicoreReadyQueueSlotV0), &next.aic_queue_slots_offset
-        ) ||
+        !aicore_sidecar_reserve_v0(&cursor, bytes, alignof(AicoreReadyQueueSlotV0), &next.aic_queue_slots_offset) ||
         !aicore_sidecar_reserve_v0(
             &cursor, sizeof(AicoreReadyQueueV0), alignof(AicoreReadyQueueV0), &next.aiv_queue_offset
         ) ||
         !aicore_sidecar_checked_mul_v0(next.aiv_queue_capacity, sizeof(AicoreReadyQueueSlotV0), &bytes) ||
-        !aicore_sidecar_reserve_v0(
-            &cursor, bytes, alignof(AicoreReadyQueueSlotV0), &next.aiv_queue_slots_offset
-        ) ||
+        !aicore_sidecar_reserve_v0(&cursor, bytes, alignof(AicoreReadyQueueSlotV0), &next.aiv_queue_slots_offset) ||
         !aicore_sidecar_checked_align_v0(cursor, AICORE_SIDECAR_ALIGNMENT_V0, &next.total_size)) {
         return false;
     }
@@ -251,8 +241,7 @@ inline bool aicore_sidecar_init_v0(void *base, const AicoreExecutionSidecarLayou
     }
     __builtin_memset(base, 0, static_cast<size_t>(layout.total_size));
 
-    AicoreTaskControlV0 *controls =
-        aicore_sidecar_at_v0<AicoreTaskControlV0>(base, layout.task_controls_offset);
+    AicoreTaskControlV0 *controls = aicore_sidecar_at_v0<AicoreTaskControlV0>(base, layout.task_controls_offset);
     for (uint64_t i = 0; i < layout.task_count; ++i) {
         controls[i].completion = 0;
         controls[i].wake_list_head = AICORE_TASK_ID_INVALID_V0;

@@ -15,6 +15,7 @@
 #include "aicore/pmu_collector_aicore.h"
 #include "common/chip_swimlane_profiling.h"
 #include "common/platform_config.h"  // Register-based communication
+#include "aicore_gm_atomic.h"
 #include "pto2_dispatch_payload.h"
 #include "runtime.h"
 
@@ -101,6 +102,25 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     // above cannot clobber it) and before opening the window; dcci to read its
     // fresh value here.
     dcci(my_hank, SINGLE_CACHE_LINE);
+    __gm__ AicoreWorkerContextV0 *worker_context = reinterpret_cast<__gm__ AicoreWorkerContextV0 *>(my_hank->task);
+    dcci(worker_context, ENTIRE_DATA_CACHE);
+    worker_context->physical_core_id = static_cast<int32_t>(my_hank->physical_core_id);
+    OUT_OF_ORDER_STORE_BARRIER();
+    dcci(worker_context, ENTIRE_DATA_CACHE, CACHELINE_OUT);
+
+    __gm__ void *sidecar_base = reinterpret_cast<__gm__ void *>(worker_context->sidecar_base_address);
+    __gm__ AicoreRunControlV0 *run_control =
+        aicore_sidecar_at_v0<AicoreRunControlV0>(sidecar_base, worker_context->run_control_offset);
+    aicore_gm_fetch_add_v0(run_control->attached_count, UINT64_C(1));
+    aicore_gm_fetch_add_v0(run_control->classified_count, UINT64_C(1));
+    while (aicore_gm_load_v0(run_control->exit_requested) == 0) {
+        SPIN_WAIT_HINT();
+    }
+    write_reg(RegId::COND, AICORE_EXITED_VALUE);
+    OUT_OF_ORDER_STORE_BARRIER();
+    aicore_gm_fetch_add_v0(run_control->finished_count, UINT64_C(1));
+    return;
+
     __gm__ PTO2DispatchPayload *payload = reinterpret_cast<__gm__ PTO2DispatchPayload *>(my_hank->task);
 
     uint32_t enable_profiling_flag = get_aicore_profiling_flag();

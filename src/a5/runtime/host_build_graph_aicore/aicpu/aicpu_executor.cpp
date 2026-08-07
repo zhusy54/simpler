@@ -22,6 +22,7 @@
 
 #include "aicpu/device_time.h"
 #include "aicpu/device_phase_aicpu.h"
+#include "aicpu/cache_maintenance.h"
 #include "callable_protocol.h"
 #include "pto2_dispatch_payload.h"
 #include "runtime.h"
@@ -226,6 +227,46 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         return -1;
     }
     int32_t run_rc = 0;
+
+    // M0 resident lifecycle: every physical AIC/AIV has attached to its own
+    // sidecar context during the handshake. The supervisor publishes one
+    // empty-graph exit after all cores report classified, then waits until all
+    // of them acknowledge finish. No HBG task or mutable graph state is read.
+    if (runtime->aicore_sidecar_base == nullptr || runtime->host_total_tasks != 0) {
+        LOG_ERROR("HBG-AICore M0 requires an initialized empty-graph sidecar");
+        run_rc = -1;
+        runtime_init_ready_.store(true, std::memory_order_release);
+    } else if (thread_idx == aicpu_thread_num_ - 1) {
+        auto *run_control = aicore_sidecar_at_v0<AicoreRunControlV0>(
+            runtime->aicore_sidecar_base, runtime->aicore_sidecar_layout.run_control_offset
+        );
+        while (true) {
+            cache_invalidate_range(run_control, sizeof(*run_control));
+            if (run_control->attached_count == static_cast<uint64_t>(runtime->worker_count) &&
+                run_control->classified_count == static_cast<uint64_t>(runtime->worker_count)) {
+                break;
+            }
+            SPIN_WAIT_HINT();
+        }
+        run_control->exit_requested = 1;
+        cache_flush_range(run_control, sizeof(*run_control));
+        while (true) {
+            cache_invalidate_range(run_control, sizeof(*run_control));
+            if (run_control->finished_count == static_cast<uint64_t>(runtime->worker_count)) break;
+            SPIN_WAIT_HINT();
+        }
+        runtime_init_ready_.store(true, std::memory_order_release);
+    } else {
+        while (!runtime_init_ready_.load(std::memory_order_acquire))
+            SPIN_WAIT_HINT();
+    }
+
+    int32_t m0_shutdown_rc = sched_ctx_.shutdown(thread_idx);
+    if (m0_shutdown_rc != 0 && run_rc == 0) run_rc = m0_shutdown_rc;
+    completion_gate_.arrive_and_finalize_if_last(aicpu_thread_num_, [&] {
+        aicpu_publish_task_timing_tail_usage(aicpu_thread_num_);
+    });
+    return run_rc;
 
     // Boot: the last AICPU thread (aicpu_thread_num_ - 1) performs the one-time
     // host-orch attach. host_build_graph's orchestrator already ran on the host,

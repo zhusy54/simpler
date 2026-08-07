@@ -39,6 +39,7 @@
 #include "common/chip_swimlane_profiling.h"
 #include "common/platform_config.h"
 #include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
+#include "aicore_execution_sidecar_v0.h"
 #include "pto2_dispatch_payload.h"
 #include "task_args.h"
 
@@ -171,6 +172,13 @@ public:
     // head on device. host_build_graph builds the whole graph on the host, so
     // the boot thread reads this instead of counting SM ring heads.
     int32_t host_total_tasks;
+
+    // Per-run mutable AICore state. Device code uses the aligned base; Host
+    // cleanup retains the original allocation returned by device_malloc.
+    void *aicore_sidecar_base;
+    void *aicore_sidecar_allocation;
+    uint64_t aicore_sidecar_allocation_size;
+    AicoreExecutionSidecarLayoutV0 aicore_sidecar_layout;
 
 private:
     // Kernel binary tracking for cleanup

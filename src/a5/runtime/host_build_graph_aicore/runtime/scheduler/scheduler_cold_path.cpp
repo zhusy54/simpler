@@ -655,12 +655,15 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
         }
     }
 
-    // Phase 2: publish every task pointer, then ONE barrier. The core reads task
+    // Phase 2: publish every resident worker-context pointer, then ONE barrier. The core reads task
     // only after its window opens (Phase 3); a single barrier orders all task
     // stores before any window STR. Writing task now (after the report) also
     // keeps the core's CACHELINE_OUT report flush from clobbering it.
     for (int32_t r = 0; r < n_ready; r++) {
-        all_handshakes[ready[r].i].task = reinterpret_cast<uint64_t>(&payload_per_core_[ready[r].i][0]);
+        all_handshakes[ready[r].i].task = reinterpret_cast<uint64_t>(aicore_sidecar_at_v0<AicoreWorkerContextV0>(
+            runtime->aicore_sidecar_base, runtime->aicore_sidecar_layout.worker_contexts_offset +
+                                              static_cast<uint64_t>(ready[r].i) * sizeof(AicoreWorkerContextV0)
+        ));
     }
     OUT_OF_ORDER_STORE_BARRIER();
 

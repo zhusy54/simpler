@@ -203,10 +203,9 @@ static void apply_env_ring_values(
 }
 
 // ring_task_window / ring_heap / ring_dep_pool point into the #pragma pack(1)
-// RuntimeEnv wire struct (call_config.h), so their uint64_t entries are only
-// byte-aligned — runtime_env sits at offset 28 in CallConfig (after 7 int32_t),
-// i.e. 4-byte but not 8-byte aligned. Reading them as `base[idx]` is an
-// unaligned 8-byte load: UB, and fatal under UBSan (-fsanitize=alignment). Copy
+// RuntimeEnv wire struct (call_config.h), so the enclosing object provides no
+// uint64_t alignment guarantee. Reading them as `base[idx]` can be an unaligned
+// 8-byte load: UB, and fatal under UBSan (-fsanitize=alignment). Copy
 // the bytes out instead. A null base means "no per-task overrides" -> 0 (unset).
 static uint64_t read_ring_override(const uint64_t *base, int idx) {
     if (base == nullptr) {
