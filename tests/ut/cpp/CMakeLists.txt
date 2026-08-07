@@ -173,6 +173,27 @@ function(add_a5_hbg_runtime_test name src)
     set_tests_properties(${name} PROPERTIES LABELS "no_hardware")
 endfunction()
 
+function(add_a5_hbg_aicore_runtime_test name src)
+    add_executable(${name} ${src})
+    target_include_directories(${name} PRIVATE
+        ${GTEST_INCLUDE_DIRS}
+        ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/host_build_graph_aicore/orchestration
+        ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/host_build_graph_aicore/runtime
+        ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/host_build_graph_aicore/common
+        ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+        ${CMAKE_SOURCE_DIR}/../../../src/common
+    )
+    target_link_libraries(${name} PRIVATE
+        ${GTEST_MAIN_LIB}
+        ${GTEST_LIB}
+        pthread
+    )
+    add_test(NAME ${name} COMMAND ${name})
+    set_tests_properties(${name} PROPERTIES LABELS "no_hardware")
+endfunction()
+
 function(add_a2a3_orchestrator_runtime_test name src)
     add_executable(${name}
         ${src}
@@ -759,6 +780,7 @@ target_sources(test_hbg_submit_poison PRIVATE
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
 )
 add_a5_hbg_runtime_test(test_a5_hbg_core_tracker common/test_hbg_core_tracker.cpp)
+add_a5_hbg_aicore_runtime_test(test_a5_hbg_aicore_sidecar a5/test_aicore_sidecar_v0.cpp)
 add_a2a3_hbg_runtime_test(test_graph_cache a2a3/test_graph_cache.cpp)
 target_sources(test_graph_cache PRIVATE
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/host_build_graph/runtime/scheduler/graph_execution.cpp
