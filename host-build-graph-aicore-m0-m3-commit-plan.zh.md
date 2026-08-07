@@ -13,7 +13,7 @@
 运行时包含、链接 HBG 私有源码。HBG 后续变化也不会自动同步，任何同步都必须经过显式差分
 评审和独立提交。
 
-第一阶段按以下顺序交付 17 个提交：
+第一阶段按以下顺序交付 16 个提交：
 
 1. M0 复制并冻结 HBG 基线，先建立 128B 隔离 sidecar 的功能门禁，再建立独立 Runtime 的
    resident 空图生命周期；
@@ -38,19 +38,21 @@
 - resident scheduler 使用 Runtime 自身的静态 AICore image；业务 kernel 继续通过现有
   `func_id_to_addr_`、`CoreCallable::resolved_addr()` 和 `PTO2DispatchPayload` 动态调用。
 
-### 2.2 每次运行的 scheduler 数量
+### 2.2 scheduler 与 worker 的动态角色
 
-`aicore_scheduler_count` 是运行拓扑，而不是 callable 编译身份的一部分，因此新增到
-`CallConfig`：
+单 lane 中每个参与运行的 AIC/AIV core 既是 scheduler，也是 worker：空闲时完成依赖分类、
+wake relay 和 ReadyQ Pull，领取 task 后立即执行 kernel，完成后再回到调度循环。M0～M2 不增加
+公开 scheduler 数量配置：
 
-- 默认值 `1`；`0` 表示分别使用全部可用 AIC 和 AIV core；正整数 `N` 表示每种实际使用的
-  core type 启用前 `N` 个 core；
-- 负数或超过实际使用类型的可用 core 数时，在启动设备任务前失败；未被图使用的 core type
-  不参与上限校验；
-- M1、M2 使用 `1`；M3 覆盖 `1`、`2`、`4`、`0`；
-- 其他 Runtime 忽略该字段，`aicpu_thread_num` 的现有语义不变；
-- Python binding、parent/child mailbox、remote L3 protocol、SceneTest config 和布局断言必须在
-  同一提交更新，remote protocol 显式升版。
+- M0 只验证空图 resident attach/exit，使用 Runtime 内部的确定性生命周期策略；
+- M1、M2 内部固定单个执行 core，先闭合单核 root 和 DAG 正确性；
+- 不按“前 N 个 core”永久划分 scheduler/worker，也不在依赖算法形成前升级 `CallConfig`、mailbox
+  或 remote protocol；
+- M3 引入多核 classify/Pull 时，根据图、设备拓扑和空闲 core 动态决定实际并发度；若需要可控的
+  正确性/性能实验轴，再增加可选 `CallConfig.aicore_scheduler_limit`。`0` 表示 Runtime 自动选择，
+  正整数只限制同时进行调度工作的 core 上限，不限制可执行 kernel 的 worker 总数；
+- 若 M3 增加该上限，binding、parent/child mailbox、remote L3 protocol、SceneTest config、布局断言、
+  非法值校验和旧 Runtime 回归必须在同一提交完成。
 
 ### 2.3 Graph ABI v0 与 128B 隔离执行 sidecar
 
@@ -145,7 +147,7 @@ A5 真机测试在占用设备前必须执行架构预检，随后通过项目�
 
 ## 4. 原子提交序列
 
-### 4.1 M0：复制基线与空图 resident 生命周期（提交 1～7）
+### 4.1 M0：复制基线与空图 resident 生命周期（提交 1～6）
 
 #### 提交 1：`docs: define HBG-AICore sibling runtime and frozen-copy baseline`
 
@@ -177,94 +179,92 @@ A5 真机测试在占用设备前必须执行架构预检，随后通过项目�
 - 验证：POD/布局断言、容量溢出、A5sim 编译；A5 手工 probe 必须先通过同 control 邻域压力、
   completion/wake 并发、queue slot 发布和普通数据可见性。任何邻位 clobber 都阻塞 M0。
 
-这是冻结复制后的第一个功能提交。后续 scheduler-count、resident lifecycle、root 执行和 DAG
+这是冻结复制后的第一个功能提交。后续 resident lifecycle、root 执行和 DAG
 调度提交都以本提交及其 A5 probe 通过为前置条件。
 
-#### 提交 5：`feat: add per-run AICore scheduler count`
-
-- 增加 `CallConfig.aicore_scheduler_count` 及 Python/mailbox/remote/SceneTest 支持。
-- 启动时根据 graph 使用的 core type 和设备拓扑解析 `1/2/4/all`。
-- 验证：默认值、wire round-trip、协议版本、非法值和旧 Runtime 忽略行为。
-
-#### 提交 6：`feat: run resident scheduler on an empty graph`
+#### 提交 5：`feat: run resident scheduler on an empty graph`
 
 - 用 FDWIC resident attach/start/finish 骨架替换复制来的逐任务 AICPU dispatch loop。
 - AICPU supervisor 建立 run/worker control，启动 scheduler，等待空图收敛并发布退出。
 - 空图不进入 Pull、不创建伪 task；inactive core 只参与受控 attach/exit。
 - 验证：A5sim 多轮启动/退出，无 hang、重复完成或遗留状态。
 
-#### 提交 7：`test: accept M0 copy parity and empty lifecycle`
+#### 提交 6：`test: accept M0 copy parity and empty lifecycle`
 
 - 增加 manual A5sim/A5 空图和 primitive SceneTestCase。
 - 重复 submit/finalize，验证 barrier、active/inactive core、退出计数和资源回收。
 - M0 出口：独立复制 Runtime 与 HBG 基线一致，并能完成 resident 空图生命周期。
 
-### 4.2 M1：单 core、单 root、真实 kernel（提交 8～10）
+### 4.2 M1：单 core、单 root、真实 kernel（提交 7～9）
 
-#### 提交 8：`test: lock task-id queue and graph-view parity`
+#### 提交 7：`test: lock task-id queue and graph-view parity`
 
 - 复用现有 `test_ready_queue.cpp` 的空/满、环回和 MPMC stress 轨迹，但验证 v0 task-id queue
   自身的 cursor、sequence、task id 和 AICore raw-atomic 发布协议。
 - HBG ReadyQ 只作为 Vyukov 算法参考，不要求与其 pointer slot 字节布局一致；额外验证相邻 queue
   slot 并发写不会 clobber。
 
-#### 提交 9：`feat: execute one root through existing callable addresses`
+#### 提交 8：`feat: execute one root through existing callable addresses`
 
 - 从复制后的只读 graph image 读取唯一零 fanin task，并把 task id 推入 sidecar AIC/AIV ReadyQ。
 - scheduler pop 后在本核 payload 中物化参数，通过现有 `func_id_to_addr_` 和
   `CoreCallable::resolved_addr()` 调用真实 kernel。
 - kernel 前沿用 HBG payload/input DCCI，kernel 后完成可见性顺序再发布 completion。
 
-#### 提交 10：`test: accept single AIC and AIV roots`
+#### 提交 9：`test: accept single AIC and AIV roots`
 
 - A5sim/A5 分别使用仓内已验证的 AIC/AIV kernel。
 - 覆盖重复 submit、输出、task owner 和 exactly-once。
 - M1 出口：单 AIC 或 AIV scheduler core 可执行真实 root，无 bundle、adapter 或直链接业务镜像。
 
-### 4.3 M2：单 core success-only DAG（提交 11～13）
+### 4.3 M2：单 core success-only DAG（提交 10～12）
 
-#### 提交 11：`test: model HBG first-unmet wake protocol`
+#### 提交 10：`test: model HBG first-unmet wake protocol`
 
 - CPU 模型逐项对应 HBG `classify_fanin_state`、`register_wake` 和 completion wake drain。
 - 覆盖 register-before-close、close-before-register、多 waiter、多 fanin 转挂和单 fanin 快路径。
 - 验证每个 task 最多 ready 一次，CLOSED 后 waiter 不丢失且所有 fanin 满足后才进入 ReadyQ。
 
-#### 提交 12：`feat: migrate HBG classify and wake relay to AICore`
+#### 提交 11：`feat: migrate HBG classify and wake relay to AICore`
 
 - 单 core 首次扫描同时完成 root/已满足 task 路由和非 root waiter 注册。
 - 完成路径依次执行普通数据发布、128B control 的 word-sized completion、wake-list close/drain 和
   waiter 重分类。
 - 直接使用 128B control 中的 task-id wake links 和 task-id ReadyQ，不增加 remaining-fanin。
 
-#### 提交 13：`test: accept single-core DAG families`
+#### 提交 12：`test: accept single-core DAG families`
 
 - manual A5sim/A5 覆盖 chain、repeated diamond、fanout、32-way layered fanin、multi-root 和固定
   seed 随机 DAG。
 - 将输出、task 执行次数和依赖顺序与原 HBG/CPU reference 对比。
 - M2 出口：单 core DAG 无漏 task、重复 task 或依赖可见性错误。
 
-### 4.4 M3：多 core 正确性与真机可行性（提交 14～17）
+### 4.4 M3：多 core 正确性与真机可行性（提交 13～16）
 
-#### 提交 14：`feat: shard initial classify behind a global barrier`
+#### 提交 13：`feat: shard initial classify behind a global barrier`
 
-- active scheduler cores 按稳定连续 task-id 区间扫描，各 task 只分类一次。
+- 空闲 core 在 scheduler 与 worker 角色间动态切换；首次分类阶段按稳定连续 task-id 区间扫描，
+  各 task 只分类一次。
 - 全部 core 完成 ready/wake 初始化后才允许任何 core Pull。
+- 根据图规模、设备拓扑和空闲 core 解析实际调度并发度。若正确性矩阵和性能对比需要显式上限，
+  在本提交增加 `CallConfig.aicore_scheduler_limit` 及完整 wire/validation 支持；`0` 为自动策略，
+  正整数只限制调度并发，不固定专用 scheduler 核，也不限制 worker 执行宽度。
 - 验证 task 数小于、等于、大于 core 数，不整除分片以及 AIC/AIV 数量不同。
 
-#### 提交 15：`feat: run multi-core pull and completion accounting`
+#### 提交 14：`feat: run multi-core pull and completion accounting`
 
 - AIC/AIV core 分别竞争兼容 ReadyQ，成功 pop 是唯一 ownership 线性化点。
 - 每 core 只写自己的 worker context/payload；完整空队列扫描后 flush 本地 completed delta。
 - 全局 `completed == expected` 后退出；不增加 claim CAS、requeue、idle bitmap 或 per-core tail scan。
 
-#### 提交 16：`test: stress multi-core scheduling races`
+#### 提交 15：`test: stress multi-core scheduling races`
 
 - 覆盖 queue 多次环回、并发 wake register/close、ready-after-empty-scan、最后一次 flush 和不同
   task/core 数组合。
-- 使用标准 DAG family 与随机 seeds `0～4`，对 `1/2/4/all` scheduler 验证 exactly-once、
+- 使用标准 DAG family 与随机 seeds `0～4`，对 `1/2/4/auto` 调度并发上限验证 exactly-once、
   计数守恒和无饥饿；fairness 只记录分布，不设置硬门槛。
 
-#### 提交 17：`perf: report M3 feasibility and pause`
+#### 提交 16：`perf: report M3 feasibility and pause`
 
 - 在 A5 真机执行第 5 节矩阵，保存原始 JSONL 和 Markdown 汇总。
 - 报告 HBG/HBG-AICore、环境身份、startup/classify、queue、wake、kernel、完成计数和 per-core 分布。
@@ -276,27 +276,27 @@ A5 真机测试在占用设备前必须执行架构预检，随后通过项目�
 
 - task 数：`1`、`2`、`63`、`64`、`65`、`256`、`1024`；
 - DAG：chain、repeated diamond、fanout、32-way layered fanin、multi-root、随机 DAG；
-- random fanin `0～4`，seed `0～4`；scheduler count `1/2/4/all`；
+- random fanin `0～4`，seed `0～4`；调度并发上限 `1/2/4/auto`；
 - AIC/AIV 分开验证，比较 HBG 输出、执行次数和依赖顺序。
 
 ### 5.2 拓扑 microbench
 
 - task 数：`64`、`1024`、`4096`；
 - DAG：chain、32-way layered fanin、multi-root；
-- scheduler count：`1/2/4/all`；AIC/AIV 分开；
+- 调度并发上限：`1/2/4/auto`；AIC/AIV 分开；
 - 每点预热 10 次、记录 30 次，报告 p50/p95，不报告样本量不足的 p99。
 
 ### 5.3 真实 kernel benchmark
 
 - AIV 使用仓内已验证的 vector-add；AIC 使用已验证的 paged-attention QK；
-- 每个 workload 使用 256 个独立 root，scheduler count 为 `1/2/4/all`；
+- 每个 workload 使用 256 个独立 root，调度并发上限为 `1/2/4/auto`；
 - 每点预热 10 次、记录 100 次，报告 p50/p95/p99；
 - repetition 交替执行 `HBG -> HBG-AICore` 与 `HBG-AICore -> HBG`，降低温度和时间漂移。
 
 ### 5.4 原始字段和汇总
 
 JSONL 至少包含 simpler commit、dirty 状态、HBG 复制来源、芯片/驱动/CANN/PTO-ISA/编译器版本、
-编译 flags、graph family、task 数、core type、scheduler count、seed、所有原始时延与失败标记。
+编译 flags、graph family、task 数、core type、调度并发上限、实际并发度、seed、所有原始时延与失败标记。
 
 聚合统计至少包含 graph build、H2D、scheduler startup、initial classify、ReadyQ push/pop/miss、
 wake/reclassify、kernel cycles、completed、总 device latency、吞吐和 per-core task 分布。v0 不要求

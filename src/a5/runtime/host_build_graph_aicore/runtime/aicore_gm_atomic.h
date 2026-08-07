@@ -37,22 +37,21 @@ inline __aicore__ uint64_t aicore_gm_load_v0(__gm__ volatile uint64_t &value, in
 #endif
 }
 
-inline __aicore__ void aicore_gm_store_v0(
-    __gm__ volatile int64_t &value, int64_t desired, int order = __ATOMIC_RELEASE
-) {
+inline __aicore__ void
+aicore_gm_store_v0(__gm__ volatile int64_t &value, int64_t desired, int order = __ATOMIC_RELEASE) {
 #if defined(__CCE_AICORE__)
     (void)order;
-    st_dev_b64(reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&value)),
-               static_cast<uint64_t>(desired));
+    st_dev_b64(
+        reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&value)), static_cast<uint64_t>(desired)
+    );
     OUT_OF_ORDER_STORE_BARRIER();
 #else
     __atomic_store_n(&value, desired, order);
 #endif
 }
 
-inline __aicore__ void aicore_gm_store_v0(
-    __gm__ volatile uint64_t &value, uint64_t desired, int order = __ATOMIC_RELEASE
-) {
+inline __aicore__ void
+aicore_gm_store_v0(__gm__ volatile uint64_t &value, uint64_t desired, int order = __ATOMIC_RELEASE) {
 #if defined(__CCE_AICORE__)
     (void)order;
     st_dev_b64(const_cast<__gm__ uint64_t *>(&value), desired);
@@ -62,9 +61,8 @@ inline __aicore__ void aicore_gm_store_v0(
 #endif
 }
 
-inline __aicore__ int64_t aicore_gm_exchange_v0(
-    __gm__ volatile int64_t &value, int64_t desired, int order = __ATOMIC_ACQ_REL
-) {
+inline __aicore__ int64_t
+aicore_gm_exchange_v0(__gm__ volatile int64_t &value, int64_t desired, int order = __ATOMIC_ACQ_REL) {
 #if defined(__CCE_AICORE__)
     (void)order;
     return atomicExch(const_cast<__gm__ int64_t *>(&value), desired);
@@ -73,9 +71,8 @@ inline __aicore__ int64_t aicore_gm_exchange_v0(
 #endif
 }
 
-inline __aicore__ uint64_t aicore_gm_fetch_add_v0(
-    __gm__ volatile uint64_t &value, uint64_t delta, int order = __ATOMIC_ACQ_REL
-) {
+inline __aicore__ uint64_t
+aicore_gm_fetch_add_v0(__gm__ volatile uint64_t &value, uint64_t delta, int order = __ATOMIC_ACQ_REL) {
 #if defined(__CCE_AICORE__)
     (void)order;
     return atomicAdd(const_cast<__gm__ uint64_t *>(&value), delta);
@@ -114,9 +111,7 @@ inline __aicore__ uint64_t aicore_gm_compare_exchange_v0(
 #endif
 }
 
-inline __aicore__ void aicore_publish_next_waiter_v0(
-    __gm__ AicoreTaskControlV0 *control, int64_t next_waiter
-) {
+inline __aicore__ void aicore_publish_next_waiter_v0(__gm__ AicoreTaskControlV0 *control, int64_t next_waiter) {
     control->next_waiter = next_waiter;
 #if defined(__CCE_AICORE__)
     OUT_OF_ORDER_STORE_BARRIER();

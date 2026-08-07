@@ -13,9 +13,8 @@
 
 #include "aicore_gm_atomic.h"
 
-inline __aicore__ bool aicore_ready_queue_push_v0(
-    __gm__ void *sidecar_base, __gm__ AicoreReadyQueueV0 *queue, int64_t task_id
-) {
+inline __aicore__ bool
+aicore_ready_queue_push_v0(__gm__ void *sidecar_base, __gm__ AicoreReadyQueueV0 *queue, int64_t task_id) {
     uint64_t pos = aicore_gm_load_v0(queue->enqueue_pos, __ATOMIC_RELAXED);
     while (true) {
         __gm__ AicoreReadyQueueSlotV0 *slots =
@@ -40,9 +39,8 @@ inline __aicore__ bool aicore_ready_queue_push_v0(
     }
 }
 
-inline __aicore__ bool aicore_ready_queue_pop_v0(
-    __gm__ void *sidecar_base, __gm__ AicoreReadyQueueV0 *queue, int64_t *task_id
-) {
+inline __aicore__ bool
+aicore_ready_queue_pop_v0(__gm__ void *sidecar_base, __gm__ AicoreReadyQueueV0 *queue, int64_t *task_id) {
     if (task_id == nullptr) return false;
     uint64_t pos = aicore_gm_load_v0(queue->dequeue_pos, __ATOMIC_RELAXED);
     while (true) {
@@ -56,9 +54,7 @@ inline __aicore__ bool aicore_ready_queue_pop_v0(
                 aicore_gm_compare_exchange_v0(queue->dequeue_pos, pos, pos + 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
             if (observed == pos) {
                 *task_id = aicore_gm_load_v0(slot->task_id, __ATOMIC_ACQUIRE);
-                aicore_gm_store_v0(
-                    slot->sequence, static_cast<int64_t>(pos + queue->capacity), __ATOMIC_RELEASE
-                );
+                aicore_gm_store_v0(slot->sequence, static_cast<int64_t>(pos + queue->capacity), __ATOMIC_RELEASE);
                 return true;
             }
             pos = observed;

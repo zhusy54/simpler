@@ -58,9 +58,7 @@ TEST(AicoreSidecarV0, PlansAlignedGraphSizedRegions) {
         EXPECT_EQ(controls[i].wake_list_head, AICORE_TASK_ID_INVALID_V0);
         EXPECT_EQ(controls[i].next_waiter, AICORE_TASK_ID_INVALID_V0);
         if (i != 0) {
-            EXPECT_EQ(
-                reinterpret_cast<uintptr_t>(&controls[i]) - reinterpret_cast<uintptr_t>(&controls[i - 1]), 128u
-            );
+            EXPECT_EQ(reinterpret_cast<uintptr_t>(&controls[i]) - reinterpret_cast<uintptr_t>(&controls[i - 1]), 128u);
         }
     }
 }
@@ -102,7 +100,8 @@ TEST(AicoreSidecarV0, TaskIdQueueWrapsWithoutLoss) {
     auto *queue = aicore_sidecar_at_v0<AicoreReadyQueueV0>(storage.base(), layout.aic_queue_offset);
 
     for (int64_t round = 0; round < 20; ++round) {
-        for (int64_t i = 0; i < 4; ++i) ASSERT_TRUE(aicore_ready_queue_push_v0(storage.base(), queue, round * 4 + i));
+        for (int64_t i = 0; i < 4; ++i)
+            ASSERT_TRUE(aicore_ready_queue_push_v0(storage.base(), queue, round * 4 + i));
         EXPECT_FALSE(aicore_ready_queue_push_v0(storage.base(), queue, 1000));
         for (int64_t i = 0; i < 4; ++i) {
             int64_t task_id = AICORE_TASK_ID_INVALID_V0;
@@ -124,13 +123,15 @@ TEST(AicoreSidecarV0, TaskIdQueueMpmcIsExactlyOnce) {
     auto *queue = aicore_sidecar_at_v0<AicoreReadyQueueV0>(storage.base(), layout.aic_queue_offset);
 
     std::vector<std::atomic<int>> seen(kTasks);
-    for (auto &count : seen) count.store(0, std::memory_order_relaxed);
+    for (auto &count : seen)
+        count.store(0, std::memory_order_relaxed);
     std::atomic<int64_t> consumed{0};
     std::vector<std::thread> threads;
     for (int producer = 0; producer < kProducers; ++producer) {
         threads.emplace_back([&, producer] {
             for (int64_t task_id = producer; task_id < kTasks; task_id += kProducers) {
-                while (!aicore_ready_queue_push_v0(storage.base(), queue, task_id)) std::this_thread::yield();
+                while (!aicore_ready_queue_push_v0(storage.base(), queue, task_id))
+                    std::this_thread::yield();
             }
         });
     }
@@ -149,10 +150,12 @@ TEST(AicoreSidecarV0, TaskIdQueueMpmcIsExactlyOnce) {
             }
         });
     }
-    for (std::thread &thread : threads) thread.join();
+    for (std::thread &thread : threads)
+        thread.join();
 
     EXPECT_EQ(consumed.load(), kTasks);
-    for (const auto &count : seen) EXPECT_EQ(count.load(), 1);
+    for (const auto &count : seen)
+        EXPECT_EQ(count.load(), 1);
 }
 
 }  // namespace
