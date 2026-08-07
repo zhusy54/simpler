@@ -28,9 +28,10 @@ Runtime 变体 `host_build_graph_aicore`，先用最小改造验证 AICore 解�
 单 lane 任务领取迁移到 AICore。原 HBG 保持不变并作为正确性和性能 oracle；新 Runtime 不在
 构建或运行时包含、链接 HBG 私有源码。HBG 后续变化不会自动同步，任何同步都必须经过显式
 差分评审和独立提交。第一阶段允许使用实验性 Graph ABI v0，目标是尽快形成可信性能结论，
-不提前承担完整异常、diagnostics、并发 prepare 和全部 task shape 的工程成本。
+不提前承担完整异常、diagnostics、并发 prepare 和全部 task shape 的工程成本；但 AICore 多核
+写安全所需的 graph-sized 128B task control 和 task-id ReadyQ 必须从 M0 建立，不能延期。
 
-人工评审通过后，第二阶段用正式 Graph ABI v1 重建 immutable record、128B control、容量和
+人工评审通过后，第二阶段用正式 Graph ABI v1 重建 immutable record、版本化 control、容量和
 生命周期契约，并逐步补齐单 lane、wide、MIX、`sync_start`、deferred completion、diagnostics
 以及 HBG 的优化能力。AICPU 最终只保留设备启动、AICore 镜像装载、硬件资源管理、终止和错误
 回收职责，不再参与逐任务解依赖决策。
@@ -68,8 +69,8 @@ claim cursor、per-core TensorMap、固定容量 task ring 或业务工作负载
 | 术语 | 含义 |
 | ---- | ---- |
 | Host graph image | Host Orchestrator 构造完成、可重定位并整体复制到设备的完整图数据 |
-| Graph ABI v0 | 第一阶段实验 ABI；直接沿用冻结复制的 HBG 图、任务、wake 和 ReadyQ 布局，只增加 run/worker control |
-| Graph ABI v1 | 第二阶段正式 ABI；immutable record、128B control、checked layout 和版本化生命周期 |
+| Graph ABI v0 | 第一阶段实验 ABI；HBG descriptor/payload/fanin 只读，加 graph-sized 128B task control、task-id ReadyQ 和 run/worker control |
+| Graph ABI v1 | 第二阶段正式 ABI；immutable record、版本化 128B control、checked layout 和生命周期 |
 | Run/worker control | v0 由 AICPU 创建的最小启动 barrier、完成计数、退出、每核 payload 地址和聚合 DFX |
 | Immutable task record | 构图完成后只读的任务描述、fanin、参数元数据和资源需求 |
 | Task control | 每任务独立的可变调度状态，固定 128B、缓存行隔离 |
@@ -81,7 +82,7 @@ claim cursor、per-core TensorMap、固定容量 task ring 或业务工作负载
 
 | 阶段 | 目的 | 主要范围 | 退出方式 |
 | ---- | ---- | -------- | -------- |
-| 第一阶段：M0～M3 | 最小成本验证 AICore 解依赖和性能 | Graph ABI v0、depth-one、成功路径、AIC/AIV 多核单 lane | M3 输出报告后暂停，由用户人工评审 |
+| 第一阶段：M0～M3 | 最小安全基线验证 AICore 解依赖和性能 | Graph ABI v0、128B 隔离 control、depth-one、成功路径、AIC/AIV 多核单 lane | M3 输出报告后暂停，由用户人工评审 |
 | 第二阶段 A：M4～M6 | 单 lane 完备 | Graph ABI v1、真实数据可见性、异常/DFX、deferred completion、depth-two | 单 lane 独立签收 |
 | 第二阶段 B：M7～M8 | 完整 task shape | wide、MIX、`sync_start` 及其资源协议 | 各 task shape 独立签收 |
 | 第二阶段 C：M9 | 完整功能完备 | 冻结 HBG 能力/优化矩阵、组合测试、长期稳定性 | 完整 Runtime 准入 |
@@ -103,8 +104,9 @@ Host Worker
   -> 选择 host_build_graph_aicore（实验、depth-one）
   -> 使用现有 ChipCallable 注册和动态 kernel 地址
   -> 在冻结复制的 HBG Host 路径同步运行 Orchestrator 并生成完整图
-  -> 沿用 HBG graph/SM/arena、completion、wake 和 ReadyQ 布局
-  -> AICPU 创建最小 run/worker control 并启动 Runtime 静态 AICore image
+  -> 沿用 HBG 只读 graph/SM/arena descriptor、payload 和 fanin
+  -> Host 创建 graph-sized 128B task control 与 task-id ReadyQ sidecar
+  -> AICPU 绑定 run/worker control 并启动 Runtime 静态 AICore image
   -> AICore 完成 classify、wake relay、Pull 和单 lane kernel 执行
   -> 记录性能数据；只运行已知成功用例
 ```
@@ -147,25 +149,32 @@ AICore 完成 barrier 后才能执行普通任务。第二个顺序避免“分�
 ### 2.2 图表示与 execution sidecar
 
 新 Runtime 始终拥有自己的源码和构建产物，不读取或链接原 HBG 的私有实现。Graph ABI v0
-来自 M0 对 HBG Runtime 源码的冻结复制，直接保留其 Host 构图、TensorMap、task payload、
-SM/arena、completion flags、pointer wake links 和 ReadyQ。HBG Host 已完成 graph image 的指针
+来自 M0 对 HBG Runtime 源码的冻结复制，但只保留其 Host 构图、TensorMap、task descriptor、
+task payload、fanin 和 SM/arena 作为只读 graph input。HBG Host 已完成 graph image 的指针
 重定位和整体 H2D，因此 image 中的指针在设备侧是有效 GM 地址，不是 Host 裸指针。
 
-v0 不建立平行的 per-task sidecar 或 task-id-only ReadyQ。AICore 侧只增加 CCEC 可编译的 ABI
-view，并与 Host 类型做 `sizeof`、`alignof` 和关键字段 `offsetof` 静态断言。AICPU 只创建：
+HBG 的 `completion_flags` 是连续排列的 `std::atomic<uint8_t>`，其 64B `PTO2TaskSlotState` 和紧凑
+ReadyQ slot 也混合了原子字段、普通字段与 device pointer。这些布局对当前 AICPU scheduler
+成立，但不能直接推出多 AICore 的 sub-word atomic、DCCI 邻位安全或 CCEC ABI 安全。v0 因此从
+M0 建立最小、graph-sized execution sidecar：
 
+- `alignas(128) AicoreTaskControlV0`：word-sized completion、task-id wake head/next 和最小状态；
+  每 task 独占 128B，DCCI 发布字段与 concurrently-mutated atomic 字段分处不同 cache line；
+- `AicoreReadyQueueV0`：只保存 task id 的有界 Vyukov MPMC，全部共享发布字段使用已验证的
+  word-sized AICore GM 原子；
 - `AicoreRunControlV0`：启动/分类 barrier、active AIC/AIV 数、expected/completed、退出状态和
   聚合 DFX；
-- `AicoreWorkerContextV0`：每核类型/rank、run control、graph/scheduler 和私有
+- `AicoreWorkerContextV0`：每核类型/rank、run control、只读 graph、sidecar 和私有
   `PTO2DispatchPayload` 地址。
 
-v0 允许保留 HBG 的固定 task-window、arena 和 ReadyQ 容量，不承诺稳定 ABI，也不作为最终
-缓存兼容面。
+sidecar 由 Host 按实际 task 数和 ready frontier 规划并校验，AICPU 只绑定设备地址和发布启动。
+sidecar ABI 使用 C/POD、offset/task id 和显式布局断言，不含指向自身区域的 Host pointer。v0
+不承诺稳定缓存兼容面，但 128B 隔离与 task-id queue 是正确性基线，不是 v1 优化。
 
 Graph ABI v1 在 M4 整体替换 v0：Host 继续保持相同公开 Orchestrator/submit 语义，但重新生成
-HBG-AICore 自己的 graph image 与 execution sidecar。graph/control identity 同时升版，所有
-v0 graph cache 强制失效并重建；生产 Runtime 不同时兼容 v0/v1。一致性由 normalized graph
-强差分约束。
+HBG-AICore 自己的 immutable graph image，并正式版本化从 v0 已存在的 execution sidecar。
+graph/control identity 同时升版，所有 v0 graph cache 强制失效并重建；生产 Runtime 不同时兼容
+v0/v1。一致性由 normalized graph 强差分约束。
 
 Graph ABI v1 固定使用以下对象：
 
@@ -173,15 +182,16 @@ Graph ABI v1 固定使用以下对象：
 | ---- | ------ | -------------- |
 | `AicoreGraphLaunchDesc` | 启动后只读 | 图基址、任务数、各区域容量、ready-set 地址、拓扑、镜像身份、DFX 地址 |
 | `AicoreTaskRecord` | 只读 | task id、kernel id、fanin、资源 shape、block 数、predicate、参数元数据 |
-| `AicoreTaskControl` | 可变 | completion、wake head、next waiter，以及 M7/M8 使用的 task epoch、参与者计数和错误码 |
+| `AicoreTaskControl` | 可变 | 延续 v0 的 128B 隔离；completion、wake head、next waiter，以及 M7/M8 使用的 task epoch、参与者计数和错误码 |
 | `AicoreRunControl` | 可变 | `expected_task_count`、批量更新的全局 `completed_count`、first-error 和退出状态 |
 | `TaskReadySet` | 可变 | v1 的 M4 至 M9 使用只保存 task id 的 Vyukov bounded MPMC；替代 ReadyQ 属于 O3 候选优化 |
 | `WorkerExecutionSlot` | 每核私有可变 | v1 中由领取者物化 tensor/scalar 参数、`LocalContext` 和 `GlobalContext`；单 lane 路径无跨核发布 |
 | `AicoreSchedulerDfx` | 可变 | 分类、领取、空轮询、等待、完成、重分类、冲突和错误计数 |
 
-`AicoreTaskControl` 固定为 128B 并做静态布局断言。高频原子控制字段不能与 kernel
-普通输出数据共用缓存行，防止 DCCI clean/invalidate 覆盖相邻原子更新。不可变记录和
-可变控制分离，既降低误写风险，也便于 HBG 与新 Runtime 对同一图做差分。
+`AicoreTaskControl` 从 v0 起固定为 128B 并做静态布局断言。高频原子控制字段不能与 kernel
+普通输出数据或其他 task control 共用缓存行；需要 DCCI 发布的普通字段也不能与并发原子字段
+同行，防止 clean/invalidate 覆盖相邻更新。不可变记录和可变控制分离，既降低误写风险，也便于
+HBG 与新 Runtime 对同一图做差分。
 
 v1 布局在 Host 构图冻结后按实际图统计生成：M4 建立 descriptor、record、control、run-control、
 fanin/wake、per-core execution slot 和 ReadyQ；后续里程碑只增加已经启用能力所需的 DFX、
@@ -203,13 +213,14 @@ participant 和 deferred-completion 区域。现有 HBG 的固定 SM/arena 写�
 
 ### 2.4 运行期 wake relay
 
-采用复制后 HBG 的“扫描 fanin、等待第一个未满足生产者”实现和状态布局，再把同一协议迁移到
-AICore：
+采用复制后 HBG 的“扫描 fanin、等待第一个未满足生产者”算法，但把可变状态落在 128B
+execution sidecar，再把同一协议迁移到 AICore：
 
 1. 生产者执行完成后，先按 Runtime 的普通数据可见性协议发布 kernel 输出。
-2. 以 release 语义写入 ring completion flag 和 Host 可见的 task-state mirror。
-3. 原子交换 `wake_list_head` 为关闭哨兵，禁止新 waiter 注册。
-4. 遍历摘取的 pointer waiter 链；每个 waiter 重新扫描全部 fanin。
+2. 以 AICore 已验证的 word-sized publish store 写入 task control completion；不写 HBG 的一字节
+   completion flag 或 task-state mirror。
+3. 原子交换 task-id `wake_list_head` 为关闭哨兵，禁止新 waiter 注册。
+4. 遍历摘取的 task-id waiter 链；每个 waiter 重新扫描全部 fanin。
 5. waiter 若已满足，进入对应 ready queue；否则注册到新的第一个未完成生产者。
 6. waiter 注册与生产者关闭并发时，以 CAS 结果和关闭哨兵决定重试，不允许丢唤醒。
 
@@ -219,19 +230,19 @@ AICore：
 
 ### 2.5 Ready queue 和仲裁
 
-- v0 直接使用 HBG 固定容量的有界 Vyukov MPMC，slot 保留 sequence、`slot_state` 和
-  `task_id_snapshot`；现有 A5 C++ UT 已覆盖空/满、环回和多生产者/消费者压力。
-- v0 测试图必须在启动前保证 task window、arena 和最大 ready frontier 不超过 HBG 容量；
-  第一阶段不定义 queue-full 运行期恢复语义。
-- v1 才将 MPMC payload 收敛为稳定 task id，并在构图结束时按最坏 ready frontier 计算容量；
-  DUMMY/predicate 容量也从对应能力启用的里程碑开始计算。
+- v0 使用 AICore-safe task-id 有界 Vyukov MPMC。HBG queue 只提供算法和 CPU 轨迹 oracle，不复用
+  其 pointer slot 字节布局；cursor、sequence 和 task-id 发布均使用 word-sized GM 原子。
+- v0 所有图必须在启动前保证 task window、arena、sidecar 和最大 ready frontier 不超过已分配
+  容量；第一阶段不定义 queue-full 运行期恢复语义，因此超限必须在 Host 阶段拒绝。
+- v1 正式版本化 task-id MPMC，并在构图结束时按最坏 ready frontier 计算容量；DUMMY/predicate
+  容量也从对应能力启用的里程碑开始计算。
 - 队列选择采用 executable-first：先过滤当前 core/cluster 能执行的 shape，再在可执行队列间
   round-robin，避免固定优先级长期饿死某类任务。
 - 单 lane ReadyQ 按 AIC/AIV 类型共享；任务入队时不绑定具体 core，空闲 core 只轮询自身可执行的
   queue。MPMC 成功 pop 后，领取者直接执行，不再进行二次 core 选择或 task-local claim。
 - v1 中 MPMC `push` 返回 full 属于内部容量计算错误，设置 first-error，不能无限自旋。
 
-M1 至 M3 使用复制后的 HBG Vyukov MPMC；M4 至 M9 使用 v1 task-id Vyukov MPMC。M9 完成后，
+M1 至 M3 使用 v0 task-id Vyukov MPMC；M4 至 M9 使用版本化 v1 task-id Vyukov MPMC。M9 完成后，
 O3 再基于固定正确性和性能
 基线对比 sharded MPMC、per-shard 非空 bitmask 和两级 ready bitmap，并按正确性、公平性、
 A5 可见性与性能证据决定是否替换基线。具体协议和采用条件见
@@ -256,7 +267,7 @@ classify 和 wake relay 必须保证 waiter 所有权只转移、不复制，tas
 一次。跨 run 复用时，ReadySet 必须在所有 core 退出后整体重建或按 generation 隔离，不能让
 旧 queue slot/ready bit 进入新一轮。详细分析见共享竞争分析文档。
 
-v0 每个 core 继续使用 HBG `PTO2DispatchPayload` 布局，从复制的 task payload 读取参数，并通过
+v0 每个 core 继续使用 HBG `PTO2DispatchPayload` 布局，从只读 task payload 读取参数，并通过
 现有 `func_id_to_addr_` 和 `CoreCallable::resolved_addr()` 动态调用业务 kernel。v1 才从
 `AicoreTaskRecord` 物化到独立 `WorkerExecutionSlot`。两种 slot 均由领取者写入并由同一 core
 同步消费，不需要跨核 epoch、doorbell 或 ack；kernel 返回后，该 core 完成状态发布和 wake
@@ -280,10 +291,11 @@ A5 上普通 GM 数据不存在可假定的跨核自动一致性。调度控制�
   acquire/release 顺序。
 - graph record、producer output 和其他跨核普通数据使用 DCCI 加 barrier 的显式发布/观察。
 - 单 lane payload/execution slot 是领取 core 的私有数据，不参与核间一致性协议。
-- 控制原子字段与被 DCCI 操作的普通数据至少缓存行隔离。
+- 控制原子字段与被 DCCI 操作的普通数据至少缓存行隔离；不同 task control 之间按 128B 隔离。
 
 v0 沿用 HBG 的通用顺序：读取 graph/payload 前执行必要 DCCI，kernel 返回后完成普通数据发布，
-再写 completion flag 和关闭 wake list。第一阶段只复用已在 HBG 中验证的 kernel 和参数形状，
+再写 sidecar completion 和关闭 wake list。128B control 邻位安全、word-sized 原子和 task-id queue
+发布必须在 M0 A5 probe 中成立；第一阶段只复用已在 HBG 中验证的 kernel 和参数形状，
 并通过跨 AIC/AIV 依赖 seam 验证该顺序。是否需要业务感知、按 tensor 范围操作的 adapter，留到
 M3 数据评审和 v1/M5 设计决定；v0 不增加 callable hook 或静默扩展 kernel ABI。
 
@@ -375,8 +387,8 @@ workload 证明具有预期的预物化/等待隐藏效果。实现不要求复�
 | ---- | -------- | -------- | --------------- |
 | Host 提前构图 | HBG 已在 Host 同步运行 Orchestrator 并整体 H2D | 高 | v0 复制到独立目录；v1 重建正式图 ABI |
 | 依赖生成 | HBG 的 TensorMap 和显式依赖已经产出 fanin | 高 | v0 复制以快速验证；v1 用 normalized graph 保证等价 |
-| 解依赖算法 | HBG 已有 completion flag、首次分类、wake list 和重新分类 | 高 | 把同一行为迁到 AICore，先 v0 测量再 v1 硬化 |
-| 有界队列 | HBG 已有 Vyukov MPMC 实现和 A5 MPMC UT | 高 | v0 直接复用复制布局；v1 再收敛为 task-id queue |
+| 解依赖算法 | HBG 已有 completion flag、首次分类、wake list 和重新分类 | 高 | 复用算法，不复用 AICPU mutable layout；从 v0 起写入 128B sidecar |
+| 有界队列 | HBG 已有 Vyukov MPMC 实现和 A5 MPMC UT | 高 | 复用算法/测试轨迹；v0 起使用 AICore-safe task-id queue |
 | 参数物化 | HBG 已有 `PTO2DispatchPayload` | 中 | v0 直接适配复制布局；v1 使用 per-core execution slot |
 | AICore 常驻调度 | FDWIC 的 `aicore/onboard_entry.h`、`core_main.h` 已实现 GM attach 和 resident 生命周期 | 高 | 可复制适用骨架，不带入设备 Orchestrator replay |
 | AICore raw atomic | FDWIC 的 `common/atomic.h`、`runtime_state.h` 已实现 CCEC GM 原子和 first-error 发布 | 高 | 复制并收窄为本方案所需 load/store/CAS/exchange/fetch-add/barrier |
@@ -398,10 +410,11 @@ FDWIC 的固定 `DistGlobal`、claim/replay 和每核 TensorMap 不适合 Host-p
 | 风险 | 影响 | 控制措施 | 阶段闸门 |
 | ---- | ---- | -------- | -------- |
 | 第一阶段无性能收益 | 完整实现投入没有价值 | M0 冻结 HBG 基线，M3 同机测量微图和真实单 lane workload | M3 人工评审后才可启动第二阶段 |
-| v0 与 v1 双重开发 | v0 临时代码渗入生产或迁移成本失控 | 明确 ABI header；M4 整体升版、缓存失效且不双栈兼容 | M4 删除生产 v0 路径 |
+| v0 与 v1 双重开发 | v0 临时代码渗入生产或迁移成本失控 | v0 已采用 128B control/task-id queue；M4 主要正式化 immutable record、identity、checked layout 并整体升版 | M4 删除生产 v0 路径 |
 | 第一阶段异常卡死 | 手工 A5sim/A5 运行永久等待或污染设备 | 仅运行已知成功用例、设备测试手工 opt-in；接受人工回收风险 | 不进入默认 CI，M6 前不宣称异常安全 |
 | A5 跨核 cache 不一致 | 读到旧参数或旧输出，产生静默错算 | v0 复用 HBG 通用 DCCI/barrier 并做 MB-8 seam；v1 根据证据决定是否需要 adapter | M5 seam 未通过不得签收完整业务 |
-| 原子和 DCCI 同行 clobber | 丢完成、重复执行或死锁 | 128B control、普通数据分区、MB-2 邻居压力 | 原子探针和布局断言通过 |
+| 原子和 DCCI 同行 clobber | 丢完成、重复执行或死锁 | M0 即使用 128B control、word-sized atomic、DCCI/atomic 分行和邻居压力 | M0 原子探针未通过不得继续 |
+| HBG byte completion/紧凑 slot 被误复用 | sub-word 写或 cache-line clean 覆盖相邻 core 更新 | HBG mutable layout 仅作 oracle；AICore 只写隔离 sidecar 和 task-id queue | M0 静态检查与 A5 clobber probe |
 | AICore 编译器不支持现有 C++ 原语 | HBG 的 `std::atomic`/指针状态不能进入 CCEC 热路径 | 复制并收窄 FDWIC raw GM atomic，增加独立编译探针 | WP1 前完成工具链探针 |
 | 动态函数入口不稳定 | kernel 无法调用或调用错误版本 | 复用 HBG callable 地址上传/解析路径并做 AIC/AIV 真机 smoke | M1 A5 smoke |
 | 多 scheduler 原子热点 | 调度开销抵消收益 | 分类分片、现有 Vyukov 队列、可执行队列 RR、冲突 DFX | M3 报告，不设自动数值门槛 |
@@ -427,12 +440,12 @@ FDWIC 的固定 `DistGlobal`、claim/replay 和每核 TensorMap 不适合 Host-p
 | 4 | 图 ABI 如何演进？ | 第一阶段使用复制 HBG 布局的实验 v0；第二阶段整体替换为正式 v1，不长期双栈兼容 |
 | 5 | 解依赖使用 refcount 还是扫描 fanin？ | 扫描 fanin，等待首个未完成 producer，wake relay 后重分类 |
 | 6 | 首次分类在哪里完成？ | AICore 多核并行分类，完成后全局 barrier |
-| 7 | ReadyQ 使用什么实现？ | M1～M3 复用 HBG pointer/tagged Vyukov MPMC；M4～M9 使用 v1 task-id MPMC；替代结构移到 O3 |
+| 7 | ReadyQ 使用什么实现？ | M1～M3 使用 AICore-safe v0 task-id Vyukov MPMC；M4～M9 正式版本化为 v1；HBG pointer queue 仅作算法 oracle；替代结构移到 O3 |
 | 8 | task shape 如何递进？ | M1～M6 完成单 lane；M7 wide；M8 MIX/`sync_start`；M9 完整组合验收 |
 | 9 | wide task 如何组织？ | leader + participant cores + block tickets |
 | 10 | MIX 的协调者是谁？ | cluster AIC leader，必要时为纯协调角色 |
 | 11 | `sync_start` 如何实现？ | task-local epoch barrier |
-| 12 | 每任务控制块如何布局？ | v0 保持 HBG 64B slot；v1 固定 128B，原子控制与普通数据隔离 |
+| 12 | 每任务控制块如何布局？ | v0 起固定 128B sidecar，原子控制、DCCI 普通字段和相邻 task 隔离；v1 正式版本化并扩展字段 |
 | 13 | kernel 数据可见性由谁负责？ | v0 复用 HBG 通用 DCCI/barrier；v1 是否需要业务感知 adapter 由 M3/M5 seam 证据决定 |
 | 14 | AICore 产物如何组织？ | 使用 Runtime 静态 scheduler image，业务 kernel 继续走现有动态地址；无 callable-scoped image |
 | 15 | 是否改变公开 submit/Orchestrator API？ | submit/Orchestrator/ChipCallable 不变；`CallConfig` 新增 per-run `aicore_scheduler_count` |
@@ -469,8 +482,8 @@ AICore scheduler 数量和队列回退次数。第一阶段 workload、规模、
 | Runtime 构建清单 | 新 Runtime 的 `build_config.py` | 保持复制基线的 Host/orchestration，后续替换 AICPU supervisor 和 AICore scheduler |
 | Host 构图 | 复制后的 `host/runtime_maker.cpp` | v0 保持 HBG 构图、重定位和 H2D 行为；v1 才重建 checked-layout builder |
 | 依赖生成 | HBG 的 `runtime/pto_dep_compute.h`、`orchestrator_core/pto_orchestrator.cpp` | v0 复制 fanin 生成；v1 重新编码并用 normalized graph 校验 |
-| 图 ABI | HBG 的 `runtime/pto_runtime2_types.h`、`runtime/pto_shared_memory.h` | v0 直接使用复制布局和设备指针；M4 用独立 record/control ABI v1 整体替换 |
-| HBG 调度语义 | HBG 的 `runtime/scheduler/` | v0 复制 classify/wake/MPMC 行为并迁到 AICore；随后在新目录独立演进 |
+| 图 ABI | HBG 的 `runtime/pto_runtime2_types.h`、`runtime/pto_shared_memory.h` | v0 只读 descriptor/payload/fanin，加 128B control/task-id queue sidecar；M4 用独立 immutable record 和正式 ABI v1 整体替换 |
+| HBG 调度语义 | HBG 的 `runtime/scheduler/` | v0 复制 classify/wake/MPMC 算法并迁到 AICore-safe sidecar；不复用 AICPU mutable layout |
 | AICore 执行 | `aicore/aicore_executor.cpp`、`runtime/pto2_dispatch_payload.h` | 新建常驻 scheduler；每 core 自主 Pull，v0 继续使用 HBG payload 和动态 kernel 地址 |
 | AICPU 执行 | `aicpu/aicpu_executor.cpp` | 新 Runtime 只保留 launch/control/drain；删除逐任务解依赖职责 |
 | FDWIC atomic | `../simpler-dist/src/a5/runtime/fully_distributed_within_core/runtime/dist_engine/common/{atomic,runtime_state}.h` | 复制到新目录并收窄；保留 CCEC raw GM intrinsic 和 first-error 顺序，不保留 FDWIC 全局状态 |
@@ -488,10 +501,10 @@ Runtime-specific 代码不在 HBG 与 HBG-AICore 之间抽取共享层。M0 将 
 
 | 工作包 | 内容 | 前置 | 交付物和退出条件 |
 | ------ | ---- | ---- | ---------------- |
-| WP0 基线与实验接入 | 冻结并机械复制 HBG；建立平级 v0 Runtime 和 per-run scheduler count | 无 | 来源证明、复制差分、空图生命周期和构建 UT |
-| WP1 AICore 原语与参考裁剪 | 从 `simpler-dist` 复制并收窄 resident、raw atomic、DCCI、barrier 和 control 骨架 | WP0 | A5sim/A5 probe；不带入 replay/SPMD 图模型 |
-| WP2 v0 最小调度 | 使用复制后的 HBG graph/wake/ReadyQ，加最小 run/worker control；交付 root、单核 DAG、多核单 lane | WP0、WP1 | M1～M3 正确性证据和性能报告 |
-| WP3 v1 图 ABI | 重建 immutable record、128B control、checked layout 和 graph identity | M3 人工批准 | v0 graph cache 失效；v1 Host/model UT 和 graph 差分 |
+| WP0 基线与实验接入 | 冻结并机械复制 HBG；建立平级 v0 Runtime、per-run scheduler count 和只读 graph seam | 无 | 来源证明、复制差分、空图生命周期和构建 UT |
+| WP1 AICore 原语与安全 sidecar | 从 `simpler-dist` 复制并收窄 resident、word-sized atomic、DCCI、barrier；建立 128B task control 和 task-id queue | WP0 | A5sim/A5 clobber probe；不带入 replay/SPMD 图模型 |
+| WP2 v0 最小调度 | 使用 HBG 只读 graph + AICore-safe execution sidecar；交付 root、单核 DAG、多核单 lane | WP0、WP1 | M1～M3 正确性证据和性能报告 |
+| WP3 v1 图 ABI | 重建 immutable record、正式版本化 128B control、checked layout 和 graph identity | M3 人工批准 | v0 graph cache 失效；v1 Host/model UT 和 graph 差分 |
 | WP4 单 lane 完备 | 真实 tensor 可见性、错误/drain、DFX、deferred completion、early resolve 和 depth-two | WP3 | M4～M6 单 lane 独立签收 |
 | WP5 高级资源调度 | wide、MIX、`sync_start`、participant epoch 和 all-or-rollback | WP4 | M7/M8 task-shape 独立签收 |
 | WP6 全能力准入 | 冻结 HBG 矩阵组合、diagnostics、长期稳定性和最终性能画像 | WP5 | M9 完整准入报告 |
@@ -511,8 +524,9 @@ Runtime-specific 代码不在 HBG 与 HBG-AICore 之间抽取共享层。M0 将 
 1. 每个里程碑只增加一组可观察能力，并有 Host/model/A5sim/A5 中适合该阶段的独立证据。
 2. 新 Runtime 始终显式选择；HBG 构建产物、默认行为和回归结果不变；公共接口变化只限已声明的
    `CallConfig.aicore_scheduler_count` 和相应 wire 升版。
-3. M0～M3 仅支持成功路径，设备用例手工 opt-in；不承诺非法输入、kernel 错误或卡死能退出。
-4. M4 起未支持能力必须启动前明确拒绝；M6 起错误和 timeout 必须有限时退出。
+3. M0～M3 仅支持成功执行路径，设备用例手工 opt-in；Host 必须在设备启动前拒绝超容量和未支持
+   task shape，但不承诺已启动后的 kernel 错误或卡死能由 Runtime 自身退出。
+4. M4 起补齐正式 ABI 的全部输入/identity 校验；M6 起设备错误和 timeout 必须有限时退出。
 5. M3 完成后必须暂停，只有用户人工批准才能开始 M4；性能报告不设置自动通过线。
 6. M4 通过 ABI 升版整体替换 v0，不允许 v0/v1 生产双栈；M1～M3 的算法和性能 workload 保留。
 7. 每个里程碑保存固定 workload、环境、identity、关键 counters 和分阶段时延，并与 HBG、
@@ -526,16 +540,21 @@ Runtime-specific 代码不在 HBG 与 HBG-AICore 之间抽取共享层。M0 将 
   采样协议。
 - 机械复制完整 A5 HBG Runtime 到平级目录；复制提交只包含名称/构建接入，并用差分清单证明
   没有调度语义变化。
-- 新 Runtime 可被显式选择、构建和装载，固定发布 depth-one 和实验 Graph ABI v0；继续使用
-  Runtime 静态 AICore image 和现有 ChipCallable 格式。
+- 新 Runtime 可被显式选择、构建和装载，固定发布 depth-one 和实验 Graph ABI v0；HBG graph
+  仅供只读，v0 从首版即包含 graph-sized 128B task control 和 task-id ReadyQ；继续使用 Runtime
+  静态 AICore image 和现有 ChipCallable 格式。
+- 128B sidecar 是冻结复制后的第一个功能改动；其 A5 邻位无 clobber probe 通过后，才允许接入
+  scheduler-count、resident lifecycle 或任何真实 task 执行路径。
 - `CallConfig` 增加 per-run `aicore_scheduler_count`，不改变 callable 编译身份。
-- 从 `simpler-dist` 复制并裁剪 AICore resident attach、raw atomic、DCCI、barrier 和 AICPU
+- 从 `simpler-dist` 复制并裁剪 AICore resident attach、word-sized raw atomic、DCCI、barrier 和 AICPU
   control-plane 骨架，不复制 replay、SPMD TensorMap 或业务 workload。
 
 独立验证：
 
-- Host/build UT 覆盖 Runtime 动态发现、复制布局差分、CallConfig wire 和 v0 空图控制。
-- A5sim/A5 手工运行空图 ready/正常 exit；验证 atomic、DCCI、barrier 和动态函数地址探针。
+- Host/build UT 覆盖 Runtime 动态发现、只读 graph view、128B/POD 布局、容量溢出、CallConfig wire
+  和 v0 空图控制。
+- A5sim/A5 手工运行空图 ready/正常 exit；验证 atomic、DCCI、barrier、相邻 task/queue slot
+  clobber 和动态函数地址探针。该 probe 是 M0 功能闸门。
 - 保存 HBG 与 v0 的构建、H2D、AICore 启动和空图退出基线；不运行异常或 timeout 用例。
 
 #### M1：单 core、单 root 任务执行
@@ -543,14 +562,14 @@ Runtime-specific 代码不在 HBG 与 HBG-AICore 之间抽取共享层。M0 将 
 新增功能：
 
 - 在 v0 上分别仅启用一个 AIC 或一个 AIV，执行一个无依赖 root task。
-- v0 root classifier 明确校验“单 task、零 fanin”后把复制后的 slot state 发布到 ReadyQ；不由 Host 直接
+- v0 root classifier 明确校验“单 task、零 fanin”后把 task id 发布到 sidecar ReadyQ；不由 Host 直接
   指定执行 core，避免出现 M1 使用 ReadyQ、M2 才定义分类来源的断层。
 - 打通复制后 HBG payload 参数读取、MPMC pop、现有动态 child-kernel 调用和正常完成计数的
   最短纵向链路。
 
 独立验证和性能对比：
 
-- Host/model 测试覆盖 root 分类、HBG queue ABI view、参数映射和 callable 地址解析。
+- Host/model 测试覆盖 root 分类、v0 task-id queue、只读 HBG graph view、参数映射和 callable 地址解析。
 - A5sim/A5 手工分别运行 no-op/短 kernel 的单 AIC、单 AIV 成功用例；不运行 predicate、
   kernel 错误或非法输入。
 - 比较 M0、HBG 和 M1 的 ready-to-start、payload materialization、kernel、completion 和总时延。
@@ -577,8 +596,9 @@ Runtime-specific 代码不在 HBG 与 HBG-AICore 之间抽取共享层。M0 将 
 新增功能：
 
 - AIC/AIV 多 scheduler 并行 initial classify，并在全核 barrier 后开始执行。
-- 复用 HBG 有界 MPMC，交付 ReadySet exactly-once 领取、兼容队列 round-robin 和领取者本核执行。
-- 复用并扩展现有 Vyukov bounded MPMC 的 CPU/A5sim 正确性和压力证据，不在本阶段引入
+- 使用 v0 task-id 有界 MPMC，交付 ReadySet exactly-once 领取、兼容队列 round-robin 和领取者本核执行。
+- 复用并扩展现有 Vyukov bounded MPMC 的算法/CPU 轨迹，在 v0 raw-atomic 布局上建立 A5sim/A5
+  正确性和压力证据，不在本阶段引入
   sharded MPMC、ready bitmap 或 bitmask 优化。
 - 支持随机 DAG、queue wrap、多 root 并发和成功路径公平进展；不实现 first-error/drain。
 
@@ -601,9 +621,9 @@ Runtime-specific 代码不在 HBG 与 HBG-AICore 之间抽取共享层。M0 将 
 
 新增功能：
 
-- 用版本化 `AicoreGraphLaunchDesc`、immutable `AicoreTaskRecord`、128B
-  `AicoreTaskControl`、`AicoreRunControl`、graph-sized ReadyQ/sidecar 和 checked relocation
-  整体替换 v0。
+- 用版本化 `AicoreGraphLaunchDesc`、immutable `AicoreTaskRecord`、正式 `AicoreTaskControl`、
+  `AicoreRunControl`、graph-sized ReadyQ/sidecar 和 checked relocation 整体替换 v0；保持 M0 已
+  验证的 128B 隔离和 task-id ownership 契约。
 - graph ABI、control ABI 和 graph identity 同时升版；强制失效并重建 v0 graph cache，删除生产
   v0 执行分支，不兼容双 ABI。
 - 建立 normalized graph exporter，冻结 task/kernel/shape/fanin/predicate/参数分类的差分格式。
@@ -623,7 +643,7 @@ Runtime-specific 代码不在 HBG 与 HBG-AICore 之间抽取共享层。M0 将 
 - 完成 TensorMap 自动依赖、显式依赖、manual scope、predicate、DUMMY、hidden allocation、
   预完成 producer、真实 tensor/scalar 参数和 HBG 单 lane graph 语义。
 - 完成 AIC→AIC、AIV→AIV、AIC→AIV、AIV→AIC 的 producer-output/consumer-input DCCI
-  发布观察协议和 128B control/普通数据缓存行隔离。
+  发布观察协议，并在真实 tensor seam 上复验 M0 的 128B control/普通数据缓存行隔离。
 - 根据上述 seam 的正确性和性能证据决定是否只保留 Runtime 通用协议，或引入业务感知的
   tensor-range adapter；若引入，必须在本里程碑单独定义 ABI、identity 和缺失时的构建错误。
 - 保持 depth-one，只验证正常完成路径；完整异常、diagnostics 和 deferred completion 留到 M6。
@@ -746,9 +766,10 @@ Runtime-specific 代码不在 HBG 与 HBG-AICore 之间抽取共享层。M0 将 
 
 覆盖以下对象：
 
-- HBG 复制来源/tree hash、v0 graph ABI view、最小 run/worker control，以及 v1 sidecar 字节布局、
-  对齐、重定位和容量计算。
-- HBG MPMC queue 的空、满、wrap、ABA、并发 push/pop、pointer/tag snapshot；v1 另测 task-id 有效性。
+- HBG 复制来源/tree hash、v0 只读 graph ABI view、128B task control、task-id ReadyQ 和最小
+  run/worker control，以及 v1 sidecar 字节布局、对齐、重定位和容量计算。
+- HBG MPMC queue 提供空、满、wrap、ABA 和并发 push/pop 的算法轨迹；v0/v1 task-id queue 分别
+  验证 raw-atomic 布局、task-id 有效性和相邻 slot 无 clobber。
 - O3 候选 ReadySet 的 set/acquire、summary 清位竞态、fallback scan、热点 word、公平性和
   非 64 对齐任务数；这些用例不属于 M0～M9 基线。
 - wake list 的注册/关闭竞态、关闭后重扫、重复唤醒和长 fanin。
@@ -792,10 +813,10 @@ M9 不接受仅凭“基础图通过”推断组合能力通过。
 | MB ID | `simpler-dist` 契约 | 本方案等价用例 | 阶段 |
 | ----- | ------------------- | -------------- | ---- |
 | MB-1 | sharded claim 恰一 winner、无跳号 | 多 scheduler 竞争 ReadySet；M3/M9 检查 MPMC slot 恰一 winner，O3 对候选实现复验 | M3、M9；O3 候选 |
-| MB-2 | 64B completion flag，邻居无 clobber | v0 验证复制的 HBG slot/completion 布局；v1 验证相邻 128B task control 高频完成/重分类 | M3 模型，M5 A5 |
+| MB-2 | 64B completion flag，邻居无 clobber | v0 从 M0 验证相邻 128B task control 的 completion/wake/DCCI 压力；v1 复验正式 control | M0 A5 功能闸门，M3 压力，M5 复验 |
 | MB-4 | `block.won` 多 lane 协作 | MIX leader/participants 竞争、唯一 leader、参数发布和最后 participant 完成 | M8，A5 必测 |
-| MB-5 | shared map 定序、seq 和回收 | 多核读取 v0 HBG graph/slot 或 v1 immutable graph/control，验证发布顺序和无旧 generation | M3 模型，M5/M6 A5 |
-| MB-6 | 确定性 GM heap、容量和反压 | v1 graph/sidecar/queue 临界容量、满队列、启动前拒绝和长序列无越界 | M4 Host，M6 运行期 |
+| MB-5 | shared map 定序、seq 和回收 | 多核读取 v0 HBG 只读 graph + sidecar control 或 v1 immutable graph/control，验证发布顺序和无旧 generation | M3 模型，M5/M6 A5 |
+| MB-6 | 确定性 GM heap、容量和反压 | v0 sidecar/queue 与 v1 graph/sidecar/queue 临界容量、启动前拒绝和长序列无越界 | M0/M4 Host，M6 运行期 |
 | MB-7 | `core_progress[]` 与 run-ahead | 慢核/忙核下检查 executable-first RR、公平进展和资源预留 | M3 单 lane，M7/M8 多资源 |
 | MB-8 | `Coherent<T>`/DCCI seam | producer 写输出、Runtime 发布完成、consumer invalidate 后读取；对照缺失可见性操作的负例 | M3 smoke，M5 A5 必测 |
 | MB-9 | private map 每核确定性 | 同一输入和 seed 重复构图/运行，graph signature、task 映射和结果稳定 | M3、M9 |
@@ -819,7 +840,8 @@ A5sim 用于功能和状态机覆盖，不把 sim cache 行为或 sim 时延作�
 
 按以下顺序执行：
 
-1. M0 primitive probe：raw atomic、DCCI、barrier、动态 kernel 地址和 resident ready/exit。
+1. M0 primitive probe：word-sized raw atomic、128B control 邻位无 clobber、task-id queue slot 发布、
+   DCCI、barrier、动态 kernel 地址和 resident ready/exit。
 2. M1～M3 手工成功路径：单 root、单核 DAG、多核单 lane，并完成固定性能矩阵；外层 timeout
    负责资源回收，但不作为 Runtime 错误语义证据。
 3. M5 MB-2/MB-8 seam：固定数据模式、多轮、跨 AIC/AIV 组合、同行负例和邻居压力。
@@ -866,11 +888,13 @@ core。同机交替运行 HBG 与 HBG-AICore，并报告各 core 负载、queue/
 - [ ] M0 已冻结 HBG commit、源目录 tree hash、允许差分、能力/优化矩阵、测试、性能 workload
   和环境。
 - [ ] M0～M3 设备测试仅手工 opt-in；M3 完整报告已人工评审并明确批准启动第二阶段。
+- [ ] v0 从 M0 起使用 128B task control 和 task-id ReadyQ；HBG mutable completion/slot/queue 布局
+  未被 AICore 写入。
 - [ ] v0 已由 v1 整体替换，旧 graph cache 确定性失效，生产路径不兼容双 ABI。
 - [ ] M0 至 M9 均可独立构建、验证和回退，且保留固定 workload 的 HBG/前序性能基线。
 - [ ] Host Orchestrator 构造完整图后才启动设备 scheduler。
 - [ ] AICore 完成首次分类、依赖等待、wake relay、任务领取和完成传播。
-- [ ] v0 HBG MPMC 与 v1 task-id MPMC 均通过 CPU 模型、A5sim 和 A5 验证，无丢任务、重复领取或饥饿；
+- [ ] v0/v1 task-id MPMC 均通过 CPU 模型、A5sim 和 A5 验证，无丢任务、重复领取、邻位 clobber 或饥饿；
   O3 替代 ReadyQ 不阻塞 M9。
 - [ ] Orchestrator/submit/Worker/ChipCallable 接口未改变；`CallConfig.aicore_scheduler_count` 的
   binding、mailbox 和 remote protocol 已同步升版并通过兼容性测试。

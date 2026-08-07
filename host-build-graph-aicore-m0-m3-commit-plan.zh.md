@@ -15,7 +15,8 @@
 
 第一阶段按以下顺序交付 17 个提交：
 
-1. M0 复制并冻结 HBG 基线，建立独立 Runtime 和 resident 空图生命周期；
+1. M0 复制并冻结 HBG 基线，先建立 128B 隔离 sidecar 的功能门禁，再建立独立 Runtime 的
+   resident 空图生命周期；
 2. M1 跑通单 core、单 root 的真实 AIC/AIV task；
 3. M2 在单 core 上跑通 success-only DAG；
 4. M3 扩展到多 core，形成 A5 真机可行性与性能报告后暂停评审。
@@ -51,44 +52,54 @@
 - Python binding、parent/child mailbox、remote L3 protocol、SceneTest config 和布局断言必须在
   同一提交更新，remote protocol 显式升版。
 
-### 2.3 Graph ABI v0 与最小控制区
+### 2.3 Graph ABI v0 与 128B 隔离执行 sidecar
 
-v0 直接使用复制自 HBG 的 Host graph、SM、arena、task payload、completion flags、wake links 和
-ReadyQ，不再创建平行的 task control 或 task-id-only queue。HBG Host 已完成 graph image 的
-指针重定位和整体 H2D，image 中的指针在设备侧是有效 GM 地址，不是 Host 裸指针。
+v0 只把复制自 HBG 的 Host graph、task descriptor、task payload 和 fanin local id 当作只读输入。
+HBG Host 已完成 graph image 的指针重定位和整体 H2D，image 中的指针在设备侧是有效 GM 地址，
+不是 Host 裸指针。AICore 不得把 HBG 的以下对象直接作为多核可变调度状态：
 
-AICore 侧只增加 CCEC 可编译的 ABI view，并与 Host 类型做 `sizeof`、`alignof` 和关键字段
-`offsetof` 静态断言。M0～M3 继续使用：
+- 一字节连续排列的 ring `completion_flags`；
+- 64B `PTO2TaskSlotState` 中的 completion mirror 和 pointer wake links；
+- 紧凑排列的 `PTO2ReadyQueueSlot {sequence, slot_state, task_id_snapshot}`。
 
-- HBG `PTO2ReadyQueueSlot {sequence, slot_state, task_id_snapshot}` 和固定容量 Vyukov MPMC；
-- HBG `PTO2TaskSlotState` 中的 completion mirror、`wake_list_head` 和 `next_in_wake_list`；
-- HBG ring 的 `completion_flags`；
-- HBG `PTO2DispatchPayload` 作为每核参数物化槽。
+这些对象当前由 AICPU 使用 `std::atomic` 和 AICPU cache/coherency 语义访问。多 AICore 若对同一
+cache line 中的不同字节或普通字段执行 store + DCCI，可能覆盖相邻 core 已发布的更新；CCEC
+raw atomic 也不能由 `std::atomic<uint8_t>` 的 Host 表面自动推出。因此 128B 隔离是 M0 的功能
+前置条件，不得推迟到 v1/M4。
 
-新增状态仅限：
+M0 在 HBG 只读图旁建立 graph-sized execution sidecar：
 
+- `alignas(128) AicoreTaskControlV0`：每 task 独占 128B，保存 word-sized completion、
+  `wake_list_head`、`next_waiter` 和最小状态；所有跨核 RMW 字段只用已验证的 AICore GM 原子；
+  需要 DCCI 发布的 `next_waiter` 位于独立 cache line，不与 completion/wake-head 原子同行；
+- `AicoreReadyQueueV0`：只保存 task id 的有界 Vyukov MPMC；cursor、sequence 和发布字段使用
+  AICore 可证明安全的 word-sized GM 原子，不复用 HBG 的 pointer slot 字节布局；
 - `AicoreRunControlV0`：启动/分类 barrier、active AIC/AIV 数、expected/completed、退出状态和聚合
   DFX；
-- `AicoreWorkerContextV0`：每核类型/rank、run control、graph/scheduler 和私有 dispatch payload
-  地址；
+- `AicoreWorkerContextV0`：每核类型/rank、run control、只读 graph、execution sidecar 和私有
+  `PTO2DispatchPayload` 地址；
 - 每核私有 `local_completed_delta` 与统计计数。
 
-这些控制对象由 AICPU supervisor 创建并通过现有 handshake 发布，不扩展 Host graph image。
-task-id-only ReadyQ、独立 immutable record/task control、graph-sized checked layout 属于 v1。
+sidecar 由 Host 按实际 task 数规划、做溢出/容量校验并随 run 发布；AICPU supervisor 只完成设备
+地址绑定和启动发布。Host/device 类型必须是 C/POD、只含整数/offset/task id，不含指向 sidecar
+内部的 Host 裸指针，并补齐 trivially-copyable、standard-layout、`sizeof`、`alignof` 和 `offsetof`
+断言。v1/M4 负责正式版本化 immutable record、checked layout 和生命周期，不再首次引入 128B
+control 或 task-id ReadyQ。
 
 ### 2.4 依赖和完成协议
 
-v0 逐项迁移当前 HBG 已有协议，不引入第二套算法：
+v0 迁移当前 HBG 已有算法，但把可变状态落在隔离 sidecar 中：
 
 1. initial classify 完整扫描任务的全部 fanin；全部满足则路由到对应 ReadyQ，否则注册到首个
    未满足 producer 的 wake list；
-2. waiter 通过 CAS 压入 producer 的 intrusive wake list；producer 已经 CLOSED 时，waiter
+2. waiter 以 task id 通过 CAS 压入 producer control 的 intrusive wake list；producer 已经 CLOSED 时，waiter
    重新扫描全部 fanin并转挂到下一个未满足 producer，或进入 ReadyQ；
-3. kernel 返回后先完成普通数据可见性，再发布 task completion flag；随后原子关闭并摘取 wake
-   list，对每个 waiter 重新分类；
+3. kernel 返回后先完成普通数据可见性，再发布 128B control 中的 word-sized completion；随后
+   原子关闭并摘取 wake list，对每个 waiter 重新分类；
 4. 不增加 remaining-fanin counter、逐边 atomic decrement、`WAITING -> READY` CAS、claim CAS、
    retry 或 requeue；
-5. ReadyQ 成功 pop 是 task ownership 的唯一线性化点。
+5. task-id ReadyQ 成功 pop 是 task ownership 的唯一线性化点；AICore 不写 HBG completion flag、
+   task-state mirror、pointer wake link 或 ReadyQ slot。
 
 每核完成任务后只增加 `local_completed_delta`。当本核完整扫描所有兼容 ReadyQ 均无任务可取时，
 才把非零 delta 一次性 `fetch_add` 到全局 completed。core 仅在全局
@@ -101,10 +112,12 @@ M0～M3 只覆盖 success-only、单 lane、`block_num == 1`：
 - 不实现 predicate、DUMMY、hidden allocation、manual scope、wide、MIX、`sync_start` 或 async；
 - 不实现 queue-full 恢复、kernel error、first-error、drain、watchdog 或 Runtime timeout；
 - 不实现 depth-two、ready bitmap、sharded queue 或自适应仲裁；
-- 不承诺 v0 ABI 稳定，也不提前增加 v1 字段。
+- 不承诺 v0 ABI 稳定，也不提前增加 v1 的正式 identity/lifecycle 字段；128B control 和 task-id
+  ReadyQ 是正确性基线，不属于可延期字段。
 
-测试图必须在 Host 启动前证明 task window、arena 和最大 ready frontier 不超过复制自 HBG 的
-固定容量。共享设备的外层 timeout 必须保留用于资源回收，但不能算作 Runtime 错误契约验证。
+所有图必须在 Host 启动前证明 task window、arena、sidecar 和最大 ready frontier 不超过已分配
+容量；不支持的 task shape 必须在设备启动前拒绝，不能依赖 queue-full 后恢复或外层 timeout。
+共享设备的外层 timeout 必须保留用于资源回收，但不能算作 Runtime 错误契约验证。
 
 ## 3. 通用提交与验证规则
 
@@ -155,17 +168,23 @@ A5 真机测试在占用设备前必须执行架构预检，随后通过项目�
   差分清单。
 - 验证：新 Runtime 可被动态发现和构建；graph layout golden、基础 A5sim 输出与 HBG 一致。
 
-#### 提交 4：`feat: add per-run AICore scheduler count`
+#### 提交 4：`feat: add 128B-isolated AICore execution sidecar`
+
+- 为 HBG 只读 descriptor/payload/fanin 定义 AICore ABI view；新增 graph-sized 128B task control 和
+  task-id-only MPMC，不把 HBG mutable state 暴露给 AICore 写。
+- 从 FDWIC 收窄复制 word-sized raw GM load/store/CAS/exchange/fetch-add、DCCI 和 barrier；明确
+  completion、wake head、next waiter 和 ReadyQ slot 的逐字段发布协议。
+- 验证：POD/布局断言、容量溢出、A5sim 编译；A5 手工 probe 必须先通过同 control 邻域压力、
+  completion/wake 并发、queue slot 发布和普通数据可见性。任何邻位 clobber 都阻塞 M0。
+
+这是冻结复制后的第一个功能提交。后续 scheduler-count、resident lifecycle、root 执行和 DAG
+调度提交都以本提交及其 A5 probe 通过为前置条件。
+
+#### 提交 5：`feat: add per-run AICore scheduler count`
 
 - 增加 `CallConfig.aicore_scheduler_count` 及 Python/mailbox/remote/SceneTest 支持。
 - 启动时根据 graph 使用的 core type 和设备拓扑解析 `1/2/4/all`。
 - 验证：默认值、wire round-trip、协议版本、非法值和旧 Runtime 忽略行为。
-
-#### 提交 5：`feat: add AICore graph views and GM primitives`
-
-- 为复制后的 HBG queue/task/payload 定义 AICore ABI view。
-- 从 FDWIC 收窄复制 raw GM load/store/CAS/exchange/fetch-add、DCCI 和 barrier。
-- 验证：布局断言、A5sim 编译；A5 手工 probe 验证原子和普通数据可见性。
 
 #### 提交 6：`feat: run resident scheduler on an empty graph`
 
@@ -182,15 +201,16 @@ A5 真机测试在占用设备前必须执行架构预检，随后通过项目�
 
 ### 4.2 M1：单 core、单 root、真实 kernel（提交 8～10）
 
-#### 提交 8：`test: lock HBG queue and graph-view parity`
+#### 提交 8：`test: lock task-id queue and graph-view parity`
 
-- 复用现有 `test_ready_queue.cpp` 的空/满、环回和 MPMC stress。
-- 对 Host HBG 队列与 AICore raw-atomic view 执行相同轨迹，比较 cursor、sequence、slot pointer 和
-  task-id snapshot；不再维护第二套队列模型。
+- 复用现有 `test_ready_queue.cpp` 的空/满、环回和 MPMC stress 轨迹，但验证 v0 task-id queue
+  自身的 cursor、sequence、task id 和 AICore raw-atomic 发布协议。
+- HBG ReadyQ 只作为 Vyukov 算法参考，不要求与其 pointer slot 字节布局一致；额外验证相邻 queue
+  slot 并发写不会 clobber。
 
 #### 提交 9：`feat: execute one root through existing callable addresses`
 
-- 从复制后的 graph image 读取唯一零 fanin task并推入现有 AIC/AIV ReadyQ。
+- 从复制后的只读 graph image 读取唯一零 fanin task，并把 task id 推入 sidecar AIC/AIV ReadyQ。
 - scheduler pop 后在本核 payload 中物化参数，通过现有 `func_id_to_addr_` 和
   `CoreCallable::resolved_addr()` 调用真实 kernel。
 - kernel 前沿用 HBG payload/input DCCI，kernel 后完成可见性顺序再发布 completion。
@@ -212,8 +232,9 @@ A5 真机测试在占用设备前必须执行架构预检，随后通过项目�
 #### 提交 12：`feat: migrate HBG classify and wake relay to AICore`
 
 - 单 core 首次扫描同时完成 root/已满足 task 路由和非 root waiter 注册。
-- 完成路径依次执行普通数据发布、completion flag、wake-list close/drain 和 waiter 重分类。
-- 直接使用复制后的 pointer wake links 和 ReadyQ，不增加 remaining-fanin 或 task-id sidecar。
+- 完成路径依次执行普通数据发布、128B control 的 word-sized completion、wake-list close/drain 和
+  waiter 重分类。
+- 直接使用 128B control 中的 task-id wake links 和 task-id ReadyQ，不增加 remaining-fanin。
 
 #### 提交 13：`test: accept single-core DAG families`
 
