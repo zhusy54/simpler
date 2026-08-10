@@ -19,7 +19,8 @@
 enum class AicoreRouteResultV0 : uint64_t {
     READY = 0,
     WAITING = 1,
-    ERROR = 2,
+    COMPLETED = 2,
+    ERROR = 3,
 };
 
 inline __aicore__ __gm__ AicoreTaskControlV0 *
@@ -39,6 +40,15 @@ inline __aicore__ AicoreRouteResultV0 aicore_classify_and_route_v0(
     const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV0 *context,
     __gm__ AicoreRunControlV0 *run_control, int64_t task_id
 ) {
+    if (task_id < 0 || static_cast<uint64_t>(task_id) >= graph.task_count) {
+        aicore_record_scheduler_error_v0(run_control, task_id, AicoreRootStatusV0::INVALID_TASK_ID);
+        return AicoreRouteResultV0::ERROR;
+    }
+    __gm__ AicoreTaskControlV0 *task_control = aicore_task_control_at_v0(sidecar_base, context, task_id);
+    if (aicore_gm_load_v0(task_control->completion) != 0) {
+        return AicoreRouteResultV0::COMPLETED;
+    }
+
     AicoreTaskInfoV0 task{};
     AicoreRootStatusV0 status = aicore_classify_task_v0(graph, task_id, &task);
     if (status != AicoreRootStatusV0::OK) {
@@ -82,8 +92,7 @@ inline __aicore__ AicoreRouteResultV0 aicore_classify_and_route_v0(
                 aicore_gm_fetch_add_v0(context->wake_closed_retry_count, UINT64_C(1));
                 break;
             }
-            __gm__ AicoreTaskControlV0 *consumer_control = aicore_task_control_at_v0(sidecar_base, context, task_id);
-            aicore_publish_next_waiter_v0(consumer_control, observed);
+            aicore_publish_next_waiter_v0(task_control, observed);
             int64_t actual = aicore_gm_compare_exchange_v0(producer_control->wake_list_head, observed, task_id);
             if (actual == observed) {
                 aicore_gm_fetch_add_v0(context->wake_register_count, UINT64_C(1));

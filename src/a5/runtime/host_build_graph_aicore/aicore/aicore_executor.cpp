@@ -91,7 +91,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             if (result == AicoreRouteResultV0::ERROR) break;
             if (result == AicoreRouteResultV0::READY) {
                 aicore_gm_fetch_add_v0(worker_context->initial_ready_count, UINT64_C(1));
-            } else {
+            } else if (result == AicoreRouteResultV0::WAITING) {
                 aicore_gm_fetch_add_v0(worker_context->initial_waiting_count, UINT64_C(1));
             }
         }
@@ -113,6 +113,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         );
         __gm__ AicoreReadyQueueV0 *completion_queue =
             aicore_sidecar_at_v0<AicoreReadyQueueV0>(sidecar_base, worker_context->completion_queue_offset);
+        uint64_t local_completed_delta = 0;
         while (aicore_gm_load_v0(run_control->classification_error) == 0) {
             if (worker_context->resolver_active != 0) {
                 int64_t completed_task_id = AICORE_TASK_ID_INVALID_V0;
@@ -123,19 +124,18 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                         )) {
                         break;
                     }
-                    ++worker_context->local_completed_delta;
+                    ++local_completed_delta;
                     aicore_gm_fetch_add_v0(worker_context->resolved_task_count, UINT64_C(1));
                     aicore_gm_fetch_add_v0(worker_context->completion_pop_count, UINT64_C(1));
                     aicore_gm_fetch_add_v0(worker_context->wake_cycles, get_sys_cnt_aicore() - wake_start);
                     continue;
                 }
                 aicore_gm_fetch_add_v0(worker_context->completion_empty_count, UINT64_C(1));
-                if (worker_context->local_completed_delta != 0) {
-                    uint64_t delta = worker_context->local_completed_delta;
-                    aicore_gm_fetch_add_v0(run_control->completed_count, delta);
-                    worker_context->local_completed_delta = 0;
+                if (local_completed_delta != 0) {
+                    aicore_gm_fetch_add_v0(run_control->completed_count, local_completed_delta);
                     aicore_gm_fetch_add_v0(worker_context->resolved_flush_count, UINT64_C(1));
-                    aicore_gm_fetch_add_v0(worker_context->resolved_flush_tasks, delta);
+                    aicore_gm_fetch_add_v0(worker_context->resolved_flush_tasks, local_completed_delta);
+                    local_completed_delta = 0;
                 }
             }
 

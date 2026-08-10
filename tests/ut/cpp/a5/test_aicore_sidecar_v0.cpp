@@ -402,6 +402,44 @@ TEST(AicoreSidecarV0, RoutesHomogeneousDagThroughWakeLists) {
     }
 }
 
+TEST(AicoreSidecarV0, SkipsPrecompletedInlineAllocationTasks) {
+    alignas(64) PTO2TaskDescriptor descriptors[2]{};
+    alignas(64) PTO2TaskPayload payloads[2]{};
+    descriptors[0].task_id = PTO2TaskId::make(0, 0);
+    descriptors[0].kernel_id[0] = INVALID_KERNEL_ID;
+    descriptors[0].kernel_id[1] = INVALID_KERNEL_ID;
+    descriptors[0].kernel_id[2] = INVALID_KERNEL_ID;
+    descriptors[1].task_id = PTO2TaskId::make(0, 1);
+    descriptors[1].kernel_id[0] = INVALID_KERNEL_ID;
+    descriptors[1].kernel_id[1] = 1;
+    descriptors[1].kernel_id[2] = INVALID_KERNEL_ID;
+    payloads[1].fanin_count = 1;
+    payloads[1].fanin_local_ids[0] = 0;
+    AicoreReadonlyGraphV0 graph{reinterpret_cast<uint64_t>(descriptors), reinterpret_cast<uint64_t>(payloads), 2, 1};
+
+    AicoreExecutionSidecarLayoutV0 layout{};
+    ASSERT_TRUE(aicore_sidecar_plan_v0(2, 0, 1, &layout));
+    SidecarBuffer storage(layout);
+    auto *controls = aicore_sidecar_at_v0<AicoreTaskControlV0>(storage.base(), layout.task_controls_offset);
+    controls[0].completion = 1;
+    controls[0].wake_list_head = AICORE_WAKE_LIST_CLOSED_V0;
+
+    auto *run_control = aicore_sidecar_at_v0<AicoreRunControlV0>(storage.base(), layout.run_control_offset);
+    AicoreWorkerContextV0 context{};
+    context.task_controls_offset = layout.task_controls_offset;
+    context.aic_queue_offset = layout.aic_queue_offset;
+    context.aiv_queue_offset = layout.aiv_queue_offset;
+
+    EXPECT_EQ(
+        aicore_classify_and_route_v0(graph, storage.base(), &context, run_control, 0), AicoreRouteResultV0::COMPLETED
+    );
+    EXPECT_EQ(
+        aicore_classify_and_route_v0(graph, storage.base(), &context, run_control, 1), AicoreRouteResultV0::READY
+    );
+    EXPECT_EQ(context.ready_push_count, 1u);
+    EXPECT_EQ(run_control->classification_error, 0u);
+}
+
 TEST(AicoreSidecarV0, RejectsInvalidAndRoutesMixedDagTasks) {
     alignas(64) PTO2TaskDescriptor descriptors[2]{};
     alignas(64) PTO2TaskPayload payloads[2]{};

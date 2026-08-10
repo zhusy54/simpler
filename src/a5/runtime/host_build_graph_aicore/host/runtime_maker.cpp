@@ -480,23 +480,33 @@ bool create_aicore_sidecar_v0(
     };
     uint64_t aic_task_count = 0;
     uint64_t aiv_task_count = 0;
+    std::vector<int64_t> inline_completed_task_ids;
     for (int64_t task_id = 0; task_id < total_tasks; ++task_id) {
+        PTO2TaskSlotState &slot = host_sm_handle.header->ring.get_slot_state_by_task_id(task_id);
         AicoreTaskInfoV0 task{};
         AicoreRootStatusV0 status = aicore_classify_task_v0(host_graph, task_id, &task);
         if (status != AicoreRootStatusV0::OK) {
+            bool inline_completed = status == AicoreRootStatusV0::UNSUPPORTED_SHAPE && slot.active_mask.raw() == 0 &&
+                                    slot.logical_block_num == 1 && slot.total_required_subtasks == 0 &&
+                                    slot.task_state.load(std::memory_order_acquire) == PTO2_TASK_COMPLETED &&
+                                    slot.task_attrs.allow_early_resolve() && !slot.task_attrs.requires_sync_start() &&
+                                    !slot.task_attrs.has_predicate();
+            if (inline_completed) {
+                inline_completed_task_ids.push_back(task_id);
+                continue;
+            }
             LOG_ERROR(
-                "HBG-AICore: invalid M2 task id=%" PRId64 " status=%" PRIu64, task_id, static_cast<uint64_t>(status)
+                "HBG-AICore: invalid v0 task id=%" PRId64 " status=%" PRIu64, task_id, static_cast<uint64_t>(status)
             );
             return false;
         }
-        PTO2TaskSlotState &slot = host_sm_handle.header->ring.get_slot_state_by_task_id(task_id);
         uint8_t expected_mask = static_cast<uint8_t>(1u << task.subtask_slot);
         if (slot.active_mask.raw() != expected_mask || slot.logical_block_num != 1 ||
             slot.total_required_subtasks != 1 || slot.task_state.load(std::memory_order_acquire) != PTO2_TASK_PENDING ||
             slot.task_attrs.allow_early_resolve() || slot.task_attrs.requires_sync_start() ||
             slot.task_attrs.has_predicate()) {
             LOG_ERROR(
-                "HBG-AICore: M2 task id=%" PRId64 " must be pending, single-slot, block_num=1, and ungated", task_id
+                "HBG-AICore: v0 task id=%" PRId64 " must be pending, single-slot, block_num=1, and ungated", task_id
             );
             return false;
         }
@@ -546,11 +556,18 @@ bool create_aicore_sidecar_v0(
         return false;
     }
 
+    auto *task_controls = aicore_sidecar_at_v0<AicoreTaskControlV0>(host_base, layout.task_controls_offset);
+    for (int64_t task_id : inline_completed_task_ids) {
+        task_controls[task_id].completion = 1;
+        task_controls[task_id].wake_list_head = AICORE_WAKE_LIST_CLOSED_V0;
+    }
+
     const pto2_sm_layout::PTO2RingSegmentOffsets device_segments =
         pto2_sm_layout::ring_segment_offsets(task_window_size);
     const uint64_t device_sm_address = reinterpret_cast<uint64_t>(runtime->get_gm_sm_ptr());
     auto *run_control = aicore_sidecar_at_v0<AicoreRunControlV0>(host_base, layout.run_control_offset);
     run_control->expected_task_count = static_cast<uint64_t>(total_tasks);
+    run_control->completed_count = inline_completed_task_ids.size();
     run_control->error_task_id = UINT64_MAX;
 
     auto *contexts = aicore_sidecar_at_v0<AicoreWorkerContextV0>(host_base, layout.worker_contexts_offset);
@@ -1161,6 +1178,8 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
             uint64_t kernel_cycles = 0;
             uint64_t completion_cycles = 0;
             uint64_t wake_cycles = 0;
+            const uint64_t executable_task_count =
+                runtime->aicore_sidecar_layout.aic_task_count + runtime->aicore_sidecar_layout.aiv_task_count;
             for (int32_t i = 0; i < runtime->worker_count; ++i) {
                 bool type_has_tasks = static_cast<CoreType>(contexts[i].core_type) == CoreType::AIC ?
                                           runtime->aicore_sidecar_layout.aic_task_count != 0 :
@@ -1205,22 +1224,21 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
             }
             if (control->classification_error != 0 ||
                 control->expected_task_count != static_cast<uint64_t>(runtime->host_total_tasks) ||
-                control->completed_count != control->expected_task_count ||
-                ready_push != control->expected_task_count || ready_pop != control->expected_task_count ||
-                completion_push != control->expected_task_count || completion_pop != control->expected_task_count ||
-                initial_ready + initial_waiting != control->expected_task_count ||
-                wake_closes != control->expected_task_count || worker_resolved != control->expected_task_count ||
-                worker_executed != control->expected_task_count || active_workers != expected_active ||
+                control->completed_count != control->expected_task_count || ready_push != executable_task_count ||
+                ready_pop != executable_task_count || completion_push != executable_task_count ||
+                completion_pop != executable_task_count || initial_ready + initial_waiting != executable_task_count ||
+                wake_closes != executable_task_count || worker_resolved != executable_task_count ||
+                worker_executed != executable_task_count || active_workers != expected_active ||
                 resolver_workers != control->resolver_count || control->classified_count != control->resolver_count ||
                 control->finished_count != static_cast<uint64_t>(runtime->worker_count) || !task_controls_valid) {
                 LOG_ERROR(
                     "HBG-AICore: invalid v0 final state expected=%" PRIu64 " completed=%" PRIu64 " push=%" PRIu64
                     " pop=%" PRIu64 " completion_push=%" PRIu64 " completion_pop=%" PRIu64 " executed=%" PRIu64
-                    " resolved=%" PRIu64 " active=%" PRIu64 " resolvers=%" PRIu64 " finished=%" PRIu64
-                    " error=%" PRIu64,
+                    " resolved=%" PRIu64 " executable=%" PRIu64 " active=%" PRIu64 " resolvers=%" PRIu64
+                    " finished=%" PRIu64 " error=%" PRIu64,
                     control->expected_task_count, control->completed_count, ready_push, ready_pop, completion_push,
-                    completion_pop, worker_executed, worker_resolved, active_workers, resolver_workers,
-                    control->finished_count, control->classification_error
+                    completion_pop, worker_executed, worker_resolved, executable_task_count, active_workers,
+                    resolver_workers, control->finished_count, control->classification_error
                 );
                 rc = -1;
             } else if (control->expected_task_count != 0) {
