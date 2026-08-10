@@ -66,17 +66,20 @@ struct alignas(128) AicoreReadyQueueV0 {
 struct alignas(128) AicoreRunControlV0 {
     uint64_t attached_count;
     uint64_t classified_count;
-    uint64_t active_aic_count;
-    uint64_t active_aiv_count;
     uint64_t expected_task_count;
     uint64_t completed_count;
     uint64_t exit_requested;
     uint64_t finished_count;
     uint64_t startup_count;
+    uint64_t root_core_type;
+    uint64_t classification_error;
     uint64_t queue_push_count;
     uint64_t queue_pop_count;
-    uint64_t queue_miss_count;
-    uint8_t padding[32];
+    uint64_t executed_count;
+    uint64_t ready_to_start_cycles;
+    uint64_t payload_cycles;
+    uint64_t kernel_cycles;
+    uint64_t completion_cycles;
 };
 
 struct alignas(128) AicoreWorkerContextV0 {
@@ -88,13 +91,15 @@ struct alignas(128) AicoreWorkerContextV0 {
     uint64_t task_controls_offset;
     uint64_t aic_queue_offset;
     uint64_t aiv_queue_offset;
-    uint64_t readonly_graph_address;
+    uint64_t graph_descriptors_address;
+    uint64_t graph_payloads_address;
     uint64_t sidecar_base_address;
     uint64_t dispatch_payload_offset;
+    uint64_t task_window_mask;
     uint64_t local_completed_delta;
     uint64_t poll_count;
     uint64_t task_count;
-    uint8_t padding[32];
+    uint8_t padding[16];
 };
 
 struct AicoreExecutionSidecarLayoutV0 {

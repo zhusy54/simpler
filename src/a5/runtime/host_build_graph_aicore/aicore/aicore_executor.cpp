@@ -15,7 +15,9 @@
 #include "aicore/pmu_collector_aicore.h"
 #include "common/chip_swimlane_profiling.h"
 #include "common/platform_config.h"  // Register-based communication
+#include "aicore_graph_view_v0.h"
 #include "aicore_gm_atomic.h"
+#include "aicore_ready_queue_v0.h"
 #include "pto2_dispatch_payload.h"
 #include "runtime.h"
 
@@ -105,6 +107,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     __gm__ AicoreWorkerContextV0 *worker_context = reinterpret_cast<__gm__ AicoreWorkerContextV0 *>(my_hank->task);
     dcci(worker_context, ENTIRE_DATA_CACHE);
     worker_context->physical_core_id = static_cast<int32_t>(my_hank->physical_core_id);
+    worker_context->core_type = static_cast<int32_t>(core_type);
     OUT_OF_ORDER_STORE_BARRIER();
     dcci(worker_context, ENTIRE_DATA_CACHE, CACHELINE_OUT);
 
@@ -112,7 +115,115 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     __gm__ AicoreRunControlV0 *run_control =
         aicore_sidecar_at_v0<AicoreRunControlV0>(sidecar_base, worker_context->run_control_offset);
     aicore_gm_fetch_add_v0(run_control->attached_count, UINT64_C(1));
+
+    if (block_idx == 0) {
+        AicoreReadonlyGraphV0 graph{
+            worker_context->graph_descriptors_address, worker_context->graph_payloads_address,
+            worker_context->task_count, worker_context->task_window_mask,
+        };
+        if (graph.task_count != 0) {
+            dcci(reinterpret_cast<__gm__ void *>(graph.descriptors_address), ENTIRE_DATA_CACHE);
+            dcci(reinterpret_cast<__gm__ void *>(graph.payloads_address), ENTIRE_DATA_CACHE);
+        }
+        AicoreRootInfoV0 root{};
+        AicoreRootStatusV0 status = aicore_classify_single_root_v0(graph, &root);
+        if (status == AicoreRootStatusV0::OK) {
+            aicore_gm_store_v0(run_control->root_core_type, static_cast<uint64_t>(root.core_type));
+            __gm__ AicoreReadyQueueV0 *queue = aicore_sidecar_at_v0<AicoreReadyQueueV0>(
+                sidecar_base, root.core_type == AicoreRootCoreTypeV0::AIC ? worker_context->aic_queue_offset :
+                                                                          worker_context->aiv_queue_offset
+            );
+            if (aicore_ready_queue_push_v0(sidecar_base, queue, root.task_id)) {
+                aicore_gm_fetch_add_v0(run_control->queue_push_count, UINT64_C(1));
+            } else {
+                aicore_gm_store_v0(
+                    run_control->classification_error, static_cast<uint64_t>(AicoreRootStatusV0::UNSUPPORTED_SHAPE)
+                );
+            }
+        } else if (status != AicoreRootStatusV0::EMPTY) {
+            aicore_gm_store_v0(run_control->classification_error, static_cast<uint64_t>(status));
+        }
+    }
     aicore_gm_fetch_add_v0(run_control->classified_count, UINT64_C(1));
+
+    while (aicore_gm_load_v0(run_control->startup_count) == 0 &&
+           aicore_gm_load_v0(run_control->exit_requested) == 0) {
+        SPIN_WAIT_HINT();
+    }
+
+    dcci(worker_context, ENTIRE_DATA_CACHE);
+    if (worker_context->active != 0 && aicore_gm_load_v0(run_control->exit_requested) == 0) {
+        uint64_t start_observed = get_sys_cnt_aicore();
+        __gm__ AicoreReadyQueueV0 *queue = aicore_sidecar_at_v0<AicoreReadyQueueV0>(
+            sidecar_base, core_type == CoreType::AIC ? worker_context->aic_queue_offset :
+                                                      worker_context->aiv_queue_offset
+        );
+        int64_t task_id = AICORE_TASK_ID_INVALID_V0;
+        while (!aicore_ready_queue_pop_v0(sidecar_base, queue, &task_id)) {
+            worker_context->poll_count++;
+            if (aicore_gm_load_v0(run_control->exit_requested) != 0) break;
+            SPIN_WAIT_HINT();
+        }
+
+        if (task_id != AICORE_TASK_ID_INVALID_V0) {
+            aicore_gm_fetch_add_v0(run_control->queue_pop_count, UINT64_C(1));
+            uint64_t payload_start = get_sys_cnt_aicore();
+            AicoreReadonlyGraphV0 graph{
+                worker_context->graph_descriptors_address, worker_context->graph_payloads_address,
+                worker_context->task_count, worker_context->task_window_mask,
+            };
+            dcci(aicore_graph_descriptor_v0(graph, task_id), ENTIRE_DATA_CACHE);
+            dcci(aicore_graph_payload_v0(graph, task_id), ENTIRE_DATA_CACHE);
+            AicoreRootInfoV0 root{};
+            AicoreRootStatusV0 status = aicore_classify_single_root_v0(graph, &root);
+            if (status == AicoreRootStatusV0::OK && root.task_id == task_id && root.kernel_id < RUNTIME_MAX_FUNC_ID &&
+                static_cast<uint64_t>(root.core_type) == static_cast<uint64_t>(core_type)) {
+                dcci(&runtime->func_id_to_addr_[root.kernel_id], SINGLE_CACHE_LINE);
+                uint64_t callable_address = runtime->func_id_to_addr_[root.kernel_id];
+                if (callable_address != 0) {
+                    dcci(reinterpret_cast<__gm__ void *>(callable_address), ENTIRE_DATA_CACHE);
+                }
+                __gm__ PTO2DispatchPayload *dispatch_payload = aicore_sidecar_at_v0<PTO2DispatchPayload>(
+                    sidecar_base, worker_context->dispatch_payload_offset
+                );
+                status = aicore_materialize_root_payload_v0(graph, root, callable_address, dispatch_payload);
+                if (status == AicoreRootStatusV0::OK) {
+                    OUT_OF_ORDER_STORE_BARRIER();
+                    uint64_t kernel_start = get_sys_cnt_aicore();
+                    execute_task(dispatch_payload);
+                    uint64_t kernel_end = get_sys_cnt_aicore();
+                    __gm__ AicoreTaskControlV0 *task_control = aicore_sidecar_at_v0<AicoreTaskControlV0>(
+                        sidecar_base, worker_context->task_controls_offset +
+                                          static_cast<uint64_t>(task_id) * sizeof(AicoreTaskControlV0)
+                    );
+                    OUT_OF_ORDER_STORE_BARRIER();
+                    aicore_gm_store_v0(task_control->completion, INT64_C(1));
+                    (void)aicore_gm_exchange_v0(task_control->wake_list_head, AICORE_WAKE_LIST_CLOSED_V0);
+                    uint64_t completion_end = get_sys_cnt_aicore();
+                    worker_context->local_completed_delta = 1;
+                    worker_context->task_count = 1;
+                    aicore_gm_store_v0(run_control->ready_to_start_cycles, payload_start - start_observed);
+                    aicore_gm_store_v0(run_control->payload_cycles, kernel_start - payload_start);
+                    aicore_gm_store_v0(run_control->kernel_cycles, kernel_end - kernel_start);
+                    aicore_gm_store_v0(run_control->completion_cycles, completion_end - kernel_end);
+                    aicore_gm_fetch_add_v0(run_control->executed_count, UINT64_C(1));
+                    aicore_gm_fetch_add_v0(run_control->completed_count, UINT64_C(1));
+                } else {
+                    aicore_gm_store_v0(run_control->classification_error, static_cast<uint64_t>(status));
+                }
+            } else {
+                aicore_gm_store_v0(
+                    run_control->classification_error,
+                    static_cast<uint64_t>(status == AicoreRootStatusV0::OK ?
+                                              AicoreRootStatusV0::UNSUPPORTED_SHAPE :
+                                              status)
+                );
+            }
+        }
+        OUT_OF_ORDER_STORE_BARRIER();
+        dcci(worker_context, ENTIRE_DATA_CACHE, CACHELINE_OUT);
+    }
+
     while (aicore_gm_load_v0(run_control->exit_requested) == 0) {
         SPIN_WAIT_HINT();
     }

@@ -12,15 +12,26 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <cstddef>
 #include <cstdlib>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #include "aicore_execution_sidecar_v0.h"
+#include "aicore_graph_view_v0.h"
 #include "aicore_gm_atomic.h"
 #include "aicore_ready_queue_v0.h"
+#include "callable.h"
+#include "pto_runtime2_types.h"
 
 namespace {
+
+static_assert(sizeof(PTO2TaskDescriptor) == AICORE_GRAPH_TASK_DESCRIPTOR_STRIDE_V0);
+static_assert(sizeof(PTO2TaskPayload) == AICORE_GRAPH_TASK_PAYLOAD_STRIDE_V0);
+static_assert(offsetof(PTO2TaskDescriptor, kernel_id) == AICORE_GRAPH_KERNEL_IDS_OFFSET_V0);
+static_assert(offsetof(PTO2TaskPayload, fanin_count) == AICORE_GRAPH_FANIN_COUNT_OFFSET_V0);
+static_assert(offsetof(CoreCallable, resolved_addr_) == AICORE_CORE_CALLABLE_RESOLVED_ADDR_OFFSET_V0);
 
 class SidecarBuffer {
 public:
@@ -156,6 +167,164 @@ TEST(AicoreSidecarV0, TaskIdQueueMpmcIsExactlyOnce) {
     EXPECT_EQ(consumed.load(), kTasks);
     for (const auto &count : seen)
         EXPECT_EQ(count.load(), 1);
+}
+
+TEST(AicoreSidecarV0, TaskIdQueueHonorsVyukovSequenceInvariant) {
+    AicoreExecutionSidecarLayoutV0 layout{};
+    ASSERT_TRUE(aicore_sidecar_plan_v0(4, 4, 0, &layout));
+    SidecarBuffer storage(layout);
+    auto *queue = aicore_sidecar_at_v0<AicoreReadyQueueV0>(storage.base(), layout.aic_queue_offset);
+    auto *slots = aicore_sidecar_at_v0<AicoreReadyQueueSlotV0>(storage.base(), layout.aic_queue_slots_offset);
+
+    // Push publishes sequence == pos + 1 after writing task_id; a full queue rejects further pushes.
+    for (int64_t i = 0; i < 4; ++i)
+        ASSERT_TRUE(aicore_ready_queue_push_v0(storage.base(), queue, i));
+    EXPECT_FALSE(aicore_ready_queue_push_v0(storage.base(), queue, 1000));
+    for (uint64_t i = 0; i < layout.aic_queue_capacity; ++i) {
+        EXPECT_EQ(slots[i].sequence, static_cast<int64_t>(i + 1));
+        EXPECT_EQ(slots[i].task_id, static_cast<int64_t>(i));
+    }
+
+    // Pop publishes sequence == pos + capacity, handing the slot back to the next round.
+    int64_t task_id = AICORE_TASK_ID_INVALID_V0;
+    for (int64_t i = 0; i < 4; ++i) {
+        ASSERT_TRUE(aicore_ready_queue_pop_v0(storage.base(), queue, &task_id));
+        EXPECT_EQ(task_id, i);
+    }
+    for (uint64_t i = 0; i < layout.aic_queue_capacity; ++i)
+        EXPECT_EQ(slots[i].sequence, static_cast<int64_t>(i + layout.aic_queue_capacity));
+
+    // A second round wraps the cursor; sequence advances by another capacity step and stays monotonic.
+    for (int64_t i = 0; i < 4; ++i)
+        ASSERT_TRUE(aicore_ready_queue_push_v0(storage.base(), queue, 10 + i));
+    for (uint64_t i = 0; i < layout.aic_queue_capacity; ++i) {
+        EXPECT_EQ(slots[i].sequence, static_cast<int64_t>(i + layout.aic_queue_capacity + 1));
+        EXPECT_EQ(slots[i].task_id, static_cast<int64_t>(10 + i));
+    }
+}
+
+TEST(AicoreSidecarV0, TaskIdQueueLayoutDivergesFromHbgPointerSlot) {
+    // The v0 slot is a pure task-id slot: two int64 words and no device pointer.
+    // HBG's PTO2ReadyQueueSlot is a pointer-slot layout
+    //   {atomic<int64> sequence; PTO2TaskSlotState* slot_state; uint64 task_id_snapshot};
+    // the v0 queue borrows only the Vyukov algorithm from HBG, not that byte layout.
+    static_assert(sizeof(AicoreReadyQueueSlotV0) == 16, "task-id slot must be exactly two int64 words");
+    static_assert(offsetof(AicoreReadyQueueSlotV0, sequence) == 0, "sequence leads the slot");
+    static_assert(offsetof(AicoreReadyQueueSlotV0, task_id) == 8, "task_id follows sequence");
+    static_assert(std::is_standard_layout_v<AicoreReadyQueueSlotV0>, "slot must remain standard-layout");
+    static_assert(std::is_trivially_copyable_v<AicoreReadyQueueSlotV0>, "slot must remain trivially copyable");
+
+    EXPECT_EQ(sizeof(AicoreReadyQueueSlotV0), 2 * sizeof(int64_t));
+    EXPECT_EQ(alignof(AicoreReadyQueueSlotV0), 16u);
+}
+
+TEST(AicoreSidecarV0, AdjacentQueueSlotsDoNotClobber) {
+    AicoreExecutionSidecarLayoutV0 layout{};
+    ASSERT_TRUE(aicore_sidecar_plan_v0(4, 4, 0, &layout));
+    SidecarBuffer storage(layout);
+    auto *slots = aicore_sidecar_at_v0<AicoreReadyQueueSlotV0>(storage.base(), layout.aic_queue_slots_offset);
+
+    // Init state: slot[i].sequence == i, slot[i].task_id == INVALID.
+    EXPECT_EQ(aicore_gm_exchange_v0(slots[0].sequence, 100), 0);
+    aicore_gm_store_v0(slots[1].task_id, 7);
+    aicore_gm_store_v0(slots[layout.aic_queue_capacity - 1].sequence, 200);
+
+    EXPECT_EQ(slots[0].sequence, 100);
+    EXPECT_EQ(slots[0].task_id, AICORE_TASK_ID_INVALID_V0);
+    EXPECT_EQ(slots[1].sequence, 1);
+    EXPECT_EQ(slots[1].task_id, 7);
+    EXPECT_EQ(slots[2].sequence, 2);
+    EXPECT_EQ(slots[2].task_id, AICORE_TASK_ID_INVALID_V0);
+    EXPECT_EQ(slots[layout.aic_queue_capacity - 1].sequence, 200);
+    EXPECT_EQ(slots[layout.aic_queue_capacity - 1].task_id, AICORE_TASK_ID_INVALID_V0);
+}
+
+TEST(AicoreSidecarV0, ClassifiesEmptyAicAndAivRoots) {
+    alignas(64) PTO2TaskDescriptor descriptors[2]{};
+    alignas(64) PTO2TaskPayload payloads[2]{};
+    AicoreReadonlyGraphV0 graph{
+        reinterpret_cast<uint64_t>(descriptors), reinterpret_cast<uint64_t>(payloads), 0, 1,
+    };
+    AicoreRootInfoV0 root{};
+    EXPECT_EQ(aicore_classify_single_root_v0(graph, &root), AicoreRootStatusV0::EMPTY);
+
+    graph.task_count = 1;
+    descriptors[0].task_id = PTO2TaskId::make(0, 0);
+    descriptors[0].kernel_id[0] = 7;
+    descriptors[0].kernel_id[1] = INVALID_KERNEL_ID;
+    descriptors[0].kernel_id[2] = INVALID_KERNEL_ID;
+    payloads[0].fanin_count = 0;
+    ASSERT_EQ(aicore_classify_single_root_v0(graph, &root), AicoreRootStatusV0::OK);
+    EXPECT_EQ(root.task_id, 0);
+    EXPECT_EQ(root.kernel_id, 7);
+    EXPECT_EQ(root.subtask_slot, 0);
+    EXPECT_EQ(root.core_type, AicoreRootCoreTypeV0::AIC);
+
+    descriptors[0].kernel_id[0] = INVALID_KERNEL_ID;
+    descriptors[0].kernel_id[2] = 9;
+    ASSERT_EQ(aicore_classify_single_root_v0(graph, &root), AicoreRootStatusV0::OK);
+    EXPECT_EQ(root.kernel_id, 9);
+    EXPECT_EQ(root.subtask_slot, 2);
+    EXPECT_EQ(root.core_type, AicoreRootCoreTypeV0::AIV);
+}
+
+TEST(AicoreSidecarV0, RejectsNonRootAndUnsupportedShapes) {
+    alignas(64) PTO2TaskDescriptor descriptors[2]{};
+    alignas(64) PTO2TaskPayload payloads[2]{};
+    AicoreReadonlyGraphV0 graph{
+        reinterpret_cast<uint64_t>(descriptors), reinterpret_cast<uint64_t>(payloads), 2, 1,
+    };
+    AicoreRootInfoV0 root{};
+    EXPECT_EQ(aicore_classify_single_root_v0(graph, &root), AicoreRootStatusV0::INVALID_TASK_COUNT);
+
+    graph.task_count = 1;
+    descriptors[0].task_id = PTO2TaskId::make(0, 0);
+    descriptors[0].kernel_id[0] = 1;
+    descriptors[0].kernel_id[1] = INVALID_KERNEL_ID;
+    descriptors[0].kernel_id[2] = INVALID_KERNEL_ID;
+    payloads[0].fanin_count = 1;
+    EXPECT_EQ(aicore_classify_single_root_v0(graph, &root), AicoreRootStatusV0::HAS_FANIN);
+
+    payloads[0].fanin_count = 0;
+    descriptors[0].kernel_id[1] = 2;
+    EXPECT_EQ(aicore_classify_single_root_v0(graph, &root), AicoreRootStatusV0::UNSUPPORTED_SHAPE);
+}
+
+TEST(AicoreSidecarV0, MapsPayloadArgumentsAndResolvesCallableAddress) {
+    alignas(64) PTO2TaskDescriptor descriptors[1]{};
+    alignas(64) PTO2TaskPayload payloads[1]{};
+    descriptors[0].task_id = PTO2TaskId::make(0, 0);
+    descriptors[0].kernel_id[0] = 3;
+    descriptors[0].kernel_id[1] = INVALID_KERNEL_ID;
+    descriptors[0].kernel_id[2] = INVALID_KERNEL_ID;
+    payloads[0].tensor_count = 2;
+    payloads[0].scalar_count = 2;
+    payloads[0].scalars[0] = UINT64_C(0x1234);
+    payloads[0].scalars[1] = UINT64_C(0x5678);
+    AicoreReadonlyGraphV0 graph{
+        reinterpret_cast<uint64_t>(descriptors), reinterpret_cast<uint64_t>(payloads), 1, 0,
+    };
+    AicoreRootInfoV0 root{};
+    ASSERT_EQ(aicore_classify_single_root_v0(graph, &root), AicoreRootStatusV0::OK);
+
+    alignas(8) uint8_t callable_bytes[AICORE_CORE_CALLABLE_RESOLVED_ADDR_OFFSET_V0 + sizeof(uint64_t)]{};
+    *reinterpret_cast<uint64_t *>(callable_bytes + AICORE_CORE_CALLABLE_RESOLVED_ADDR_OFFSET_V0) =
+        UINT64_C(0xabcdef00);
+    PTO2DispatchPayload dispatch{};
+    ASSERT_EQ(
+        aicore_materialize_root_payload_v0(graph, root, reinterpret_cast<uint64_t>(callable_bytes), &dispatch),
+        AicoreRootStatusV0::OK
+    );
+    EXPECT_EQ(dispatch.function_bin_addr, UINT64_C(0xabcdef00));
+    EXPECT_EQ(dispatch.args[0], reinterpret_cast<uint64_t>(&payloads[0].tensors[0]));
+    EXPECT_EQ(dispatch.args[1], reinterpret_cast<uint64_t>(&payloads[0].tensors[1]));
+    EXPECT_EQ(dispatch.args[2], UINT64_C(0x1234));
+    EXPECT_EQ(dispatch.args[3], UINT64_C(0x5678));
+    EXPECT_EQ(dispatch.args[PAYLOAD_LOCAL_CONTEXT_INDEX], reinterpret_cast<uint64_t>(&dispatch.local_context));
+    EXPECT_EQ(dispatch.args[PAYLOAD_GLOBAL_CONTEXT_INDEX], reinterpret_cast<uint64_t>(&dispatch.global_context));
+    EXPECT_EQ(dispatch.local_context.block_idx, 0);
+    EXPECT_EQ(dispatch.local_context.block_num, 1);
+    EXPECT_EQ(dispatch.local_context.async_ctx.task_token.raw, 0u);
 }
 
 }  // namespace

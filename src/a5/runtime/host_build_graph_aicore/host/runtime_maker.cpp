@@ -49,6 +49,7 @@
 
 #include "../common/pto_runtime_status.h"
 #include "../runtime/common.h"
+#include "../runtime/aicore_graph_view_v0.h"
 #include "../runtime/dep_gen_host_graph.h"
 #include "../runtime/host_tensor_access.h"
 #include "../runtime/pto_orchestrator.h"
@@ -95,6 +96,12 @@ extern "C" int concurrent_native_prepare_supported_impl(void) {
 // host_build_graph is single-ring (PTO2_MAX_RING_DEPTH == 1) and reads only the
 // first slot; it must fit within the ABI's slot budget, not equal it.
 static_assert(PTO2_MAX_RING_DEPTH <= RUNTIME_ENV_RING_COUNT, "PTO2 runtime ring depth must fit RuntimeEnv ring slots");
+static_assert(sizeof(PTO2TaskDescriptor) == AICORE_GRAPH_TASK_DESCRIPTOR_STRIDE_V0);
+static_assert(sizeof(PTO2TaskPayload) == AICORE_GRAPH_TASK_PAYLOAD_STRIDE_V0);
+static_assert(offsetof(PTO2TaskDescriptor, task_id) == AICORE_GRAPH_TASK_ID_OFFSET_V0);
+static_assert(offsetof(PTO2TaskDescriptor, kernel_id) == AICORE_GRAPH_KERNEL_IDS_OFFSET_V0);
+static_assert(offsetof(PTO2TaskPayload, fanin_count) == AICORE_GRAPH_FANIN_COUNT_OFFSET_V0);
+static_assert(offsetof(CoreCallable, resolved_addr_) == AICORE_CORE_CALLABLE_RESOLVED_ADDR_OFFSET_V0);
 
 // Helper: return current time in milliseconds
 static int64_t _now_ms() {
@@ -455,11 +462,44 @@ void release_aicore_sidecar(Runtime *runtime, const HostApi *api) {
     }
 }
 
-bool create_empty_aicore_sidecar(Runtime *runtime, const HostApi *api) {
+bool create_aicore_sidecar_v0(
+    Runtime *runtime, const HostApi *api, PTO2SharedMemoryHandle &host_sm_handle, int32_t total_tasks,
+    uint64_t task_window_size
+) {
+    AicoreReadonlyGraphV0 host_graph{
+        reinterpret_cast<uint64_t>(host_sm_handle.header->ring.task_descriptors),
+        reinterpret_cast<uint64_t>(host_sm_handle.header->ring.task_payloads), static_cast<uint64_t>(total_tasks),
+        task_window_size - 1,
+    };
+    AicoreRootInfoV0 root{};
+    AicoreRootStatusV0 root_status = aicore_classify_single_root_v0(host_graph, &root);
+    if (root_status != AicoreRootStatusV0::OK && root_status != AicoreRootStatusV0::EMPTY) {
+        LOG_ERROR("HBG-AICore: unsupported v0 root graph (status=%" PRIu64 ")", static_cast<uint64_t>(root_status));
+        return false;
+    }
+
+    uint64_t aic_task_count = root.core_type == AicoreRootCoreTypeV0::AIC ? 1 : 0;
+    uint64_t aiv_task_count = root.core_type == AicoreRootCoreTypeV0::AIV ? 1 : 0;
+    if (root_status == AicoreRootStatusV0::OK) {
+        PTO2TaskSlotState &slot = host_sm_handle.header->ring.get_slot_state_by_task_id(0);
+        uint8_t expected_mask = static_cast<uint8_t>(1u << root.subtask_slot);
+        if (slot.active_mask.raw() != expected_mask || slot.logical_block_num != 1 ||
+            slot.total_required_subtasks != 1 || slot.task_state.load(std::memory_order_acquire) != PTO2_TASK_PENDING ||
+            slot.task_attrs.allow_early_resolve() || slot.task_attrs.requires_sync_start() ||
+            slot.task_attrs.has_predicate()) {
+            LOG_ERROR("HBG-AICore: M1 requires one pending, single-slot, block_num=1 root");
+            return false;
+        }
+        if (root.kernel_id >= RUNTIME_MAX_FUNC_ID || runtime->get_function_bin_addr(root.kernel_id) == 0) {
+            LOG_ERROR("HBG-AICore: root kernel id %d has no registered callable", root.kernel_id);
+            return false;
+        }
+    }
+
     AicoreExecutionSidecarLayoutV0 layout{};
-    if (!aicore_sidecar_plan_v0(0, 0, 0, &layout) ||
+    if (!aicore_sidecar_plan_v0(static_cast<uint64_t>(total_tasks), aic_task_count, aiv_task_count, &layout) ||
         layout.total_size > std::numeric_limits<uint64_t>::max() - (AICORE_SIDECAR_ALIGNMENT_V0 - 1)) {
-        LOG_ERROR("HBG-AICore: empty sidecar layout overflow");
+        LOG_ERROR("HBG-AICore: sidecar layout overflow");
         return false;
     }
 
@@ -479,9 +519,16 @@ bool create_empty_aicore_sidecar(Runtime *runtime, const HostApi *api) {
     void *host_base = reinterpret_cast<void *>(host_aligned_address);
     if (!aicore_sidecar_init_v0(host_base, layout)) {
         api->device_free(allocation);
-        LOG_ERROR("HBG-AICore: failed to initialize empty sidecar");
+        LOG_ERROR("HBG-AICore: failed to initialize sidecar");
         return false;
     }
+
+    const pto2_sm_layout::PTO2RingSegmentOffsets device_segments =
+        pto2_sm_layout::ring_segment_offsets(task_window_size);
+    const uint64_t device_sm_address = reinterpret_cast<uint64_t>(runtime->get_gm_sm_ptr());
+    auto *run_control = aicore_sidecar_at_v0<AicoreRunControlV0>(host_base, layout.run_control_offset);
+    run_control->expected_task_count = static_cast<uint64_t>(total_tasks);
+    run_control->root_core_type = static_cast<uint64_t>(root.core_type);
 
     auto *contexts = aicore_sidecar_at_v0<AicoreWorkerContextV0>(host_base, layout.worker_contexts_offset);
     int32_t aic_rank = 0;
@@ -496,17 +543,20 @@ bool create_empty_aicore_sidecar(Runtime *runtime, const HostApi *api) {
         context.task_controls_offset = layout.task_controls_offset;
         context.aic_queue_offset = layout.aic_queue_offset;
         context.aiv_queue_offset = layout.aiv_queue_offset;
-        context.readonly_graph_address = reinterpret_cast<uint64_t>(runtime->get_gm_sm_ptr());
+        context.graph_descriptors_address = device_sm_address + device_segments.descriptors;
+        context.graph_payloads_address = device_sm_address + device_segments.payloads;
         context.sidecar_base_address = aligned_address;
         context.dispatch_payload_offset =
             layout.dispatch_payloads_offset + static_cast<uint64_t>(i) * sizeof(PTO2DispatchPayload);
+        context.task_window_mask = task_window_size - 1;
+        context.task_count = static_cast<uint64_t>(total_tasks);
     }
 
     if (api->copy_to_device(
             reinterpret_cast<void *>(aligned_address), host_base, static_cast<size_t>(layout.total_size)
         ) != 0) {
         api->device_free(allocation);
-        LOG_ERROR("HBG-AICore: failed to publish empty sidecar");
+        LOG_ERROR("HBG-AICore: failed to publish sidecar");
         return false;
     }
     runtime->aicore_sidecar_base = reinterpret_cast<void *>(aligned_address);
@@ -585,6 +635,10 @@ int32_t run_host_orchestration(
 
     int32_t total_tasks = pto2_sm_layout::ring_current_task_index_addr(host_sm)->load(std::memory_order_acquire);
 
+    if (!create_aicore_sidecar_v0(runtime, api, host_sm_handle, total_tasks, eff_task_window_sizes[0])) {
+        return -1;
+    }
+
     // Relocate the host-DDR cross-task pointers to their final DEVICE addresses
     // on the host, before the SM and arena leave for the device. Pointers into
     // the SM shift by sm_delta; pointers into the arena (fanout adjacency, wiring
@@ -599,11 +653,13 @@ int32_t run_host_orchestration(
             reinterpret_cast<uint64_t>(host_arena.base()), layout.arena_size, arena_delta
         )) {
         LOG_ERROR("host-orch: relocation failed; refusing to H2D an image with unrelocated host pointers");
+        release_aicore_sidecar(runtime, api);
         return -1;
     }
 
     if (api->copy_to_device(device_sm, host_sm, sm_size) != 0) {
         LOG_ERROR("host-orch: H2D of populated SM failed");
+        release_aicore_sidecar(runtime, api);
         return -1;
     }
     return total_tasks;
@@ -937,16 +993,6 @@ extern "C" int bind_callable_to_runtime_impl(
         LOG_INFO("host-orch: submitted %d tasks on host", total_tasks);
     }
 
-    // M0 deliberately accepts only an empty graph. A non-empty graph would
-    // execute real tasks and belongs to M1, even though HBG built the image.
-    if (runtime->host_total_tasks != 0) {
-        LOG_ERROR("HBG-AICore M0 accepts only an empty graph; got %d tasks", runtime->host_total_tasks);
-        return -1;
-    }
-    if (!create_empty_aicore_sidecar(runtime, api)) {
-        return -1;
-    }
-
     // Stash the layout inside the PTO2Runtime image so the AICPU can recover
     // every arena-internal offset after rtMemcpy. The runtime arena's device
     // base does NOT travel in this image — it's on the host Runtime
@@ -1021,6 +1067,58 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
         int32_t orch_error_code = host_header.orch_error_code.load(std::memory_order_relaxed);
         int32_t sched_error_code = host_header.sched_error_code.load(std::memory_order_relaxed);
         LOG_RUNTIME_FAILURE(orch_error_code, sched_error_code, runtime_status);
+    }
+
+    if (runtime->aicore_sidecar_base != nullptr) {
+        const uint64_t sidecar_size = runtime->aicore_sidecar_layout.total_size;
+        std::vector<uint8_t> sidecar_storage(static_cast<size_t>(sidecar_size + AICORE_SIDECAR_ALIGNMENT_V0 - 1));
+        uintptr_t host_sidecar_address =
+            (reinterpret_cast<uintptr_t>(sidecar_storage.data()) + AICORE_SIDECAR_ALIGNMENT_V0 - 1) &
+            ~(static_cast<uintptr_t>(AICORE_SIDECAR_ALIGNMENT_V0) - 1);
+        void *host_sidecar = reinterpret_cast<void *>(host_sidecar_address);
+        int sidecar_rc =
+            api->copy_from_device(host_sidecar, runtime->aicore_sidecar_base, static_cast<size_t>(sidecar_size));
+        if (sidecar_rc != 0) {
+            LOG_ERROR("HBG-AICore: failed to copy v0 sidecar from device: %d", sidecar_rc);
+            rc = sidecar_rc;
+        } else {
+            const auto *control = aicore_sidecar_at_v0<AicoreRunControlV0>(
+                host_sidecar, runtime->aicore_sidecar_layout.run_control_offset
+            );
+            const auto *contexts = aicore_sidecar_at_v0<AicoreWorkerContextV0>(
+                host_sidecar, runtime->aicore_sidecar_layout.worker_contexts_offset
+            );
+            uint64_t active_workers = 0;
+            for (int32_t i = 0; i < runtime->worker_count; ++i)
+                active_workers += contexts[i].active != 0 ? 1 : 0;
+            uint64_t expected_active = runtime->host_total_tasks == 0 ? 0 : 1;
+            if (control->classification_error != 0 ||
+                control->expected_task_count != static_cast<uint64_t>(runtime->host_total_tasks) ||
+                control->completed_count != control->expected_task_count ||
+                control->queue_push_count != control->expected_task_count ||
+                control->queue_pop_count != control->expected_task_count ||
+                control->executed_count != control->expected_task_count || active_workers != expected_active ||
+                control->finished_count != static_cast<uint64_t>(runtime->worker_count)) {
+                LOG_ERROR(
+                    "HBG-AICore: invalid v0 final state expected=%" PRIu64 " completed=%" PRIu64
+                    " push=%" PRIu64 " pop=%" PRIu64 " executed=%" PRIu64 " active=%" PRIu64
+                    " finished=%" PRIu64 " error=%" PRIu64,
+                    control->expected_task_count, control->completed_count, control->queue_push_count,
+                    control->queue_pop_count, control->executed_count, active_workers, control->finished_count,
+                    control->classification_error
+                );
+                rc = -1;
+            } else if (control->expected_task_count == 1) {
+                uint64_t aicore_total_cycles = control->ready_to_start_cycles + control->payload_cycles +
+                                               control->kernel_cycles + control->completion_cycles;
+                LOG_INFO(
+                    "HBG-AICore M1 HOST TIMING: ready_to_start=%" PRIu64 " payload=%" PRIu64 " kernel=%" PRIu64
+                    " completion=%" PRIu64 " total=%" PRIu64 " cycles",
+                    control->ready_to_start_cycles, control->payload_cycles, control->kernel_cycles,
+                    control->completion_cycles, aicore_total_cycles
+                );
+            }
+        }
     }
 
     if (skip_tensor_copy_back) {
