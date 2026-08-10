@@ -24,6 +24,10 @@
 #define __aicore__
 #endif
 
+#ifndef __host__
+#define __host__
+#endif
+
 inline constexpr uint64_t AICORE_SIDECAR_ALIGNMENT_V0 = 128;
 inline constexpr uint64_t AICORE_WORKER_CAPACITY_V0 = 108;
 inline constexpr int64_t AICORE_TASK_ID_INVALID_V0 = -1;
@@ -231,7 +235,7 @@ inline bool aicore_sidecar_plan_v0(
 }
 
 template <typename T>
-inline __gm__ T *aicore_sidecar_at_v0(__gm__ void *base, uint64_t offset) {
+inline __host__ __aicore__ __gm__ T *aicore_sidecar_at_v0(__gm__ void *base, uint64_t offset) {
     return reinterpret_cast<__gm__ T *>(reinterpret_cast<__gm__ uint8_t *>(base) + offset);
 }
 

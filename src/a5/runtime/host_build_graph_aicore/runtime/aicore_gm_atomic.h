@@ -41,8 +41,8 @@ inline __aicore__ void
 aicore_gm_store_v0(__gm__ volatile int64_t &value, int64_t desired, int order = __ATOMIC_RELEASE) {
 #if defined(__CCE_AICORE__)
     (void)order;
-    st_dev_b64(
-        reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&value)), static_cast<uint64_t>(desired)
+    st_dev(
+        static_cast<uint64_t>(desired), reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&value)), 0
     );
     OUT_OF_ORDER_STORE_BARRIER();
 #else
@@ -54,7 +54,7 @@ inline __aicore__ void
 aicore_gm_store_v0(__gm__ volatile uint64_t &value, uint64_t desired, int order = __ATOMIC_RELEASE) {
 #if defined(__CCE_AICORE__)
     (void)order;
-    st_dev_b64(const_cast<__gm__ uint64_t *>(&value), desired);
+    st_dev(desired, const_cast<__gm__ uint64_t *>(&value), 0);
     OUT_OF_ORDER_STORE_BARRIER();
 #else
     __atomic_store_n(&value, desired, order);
