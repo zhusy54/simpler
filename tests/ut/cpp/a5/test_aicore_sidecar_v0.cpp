@@ -22,6 +22,7 @@
 
 #include "aicore_execution_sidecar_v0.h"
 #include "aicore_dependency_model_v0.h"
+#include "aicore_dependency_scheduler_v0.h"
 #include "aicore_graph_view_v0.h"
 #include "aicore_gm_atomic.h"
 #include "aicore_ready_queue_v0.h"
@@ -336,6 +337,108 @@ TEST(AicoreSidecarV0, MapsPayloadArgumentsAndResolvesCallableAddress) {
     EXPECT_EQ(dispatch.local_context.block_idx, 0);
     EXPECT_EQ(dispatch.local_context.block_num, 1);
     EXPECT_EQ(dispatch.local_context.async_ctx.task_token.raw, 0u);
+}
+
+TEST(AicoreSidecarV0, RoutesHomogeneousDagThroughWakeLists) {
+    alignas(64) PTO2TaskDescriptor descriptors[4]{};
+    alignas(64) PTO2TaskPayload payloads[4]{};
+    for (int64_t task_id = 0; task_id < 4; ++task_id) {
+        descriptors[task_id].task_id = PTO2TaskId::make(0, task_id);
+        descriptors[task_id].kernel_id[0] = 3;
+        descriptors[task_id].kernel_id[1] = INVALID_KERNEL_ID;
+        descriptors[task_id].kernel_id[2] = INVALID_KERNEL_ID;
+    }
+    payloads[1].fanin_count = 1;
+    payloads[1].fanin_local_ids[0] = 0;
+    payloads[2].fanin_count = 1;
+    payloads[2].fanin_local_ids[0] = 0;
+    payloads[3].fanin_count = 2;
+    payloads[3].fanin_local_ids[0] = 2;
+    payloads[3].fanin_local_ids[1] = 1;
+    AicoreReadonlyGraphV0 graph{
+        reinterpret_cast<uint64_t>(descriptors),
+        reinterpret_cast<uint64_t>(payloads),
+        4,
+        3,
+    };
+
+    AicoreExecutionSidecarLayoutV0 layout{};
+    ASSERT_TRUE(aicore_sidecar_plan_v0(4, 4, 0, &layout));
+    SidecarBuffer storage(layout);
+    auto *run_control = aicore_sidecar_at_v0<AicoreRunControlV0>(storage.base(), layout.run_control_offset);
+    run_control->root_core_type = static_cast<uint64_t>(AicoreRootCoreTypeV0::AIC);
+    AicoreWorkerContextV0 context{};
+    context.task_controls_offset = layout.task_controls_offset;
+    context.aic_queue_offset = layout.aic_queue_offset;
+    context.aiv_queue_offset = layout.aiv_queue_offset;
+
+    EXPECT_EQ(
+        aicore_classify_and_route_v0(graph, storage.base(), &context, run_control, 0), AicoreRouteResultV0::READY
+    );
+    for (int64_t task_id = 1; task_id < 4; ++task_id) {
+        EXPECT_EQ(
+            aicore_classify_and_route_v0(graph, storage.base(), &context, run_control, task_id),
+            AicoreRouteResultV0::WAITING
+        );
+    }
+    auto *queue = aicore_sidecar_at_v0<AicoreReadyQueueV0>(storage.base(), layout.aic_queue_offset);
+    std::vector<int> seen(4, 0);
+    int64_t task_id = AICORE_TASK_ID_INVALID_V0;
+    while (aicore_ready_queue_pop_v0(storage.base(), queue, &task_id)) {
+        ++seen[task_id];
+        ASSERT_TRUE(aicore_complete_and_wake_v0(graph, storage.base(), &context, run_control, task_id));
+    }
+
+    EXPECT_EQ(seen, (std::vector<int>{1, 1, 1, 1}));
+    EXPECT_EQ(run_control->queue_push_count, 4u);
+    EXPECT_EQ(run_control->wake_close_count, 4u);
+    EXPECT_EQ(run_control->wake_register_count, 4u);
+    EXPECT_EQ(run_control->wake_reclassify_count, 4u);
+    auto *controls = aicore_sidecar_at_v0<AicoreTaskControlV0>(storage.base(), layout.task_controls_offset);
+    for (int64_t i = 0; i < 4; ++i) {
+        EXPECT_EQ(controls[i].completion, 1);
+        EXPECT_EQ(controls[i].wake_list_head, AICORE_WAKE_LIST_CLOSED_V0);
+    }
+}
+
+TEST(AicoreSidecarV0, RejectsInvalidOrMixedDagTasks) {
+    alignas(64) PTO2TaskDescriptor descriptors[2]{};
+    alignas(64) PTO2TaskPayload payloads[2]{};
+    descriptors[0].task_id = PTO2TaskId::make(0, 0);
+    descriptors[0].kernel_id[0] = 0;
+    descriptors[0].kernel_id[1] = INVALID_KERNEL_ID;
+    descriptors[0].kernel_id[2] = INVALID_KERNEL_ID;
+    descriptors[1].task_id = PTO2TaskId::make(0, 1);
+    descriptors[1].kernel_id[0] = INVALID_KERNEL_ID;
+    descriptors[1].kernel_id[1] = 1;
+    descriptors[1].kernel_id[2] = INVALID_KERNEL_ID;
+    payloads[1].fanin_count = 2;
+    payloads[1].fanin_local_ids[0] = 0;
+    payloads[1].fanin_local_ids[1] = 0;
+    AicoreReadonlyGraphV0 graph{
+        reinterpret_cast<uint64_t>(descriptors),
+        reinterpret_cast<uint64_t>(payloads),
+        2,
+        1,
+    };
+    AicoreTaskInfoV0 task{};
+    EXPECT_EQ(aicore_classify_task_v0(graph, 1, &task), AicoreRootStatusV0::INVALID_FANIN_ID);
+
+    payloads[1].fanin_count = 1;
+    EXPECT_EQ(aicore_classify_task_v0(graph, 1, &task), AicoreRootStatusV0::OK);
+    AicoreExecutionSidecarLayoutV0 layout{};
+    ASSERT_TRUE(aicore_sidecar_plan_v0(2, 1, 1, &layout));
+    SidecarBuffer storage(layout);
+    auto *run_control = aicore_sidecar_at_v0<AicoreRunControlV0>(storage.base(), layout.run_control_offset);
+    run_control->root_core_type = static_cast<uint64_t>(AicoreRootCoreTypeV0::AIC);
+    AicoreWorkerContextV0 context{};
+    context.task_controls_offset = layout.task_controls_offset;
+    context.aic_queue_offset = layout.aic_queue_offset;
+    context.aiv_queue_offset = layout.aiv_queue_offset;
+    EXPECT_EQ(
+        aicore_classify_and_route_v0(graph, storage.base(), &context, run_control, 1), AicoreRouteResultV0::ERROR
+    );
+    EXPECT_EQ(run_control->classification_error, static_cast<uint64_t>(AicoreRootStatusV0::MIXED_CORE_TYPE));
 }
 
 TEST(AicoreDependencyModelV0, RegisterBeforeCloseWakesEveryWaiterExactlyOnce) {

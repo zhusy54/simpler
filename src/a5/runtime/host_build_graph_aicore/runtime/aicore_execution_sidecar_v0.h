@@ -80,6 +80,19 @@ struct alignas(128) AicoreRunControlV0 {
     uint64_t payload_cycles;
     uint64_t kernel_cycles;
     uint64_t completion_cycles;
+    uint64_t initial_ready_count;
+    uint64_t initial_waiting_count;
+    uint64_t fanin_scan_count;
+    uint64_t fanin_edge_count;
+    uint64_t wake_register_count;
+    uint64_t wake_close_count;
+    uint64_t wake_reclassify_count;
+    uint64_t wake_closed_retry_count;
+    uint64_t classify_cycles;
+    uint64_t wake_cycles;
+    uint64_t empty_scan_count;
+    uint64_t error_task_id;
+    uint64_t reserved[4];
 };
 
 struct alignas(128) AicoreWorkerContextV0 {
@@ -98,8 +111,9 @@ struct alignas(128) AicoreWorkerContextV0 {
     uint64_t task_window_mask;
     uint64_t local_completed_delta;
     uint64_t poll_count;
-    uint64_t task_count;
-    uint8_t padding[16];
+    uint64_t graph_task_count;
+    uint64_t executed_task_count;
+    uint8_t padding[8];
 };
 
 struct AicoreExecutionSidecarLayoutV0 {
@@ -128,7 +142,8 @@ static_assert(sizeof(AicoreReadyQueueSlotV0) == 16, "task-id queue slot layout c
 static_assert(sizeof(AicoreReadyQueueV0) == 384, "task-id queue header layout changed");
 static_assert(offsetof(AicoreReadyQueueV0, enqueue_pos) == 128, "enqueue cursor must have its own line");
 static_assert(offsetof(AicoreReadyQueueV0, dequeue_pos) == 256, "dequeue cursor must have its own line");
-static_assert(sizeof(AicoreRunControlV0) == 128, "run control layout changed");
+static_assert(sizeof(AicoreRunControlV0) == 256, "run control layout changed");
+static_assert(alignof(AicoreRunControlV0) == 128, "run control must be 128-byte aligned");
 static_assert(sizeof(AicoreWorkerContextV0) == 128, "worker context layout changed");
 
 #if !defined(__CCE_AICORE__)

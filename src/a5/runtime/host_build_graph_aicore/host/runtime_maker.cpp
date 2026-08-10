@@ -466,33 +466,56 @@ bool create_aicore_sidecar_v0(
     Runtime *runtime, const HostApi *api, PTO2SharedMemoryHandle &host_sm_handle, int32_t total_tasks,
     uint64_t task_window_size
 ) {
-    AicoreReadonlyGraphV0 host_graph{
-        reinterpret_cast<uint64_t>(host_sm_handle.header->ring.task_descriptors),
-        reinterpret_cast<uint64_t>(host_sm_handle.header->ring.task_payloads), static_cast<uint64_t>(total_tasks),
-        task_window_size - 1,
-    };
-    AicoreRootInfoV0 root{};
-    AicoreRootStatusV0 root_status = aicore_classify_single_root_v0(host_graph, &root);
-    if (root_status != AicoreRootStatusV0::OK && root_status != AicoreRootStatusV0::EMPTY) {
-        LOG_ERROR("HBG-AICore: unsupported v0 root graph (status=%" PRIu64 ")", static_cast<uint64_t>(root_status));
+    if (total_tasks < 0 || task_window_size == 0 || static_cast<uint64_t>(total_tasks) > task_window_size) {
+        LOG_ERROR("HBG-AICore: invalid graph size tasks=%d window=%" PRIu64, total_tasks, task_window_size);
         return false;
     }
+    AicoreReadonlyGraphV0 host_graph{
+        reinterpret_cast<uint64_t>(host_sm_handle.header->ring.task_descriptors),
+        reinterpret_cast<uint64_t>(host_sm_handle.header->ring.task_payloads),
+        static_cast<uint64_t>(total_tasks),
+        task_window_size - 1,
+    };
+    AicoreRootCoreTypeV0 graph_core_type = AicoreRootCoreTypeV0::NONE;
+    uint64_t aic_task_count = 0;
+    uint64_t aiv_task_count = 0;
+    for (int64_t task_id = 0; task_id < total_tasks; ++task_id) {
+        AicoreTaskInfoV0 task{};
+        AicoreRootStatusV0 status = aicore_classify_task_v0(host_graph, task_id, &task);
+        if (status != AicoreRootStatusV0::OK) {
+            LOG_ERROR(
+                "HBG-AICore: invalid M2 task id=%" PRId64 " status=%" PRIu64, task_id, static_cast<uint64_t>(status)
+            );
+            return false;
+        }
+        if (graph_core_type == AicoreRootCoreTypeV0::NONE) {
+            graph_core_type = task.core_type;
+        } else if (graph_core_type != task.core_type) {
+            LOG_ERROR("HBG-AICore: M2 requires a homogeneous AIC-only or AIV-only graph");
+            return false;
+        }
 
-    uint64_t aic_task_count = root.core_type == AicoreRootCoreTypeV0::AIC ? 1 : 0;
-    uint64_t aiv_task_count = root.core_type == AicoreRootCoreTypeV0::AIV ? 1 : 0;
-    if (root_status == AicoreRootStatusV0::OK) {
-        PTO2TaskSlotState &slot = host_sm_handle.header->ring.get_slot_state_by_task_id(0);
-        uint8_t expected_mask = static_cast<uint8_t>(1u << root.subtask_slot);
+        PTO2TaskSlotState &slot = host_sm_handle.header->ring.get_slot_state_by_task_id(task_id);
+        uint8_t expected_mask = static_cast<uint8_t>(1u << task.subtask_slot);
         if (slot.active_mask.raw() != expected_mask || slot.logical_block_num != 1 ||
             slot.total_required_subtasks != 1 || slot.task_state.load(std::memory_order_acquire) != PTO2_TASK_PENDING ||
             slot.task_attrs.allow_early_resolve() || slot.task_attrs.requires_sync_start() ||
             slot.task_attrs.has_predicate()) {
-            LOG_ERROR("HBG-AICore: M1 requires one pending, single-slot, block_num=1 root");
+            LOG_ERROR(
+                "HBG-AICore: M2 task id=%" PRId64 " must be pending, single-slot, block_num=1, and ungated", task_id
+            );
             return false;
         }
-        if (root.kernel_id >= RUNTIME_MAX_FUNC_ID || runtime->get_function_bin_addr(root.kernel_id) == 0) {
-            LOG_ERROR("HBG-AICore: root kernel id %d has no registered callable", root.kernel_id);
+        if (task.kernel_id >= RUNTIME_MAX_FUNC_ID || runtime->get_function_bin_addr(task.kernel_id) == 0) {
+            LOG_ERROR(
+                "HBG-AICore: task id=%" PRId64 " kernel id %d has no registered callable", task_id, task.kernel_id
+            );
             return false;
+        }
+        if (task.core_type == AicoreRootCoreTypeV0::AIC) {
+            ++aic_task_count;
+        } else {
+            ++aiv_task_count;
         }
     }
 
@@ -528,7 +551,8 @@ bool create_aicore_sidecar_v0(
     const uint64_t device_sm_address = reinterpret_cast<uint64_t>(runtime->get_gm_sm_ptr());
     auto *run_control = aicore_sidecar_at_v0<AicoreRunControlV0>(host_base, layout.run_control_offset);
     run_control->expected_task_count = static_cast<uint64_t>(total_tasks);
-    run_control->root_core_type = static_cast<uint64_t>(root.core_type);
+    run_control->root_core_type = static_cast<uint64_t>(graph_core_type);
+    run_control->error_task_id = UINT64_MAX;
 
     auto *contexts = aicore_sidecar_at_v0<AicoreWorkerContextV0>(host_base, layout.worker_contexts_offset);
     int32_t aic_rank = 0;
@@ -549,7 +573,7 @@ bool create_aicore_sidecar_v0(
         context.dispatch_payload_offset =
             layout.dispatch_payloads_offset + static_cast<uint64_t>(i) * sizeof(PTO2DispatchPayload);
         context.task_window_mask = task_window_size - 1;
-        context.task_count = static_cast<uint64_t>(total_tasks);
+        context.graph_task_count = static_cast<uint64_t>(total_tasks);
     }
 
     if (api->copy_to_device(
@@ -1088,34 +1112,64 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
             const auto *contexts = aicore_sidecar_at_v0<AicoreWorkerContextV0>(
                 host_sidecar, runtime->aicore_sidecar_layout.worker_contexts_offset
             );
+            const auto *task_controls = aicore_sidecar_at_v0<AicoreTaskControlV0>(
+                host_sidecar, runtime->aicore_sidecar_layout.task_controls_offset
+            );
             uint64_t active_workers = 0;
+            uint64_t worker_executed = 0;
             for (int32_t i = 0; i < runtime->worker_count; ++i)
-                active_workers += contexts[i].active != 0 ? 1 : 0;
+                if (contexts[i].active != 0) {
+                    ++active_workers;
+                    worker_executed += contexts[i].executed_task_count;
+                }
+            bool task_controls_valid = true;
+            for (int32_t task_id = 0; task_id < runtime->host_total_tasks; ++task_id) {
+                if (task_controls[task_id].completion != 1 ||
+                    task_controls[task_id].wake_list_head != AICORE_WAKE_LIST_CLOSED_V0) {
+                    LOG_ERROR(
+                        "HBG-AICore: invalid task control id=%d completion=%" PRId64 " wake_head=%" PRId64, task_id,
+                        task_controls[task_id].completion, task_controls[task_id].wake_list_head
+                    );
+                    task_controls_valid = false;
+                    break;
+                }
+            }
             uint64_t expected_active = runtime->host_total_tasks == 0 ? 0 : 1;
             if (control->classification_error != 0 ||
                 control->expected_task_count != static_cast<uint64_t>(runtime->host_total_tasks) ||
                 control->completed_count != control->expected_task_count ||
                 control->queue_push_count != control->expected_task_count ||
                 control->queue_pop_count != control->expected_task_count ||
-                control->executed_count != control->expected_task_count || active_workers != expected_active ||
-                control->finished_count != static_cast<uint64_t>(runtime->worker_count)) {
+                control->executed_count != control->expected_task_count ||
+                control->initial_ready_count + control->initial_waiting_count != control->expected_task_count ||
+                control->wake_close_count != control->expected_task_count ||
+                worker_executed != control->expected_task_count || active_workers != expected_active ||
+                control->finished_count != static_cast<uint64_t>(runtime->worker_count) || !task_controls_valid) {
                 LOG_ERROR(
-                    "HBG-AICore: invalid v0 final state expected=%" PRIu64 " completed=%" PRIu64
-                    " push=%" PRIu64 " pop=%" PRIu64 " executed=%" PRIu64 " active=%" PRIu64
+                    "HBG-AICore: invalid v0 final state expected=%" PRIu64 " completed=%" PRIu64 " push=%" PRIu64
+                    " pop=%" PRIu64 " executed=%" PRIu64 " active=%" PRIu64 " worker_executed=%" PRIu64
                     " finished=%" PRIu64 " error=%" PRIu64,
                     control->expected_task_count, control->completed_count, control->queue_push_count,
-                    control->queue_pop_count, control->executed_count, active_workers, control->finished_count,
-                    control->classification_error
+                    control->queue_pop_count, control->executed_count, active_workers, worker_executed,
+                    control->finished_count, control->classification_error
                 );
                 rc = -1;
-            } else if (control->expected_task_count == 1) {
+            } else if (control->expected_task_count != 0) {
                 uint64_t aicore_total_cycles = control->ready_to_start_cycles + control->payload_cycles +
                                                control->kernel_cycles + control->completion_cycles;
                 LOG_INFO(
-                    "HBG-AICore M1 HOST TIMING: ready_to_start=%" PRIu64 " payload=%" PRIu64 " kernel=%" PRIu64
+                    "HBG-AICore HOST TIMING: ready_to_start=%" PRIu64 " payload=%" PRIu64 " kernel=%" PRIu64
                     " completion=%" PRIu64 " total=%" PRIu64 " cycles",
                     control->ready_to_start_cycles, control->payload_cycles, control->kernel_cycles,
                     control->completion_cycles, aicore_total_cycles
+                );
+                LOG_INFO(
+                    "HBG-AICore M2 COUNTERS: initial_ready=%" PRIu64 " initial_waiting=%" PRIu64 " fanin_scans=%" PRIu64
+                    " fanin_edges=%" PRIu64 " registers=%" PRIu64 " closes=%" PRIu64 " reclassifies=%" PRIu64
+                    " closed_retries=%" PRIu64,
+                    control->initial_ready_count, control->initial_waiting_count, control->fanin_scan_count,
+                    control->fanin_edge_count, control->wake_register_count, control->wake_close_count,
+                    control->wake_reclassify_count, control->wake_closed_retry_count
                 );
             }
         }
