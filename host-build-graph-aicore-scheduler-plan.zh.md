@@ -15,9 +15,10 @@
 ### 1.1 架构结论
 
 当前分支已新增显式 Runtime 变体 `host_build_graph_aicore`，并完成 M0～M2：单 root 与单核
-同质 DAG 的首次分类、依赖等待、完成传播和任务领取已在 A5sim 验证。A5 真机可见性、性能收益
-和 M3 多核扩展尚未证明，完成后仍须由人工架构评审决定是否进入完整实现；现有
-`host_build_graph` 的默认行为不变。
+同质 DAG 的首次分类、依赖等待、完成传播和任务领取已在 A5sim 验证；验证同时覆盖生产
+close/register 并发协议、CPU 模型的长 fanin，以及真实 TensorMap AIV 数据流的 chain、diamond
+和 multi-root HBG 差分。A5 真机可见性、性能收益和 M3 多核扩展尚未证明，完成后仍须由人工
+架构评审决定是否进入完整实现；现有 `host_build_graph` 的默认行为不变。
 
 新 Runtime 位于 `simpler/src/a5/runtime/host_build_graph_aicore/`，与现有
 `simpler/src/a5/runtime/host_build_graph/` 平级。第一阶段从当前 A5 HBG 复制完整实现代码作为
@@ -593,8 +594,12 @@ Runtime-specific 代码不在 HBG 与 HBG-AICore 之间抽取共享层。M0 将 
 独立验证和性能对比：
 
 - CPU 模型覆盖成功路径 waiter 注册/关闭竞态、重复唤醒和长 fanin，不注入 queue 满或首错。
+- 生产 `classify/complete-and-wake` 接口直接覆盖多 waiter 并发 drain 和 close/register 竞态，
+  避免只由独立模型证明状态机。
 - A5sim/A5 手工对基础图族逐边验证 `producer complete-before-consumer start`，并与 HBG 比较
   graph signature 和成功输出。
+- 对 chain、diamond 和 multi-root 增加真实 AIV kernel/TensorMap 推导依赖，以相同 orchestration
+  分别运行 HBG-AICore 和 HBG，比较业务输出；显式状态检查图继续覆盖 fanout、宽 fanin 和随机图。
 - 固定单核 DAG 比较 M1、HBG 和本里程碑的分类、重复 fanin 扫描、完成传播及总时延。
 
 #### M3：多 core 单 lane 调度
@@ -784,6 +789,8 @@ Runtime-specific 代码不在 HBG 与 HBG-AICore 之间抽取共享层。M0 将 
 - O3 候选 ReadySet 的 set/acquire、summary 清位竞态、fallback scan、热点 word、公平性和
   非 64 对齐任务数；这些用例不属于 M0～M9 基线。
 - wake list 的注册/关闭竞态、关闭后重扫、重复唤醒和长 fanin。
+- wake list 除模型测试外，必须直接调用生产分类/完成接口做并发 close/register 和多 waiter drain；
+  当前 v0 生产接口用例覆盖 16 waiter 和 40 轮竞态，CPU 模型另覆盖 32 路 fanin。
 - initial classify 的区间分片、预完成 producer、隐藏分配和 barrier。
 - task 单次 ready 发布、ReadySet exactly-once 领取和 first-error 幂等性。
 - M7/M8 的 idle bitmap、MIX/wide all-or-rollback、participant 和 task epoch barrier 模型。

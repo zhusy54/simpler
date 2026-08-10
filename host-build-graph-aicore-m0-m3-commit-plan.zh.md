@@ -24,9 +24,11 @@
 第一阶段只回答“Host 已知完整 DAG 能否由 AICore scheduler 正确、高效执行”。M3 完成后不得
 直接进入 M4，必须先根据 ABI v0 的实测结果决定是否继续以及 v1 的具体形态。
 
-当前分支已经实现 M1 功能和 M2 单核同质 DAG：CPU reference、AICore first-unmet/wake relay、
-Host 启动前校验以及纯 AIC/纯 AIV 标准图族均已落地并通过 A5sim。M1/M2 的 A5 真机签署和
-HBG 性能对比仍须在架构预检恢复后补齐，不能用 A5sim 结果替代。
+当前分支已经实现 M1 功能和 M2 单核同质 DAG：CPU reference、生产路径的 AICore
+first-unmet/wake relay、Host 启动前校验以及纯 AIC/纯 AIV 标准图族均已落地并通过 A5sim。
+此外，生产接口已覆盖 16 waiter 并发注册/关闭竞态，CPU 模型已覆盖 32 路 fanin；真实
+TensorMap AIV 数据流的 chain、diamond 和 multi-root 也已与 HBG oracle 同输入验证通过。
+M1/M2 的 A5 真机签署和 HBG 性能对比仍须在架构预检恢复后补齐，不能用 A5sim 结果替代。
 
 ## 2. 已锁定的实现契约
 
@@ -229,6 +231,8 @@ A5 真机测试在占用设备前必须执行架构预检，随后通过项目�
 - CPU 模型逐项对应 HBG `classify_fanin_state`、`register_wake` 和 completion wake drain。
 - 覆盖 register-before-close、close-before-register、多 waiter、多 fanin 转挂和单 fanin 快路径。
 - 验证每个 task 最多 ready 一次，CLOSED 后 waiter 不丢失且所有 fanin 满足后才进入 ReadyQ。
+- 当前增强用例还直接调用生产 `classify/complete-and-wake` 接口，覆盖 16 waiter 并发 drain 和
+  40 轮 close/register 竞态；CPU 模型另覆盖 32 路 fanin，不以独立模型替代生产协议验证。
 
 #### 提交 11：`feat: migrate HBG classify and wake relay to AICore`
 
@@ -242,6 +246,8 @@ A5 真机测试在占用设备前必须执行架构预检，随后通过项目�
 - manual A5sim/A5 覆盖 chain、repeated diamond、fanout、32-way layered fanin、multi-root 和固定
   seed 随机 DAG。
 - 将输出、task 执行次数和依赖顺序与原 HBG/CPU reference 对比。
+- 除显式状态检查图外，使用真实 AIV kernel 和 TensorMap 推导依赖覆盖 chain、diamond、
+  multi-root，并以相同 orchestration 在 HBG 上运行作为输出 oracle。
 - M2 出口：单 core DAG 无漏 task、重复 task 或依赖可见性错误。
 
 ### 4.4 M3：多 core 正确性与真机可行性（提交 13～16）

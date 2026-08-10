@@ -441,6 +441,129 @@ TEST(AicoreSidecarV0, RejectsInvalidOrMixedDagTasks) {
     EXPECT_EQ(run_control->classification_error, static_cast<uint64_t>(AicoreRootStatusV0::MIXED_CORE_TYPE));
 }
 
+TEST(AicoreSidecarV0, ProductionWakeProtocolDrainsConcurrentWaitersExactlyOnce) {
+    constexpr int64_t kConsumerCount = 16;
+    constexpr int64_t kTaskCount = kConsumerCount + 1;
+    alignas(64) PTO2TaskDescriptor descriptors[kTaskCount]{};
+    alignas(64) PTO2TaskPayload payloads[kTaskCount]{};
+    for (int64_t task_id = 0; task_id < kTaskCount; ++task_id) {
+        descriptors[task_id].task_id = PTO2TaskId::make(0, task_id);
+        descriptors[task_id].kernel_id[0] = 1;
+        descriptors[task_id].kernel_id[1] = INVALID_KERNEL_ID;
+        descriptors[task_id].kernel_id[2] = INVALID_KERNEL_ID;
+        if (task_id != 0) {
+            payloads[task_id].fanin_count = 1;
+            payloads[task_id].fanin_local_ids[0] = 0;
+        }
+    }
+    AicoreReadonlyGraphV0 graph{
+        reinterpret_cast<uint64_t>(descriptors),
+        reinterpret_cast<uint64_t>(payloads),
+        kTaskCount,
+        31,
+    };
+    AicoreExecutionSidecarLayoutV0 layout{};
+    ASSERT_TRUE(aicore_sidecar_plan_v0(kTaskCount, kTaskCount, 0, &layout));
+    SidecarBuffer storage(layout);
+    auto *run_control = aicore_sidecar_at_v0<AicoreRunControlV0>(storage.base(), layout.run_control_offset);
+    run_control->root_core_type = static_cast<uint64_t>(AicoreRootCoreTypeV0::AIC);
+    AicoreWorkerContextV0 context{};
+    context.task_controls_offset = layout.task_controls_offset;
+    context.aic_queue_offset = layout.aic_queue_offset;
+    context.aiv_queue_offset = layout.aiv_queue_offset;
+
+    std::vector<AicoreRouteResultV0> routes(kConsumerCount, AicoreRouteResultV0::ERROR);
+    std::vector<std::thread> threads;
+    for (int64_t consumer = 1; consumer < kTaskCount; ++consumer) {
+        threads.emplace_back([&, consumer] {
+            routes[consumer - 1] = aicore_classify_and_route_v0(graph, storage.base(), &context, run_control, consumer);
+        });
+    }
+    for (std::thread &thread : threads)
+        thread.join();
+    for (AicoreRouteResultV0 route : routes)
+        EXPECT_EQ(route, AicoreRouteResultV0::WAITING);
+
+    ASSERT_TRUE(aicore_complete_and_wake_v0(graph, storage.base(), &context, run_control, 0));
+    auto *queue = aicore_sidecar_at_v0<AicoreReadyQueueV0>(storage.base(), layout.aic_queue_offset);
+    std::vector<int> seen(kTaskCount, 0);
+    int64_t task_id = AICORE_TASK_ID_INVALID_V0;
+    while (aicore_ready_queue_pop_v0(storage.base(), queue, &task_id))
+        ++seen[task_id];
+
+    EXPECT_EQ(seen[0], 0);
+    for (int64_t consumer = 1; consumer < kTaskCount; ++consumer)
+        EXPECT_EQ(seen[consumer], 1);
+    EXPECT_EQ(run_control->wake_register_count, static_cast<uint64_t>(kConsumerCount));
+    EXPECT_EQ(run_control->wake_reclassify_count, static_cast<uint64_t>(kConsumerCount));
+    EXPECT_EQ(run_control->queue_push_count, static_cast<uint64_t>(kConsumerCount));
+    EXPECT_EQ(run_control->classification_error, 0u);
+}
+
+TEST(AicoreSidecarV0, ProductionWakeProtocolRacesCloseAgainstRegistration) {
+    constexpr int64_t kConsumerCount = 16;
+    constexpr int64_t kTaskCount = kConsumerCount + 1;
+    constexpr int kRounds = 40;
+    for (int round = 0; round < kRounds; ++round) {
+        alignas(64) PTO2TaskDescriptor descriptors[kTaskCount]{};
+        alignas(64) PTO2TaskPayload payloads[kTaskCount]{};
+        for (int64_t task_id = 0; task_id < kTaskCount; ++task_id) {
+            descriptors[task_id].task_id = PTO2TaskId::make(0, task_id);
+            descriptors[task_id].kernel_id[0] = 1;
+            descriptors[task_id].kernel_id[1] = INVALID_KERNEL_ID;
+            descriptors[task_id].kernel_id[2] = INVALID_KERNEL_ID;
+            if (task_id != 0) {
+                payloads[task_id].fanin_count = 1;
+                payloads[task_id].fanin_local_ids[0] = 0;
+            }
+        }
+        AicoreReadonlyGraphV0 graph{
+            reinterpret_cast<uint64_t>(descriptors),
+            reinterpret_cast<uint64_t>(payloads),
+            kTaskCount,
+            31,
+        };
+        AicoreExecutionSidecarLayoutV0 layout{};
+        ASSERT_TRUE(aicore_sidecar_plan_v0(kTaskCount, kTaskCount, 0, &layout));
+        SidecarBuffer storage(layout);
+        auto *run_control = aicore_sidecar_at_v0<AicoreRunControlV0>(storage.base(), layout.run_control_offset);
+        run_control->root_core_type = static_cast<uint64_t>(AicoreRootCoreTypeV0::AIC);
+        AicoreWorkerContextV0 context{};
+        context.task_controls_offset = layout.task_controls_offset;
+        context.aic_queue_offset = layout.aic_queue_offset;
+        context.aiv_queue_offset = layout.aiv_queue_offset;
+
+        bool completion_ok = false;
+        std::vector<AicoreRouteResultV0> routes(kConsumerCount, AicoreRouteResultV0::ERROR);
+        std::vector<std::thread> threads;
+        threads.emplace_back([&] {
+            completion_ok = aicore_complete_and_wake_v0(graph, storage.base(), &context, run_control, 0);
+        });
+        for (int64_t consumer = 1; consumer < kTaskCount; ++consumer) {
+            threads.emplace_back([&, consumer] {
+                if ((round & 1) != 0) std::this_thread::yield();
+                routes[consumer - 1] =
+                    aicore_classify_and_route_v0(graph, storage.base(), &context, run_control, consumer);
+            });
+        }
+        for (std::thread &thread : threads)
+            thread.join();
+
+        ASSERT_TRUE(completion_ok) << "round " << round;
+        for (AicoreRouteResultV0 route : routes)
+            ASSERT_NE(route, AicoreRouteResultV0::ERROR) << "round " << round;
+        auto *queue = aicore_sidecar_at_v0<AicoreReadyQueueV0>(storage.base(), layout.aic_queue_offset);
+        std::vector<int> seen(kTaskCount, 0);
+        int64_t task_id = AICORE_TASK_ID_INVALID_V0;
+        while (aicore_ready_queue_pop_v0(storage.base(), queue, &task_id))
+            ++seen[task_id];
+        for (int64_t consumer = 1; consumer < kTaskCount; ++consumer)
+            ASSERT_EQ(seen[consumer], 1) << "round " << round << " consumer " << consumer;
+        ASSERT_EQ(run_control->queue_push_count, static_cast<uint64_t>(kConsumerCount)) << "round " << round;
+        ASSERT_EQ(run_control->classification_error, 0u) << "round " << round;
+    }
+}
+
 TEST(AicoreDependencyModelV0, RegisterBeforeCloseWakesEveryWaiterExactlyOnce) {
     AicoreDependencyModelV0 model({{}, {0}, {0}});
     ASSERT_TRUE(model.classify_all());
@@ -518,6 +641,38 @@ TEST(AicoreDependencyModelV0, FixedSeedRandomDagCompletesExactlyOnce) {
     EXPECT_EQ(model.ready_count(), 0u);
     for (int count : seen)
         EXPECT_EQ(count, 1);
+}
+
+TEST(AicoreDependencyModelV0, LongFaninWaitsForEveryProducer) {
+    constexpr int64_t kProducerCount = 32;
+    constexpr int64_t kConsumer = kProducerCount;
+    std::vector<std::vector<int64_t>> fanins(kProducerCount + 1);
+    for (int64_t producer = 0; producer < kProducerCount; ++producer)
+        fanins[kConsumer].push_back(producer);
+
+    AicoreDependencyModelV0 model(std::move(fanins));
+    ASSERT_TRUE(model.classify_all());
+    EXPECT_EQ(model.ready_count(), static_cast<size_t>(kProducerCount));
+    EXPECT_EQ(model.state(kConsumer), AicoreModelTaskStateV0::WAITING);
+
+    for (int64_t producer = 0; producer < kProducerCount; ++producer) {
+        int64_t task_id = -1;
+        ASSERT_TRUE(model.pop_ready(&task_id));
+        ASSERT_EQ(task_id, producer);
+        ASSERT_TRUE(model.complete(task_id));
+        ASSERT_TRUE(model.validate_invariants());
+        EXPECT_EQ(
+            model.state(kConsumer),
+            producer + 1 == kProducerCount ? AicoreModelTaskStateV0::READY : AicoreModelTaskStateV0::WAITING
+        );
+    }
+
+    int64_t task_id = -1;
+    ASSERT_TRUE(model.pop_ready(&task_id));
+    ASSERT_EQ(task_id, kConsumer);
+    ASSERT_TRUE(model.complete(task_id));
+    EXPECT_EQ(model.completed_count(), static_cast<size_t>(kProducerCount + 1));
+    EXPECT_TRUE(model.validate_invariants());
 }
 
 }  // namespace
