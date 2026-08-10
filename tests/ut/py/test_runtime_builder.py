@@ -14,6 +14,45 @@ from unittest.mock import patch
 
 import pytest
 
+
+class TestOrchestrationToolchainSelection:
+    """The orchestration toolchain is selected by runtime name."""
+
+    @pytest.mark.parametrize(
+        ("variant", "runtime_name", "expected_toolchain"),
+        [
+            ("", "host_build_graph", "host"),
+            ("sim", "host_build_graph", "host"),
+            ("", "host_build_graph_aicore", "host"),
+            ("sim", "host_build_graph_aicore", "host"),
+            ("", "tensormap_and_ringbuffer", "aicpu"),
+            ("sim", "tensormap_and_ringbuffer", "host"),
+        ],
+    )
+    def test_selects_toolchain_by_runtime_name(self, variant, runtime_name, expected_toolchain):
+        from simpler_setup.kernel_compiler import KernelCompiler  # noqa: PLC0415
+
+        compiler = KernelCompiler.__new__(KernelCompiler)
+        compiler.platform = f"a5{variant}"
+        compiler.host_gxx = object()
+        compiler.aarch64 = object() if not variant else None
+
+        selected = compiler._orchestration_toolchain(runtime_name)
+        expected = compiler.host_gxx if expected_toolchain == "host" else compiler.aarch64
+        assert selected is expected
+
+    def test_rejects_unknown_runtime(self):
+        from simpler_setup.kernel_compiler import KernelCompiler  # noqa: PLC0415
+
+        compiler = KernelCompiler.__new__(KernelCompiler)
+        compiler.platform = "a5sim"
+        compiler.host_gxx = object()
+        compiler.aarch64 = None
+
+        with pytest.raises(ValueError, match="Unknown runtime_name"):
+            compiler._orchestration_toolchain("does_not_exist")
+
+
 # --- Discovery tests (no compilation needed) ---
 
 
