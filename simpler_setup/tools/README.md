@@ -14,6 +14,24 @@ no repo checkout required.
 - **[sched_overhead_analysis](#sched_overhead_analysis)** — scheduler overhead / Tail OH breakdown
 - **[critical_path](#critical_path)** — chip swimlane critical-path compute/stall analysis
 - **[strace_timing](#strace_timing)** — per-stage `simpler_run` breakdown (host + AICPU phases) from `[STRACE]` log markers → TPOT table, per-round table (`--rounds-table`), nested tree (`--tree`), or Perfetto JSON
+- **hbg_aicore_m3_compare** — sample-preserving HBG vs HBG-AICore p50/p95/p99 comparison with a >2% review flag
+
+### HBG-AICore M3 comparison
+
+Capture same-device HBG and HBG-AICore runs as separate logs, then compare
+them without dropping outliers:
+
+```bash
+python -m simpler_setup.tools.hbg_aicore_m3_compare \
+  --hbg-log outputs/hbg.log \
+  --hbg-aicore-log outputs/hbg_aicore.log \
+  --json-out outputs/hbg_aicore_m3.json
+```
+
+The Markdown table uses p50 for the change percentage and reports p95/p99 for
+tail review. The JSON artifact contains every parsed sample and marks p50
+regressions above 2%; this is a review signal, not an automatic pass/fail gate.
+
 - **[dump_viewer](#dump_viewer)** — inspect / export args dumps (see [docs/args-dump.md](../../docs/dfx/args-dump.md) for full workflow)
 - **[deps_viewer](#deps_viewer)** — `deps.json` (dep_gen) → text or pan/zoom HTML dependency graph
 

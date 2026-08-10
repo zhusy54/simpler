@@ -15,6 +15,46 @@
 
 #include "aicore_execution_sidecar_v0.h"
 
+inline __aicore__ void aicore_publish_cache_line_v0(__gm__ void *address) {
+#if defined(__CCE_AICORE__)
+    dcci(address, SINGLE_CACHE_LINE, CACHELINE_OUT);
+    dsb((mem_dsb_t)0);
+#else
+    (void)address;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
+}
+
+inline __aicore__ void aicore_observe_cache_line_v0(__gm__ void *address) {
+#if defined(__CCE_AICORE__)
+    dcci(address, SINGLE_CACHE_LINE);
+    dsb((mem_dsb_t)0);
+#else
+    (void)address;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
+}
+
+inline __aicore__ void aicore_publish_data_cache_v0(__gm__ void *address) {
+#if defined(__CCE_AICORE__)
+    dcci(address, ENTIRE_DATA_CACHE, CACHELINE_OUT);
+    dsb((mem_dsb_t)0);
+#else
+    (void)address;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
+}
+
+inline __aicore__ void aicore_observe_data_cache_v0(__gm__ void *address) {
+#if defined(__CCE_AICORE__)
+    dcci(address, ENTIRE_DATA_CACHE);
+    dsb((mem_dsb_t)0);
+#else
+    (void)address;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
+}
+
 // These wrappers are a runtime-local subset of simpler-dist FDWIC's validated
 // A5 raw-GM atomic protocol. They intentionally expose the observed old value
 // returned by the hardware instead of emulating std::atomic's API.
@@ -113,21 +153,10 @@ inline __aicore__ uint64_t aicore_gm_compare_exchange_v0(
 
 inline __aicore__ void aicore_publish_next_waiter_v0(__gm__ AicoreTaskControlV0 *control, int64_t next_waiter) {
     control->next_waiter = next_waiter;
-#if defined(__CCE_AICORE__)
-    OUT_OF_ORDER_STORE_BARRIER();
-    dcci(&control->next_waiter, SINGLE_CACHE_LINE, CACHELINE_OUT);
-    OUT_OF_ORDER_STORE_BARRIER();
-#else
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-#endif
+    aicore_publish_cache_line_v0(&control->next_waiter);
 }
 
 inline __aicore__ int64_t aicore_observe_next_waiter_v0(__gm__ AicoreTaskControlV0 *control) {
-#if defined(__CCE_AICORE__)
-    dcci(&control->next_waiter, SINGLE_CACHE_LINE);
-    OUT_OF_ORDER_STORE_BARRIER();
-#else
-    __atomic_thread_fence(__ATOMIC_ACQUIRE);
-#endif
+    aicore_observe_cache_line_v0(&control->next_waiter);
     return control->next_waiter;
 }

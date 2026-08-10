@@ -209,9 +209,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     }
     int32_t run_rc = 0;
 
-    // The supervisor selects one compatible worker only after the handshake has
-    // discovered the actual topology. AICore owns graph classification, ReadyQ
-    // publication, task pickup, execution, and completion publication.
+    // The supervisor discovers topology and publishes the per-run resolver set.
+    // AICore owns graph classification, ReadyQ/CompletionQ processing, task
+    // execution, and completion propagation.
     if (runtime->aicore_sidecar_base == nullptr || runtime->host_total_tasks < 0) {
         LOG_ERROR("HBG-AICore v0 requires an initialized graph");
         run_rc = -1;
@@ -225,35 +225,76 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         );
         while (true) {
             cache_invalidate_range(run_control, sizeof(*run_control));
-            if (run_control->attached_count == static_cast<uint64_t>(runtime->worker_count) &&
-                run_control->classified_count == static_cast<uint64_t>(runtime->worker_count)) {
+            if (run_control->attached_count == static_cast<uint64_t>(runtime->worker_count)) {
                 break;
             }
             SPIN_WAIT_HINT();
         }
 
-        if (run_control->classification_error != 0) {
+        cache_invalidate_range(contexts, static_cast<size_t>(runtime->worker_count) * sizeof(*contexts));
+        int32_t aic_count = 0;
+        int32_t aiv_count = 0;
+        for (int32_t i = 0; i < runtime->worker_count; ++i) {
+            if (static_cast<CoreType>(contexts[i].core_type) == CoreType::AIC) {
+                contexts[i].type_rank = aic_count++;
+                contexts[i].active = runtime->aicore_sidecar_layout.aic_task_count != 0 ? 1 : 0;
+            } else {
+                contexts[i].type_rank = aiv_count++;
+                contexts[i].active = runtime->aicore_sidecar_layout.aiv_task_count != 0 ? 1 : 0;
+            }
+            contexts[i].resolver_active = 0;
+            contexts[i].classifier_rank = -1;
+        }
+
+        auto resolve_limit = [&](int32_t requested, int32_t available) {
+            if (requested < 0 || available == 0 || run_control->expected_task_count == 0) return 0;
+            uint64_t capped_tasks = run_control->expected_task_count;
+            if (capped_tasks > static_cast<uint64_t>(available)) capped_tasks = static_cast<uint64_t>(available);
+            int32_t automatic = static_cast<int32_t>(capped_tasks);
+            if (requested == 0) return automatic;
+            return requested < automatic ? requested : automatic;
+        };
+        int32_t aic_resolvers = resolve_limit(runtime->aic_dependency_scheduler_limit, aic_count);
+        int32_t aiv_resolvers = resolve_limit(runtime->aiv_dependency_scheduler_limit, aiv_count);
+        int32_t resolver_count = aic_resolvers + aiv_resolvers;
+        int32_t classifier_rank = 0;
+        for (int32_t i = 0; i < runtime->worker_count; ++i) {
+            bool selected = (static_cast<CoreType>(contexts[i].core_type) == CoreType::AIC) ?
+                                contexts[i].type_rank < aic_resolvers :
+                                contexts[i].type_rank < aiv_resolvers;
+            if (selected) {
+                contexts[i].resolver_active = 1;
+                contexts[i].classifier_rank = classifier_rank++;
+            }
+        }
+        run_control->resolver_count = static_cast<uint64_t>(resolver_count);
+        run_control->aic_resolver_count = static_cast<uint64_t>(aic_resolvers);
+        run_control->aiv_resolver_count = static_cast<uint64_t>(aiv_resolvers);
+        cache_flush_range(contexts, static_cast<size_t>(runtime->worker_count) * sizeof(*contexts));
+
+        if (run_control->expected_task_count != 0 &&
+            ((runtime->aicore_sidecar_layout.aic_task_count != 0 && aic_count == 0) ||
+             (runtime->aicore_sidecar_layout.aiv_task_count != 0 && aiv_count == 0) || resolver_count == 0)) {
             LOG_ERROR(
-                "HBG-AICore: graph classification failed at task=%" PRIu64 " status=%" PRIu64,
-                run_control->error_task_id, run_control->classification_error
+                "HBG-AICore: topology cannot execute graph (tasks AIC=%" PRIu64 " AIV=%" PRIu64
+                ", cores AIC=%d AIV=%d, resolvers=%d)",
+                runtime->aicore_sidecar_layout.aic_task_count, runtime->aicore_sidecar_layout.aiv_task_count, aic_count,
+                aiv_count, resolver_count
             );
             run_rc = -1;
         } else if (run_control->expected_task_count != 0) {
-            cache_invalidate_range(contexts, static_cast<size_t>(runtime->worker_count) * sizeof(*contexts));
-            int32_t active_worker = -1;
-            for (int32_t i = 0; i < runtime->worker_count; ++i) {
-                if (static_cast<uint64_t>(contexts[i].core_type) == run_control->root_core_type) {
-                    active_worker = i;
+            run_control->startup_phase = static_cast<uint64_t>(AicoreRunPhaseV0::CLASSIFY);
+            cache_flush_range(run_control, sizeof(*run_control));
+            while (true) {
+                cache_invalidate_range(run_control, sizeof(*run_control));
+                if (run_control->classified_count == run_control->resolver_count ||
+                    run_control->classification_error != 0) {
                     break;
                 }
+                SPIN_WAIT_HINT();
             }
-            if (active_worker < 0) {
-                LOG_ERROR("HBG-AICore: no worker matches graph core type=%" PRIu64, run_control->root_core_type);
-                run_rc = -1;
-            } else {
-                contexts[active_worker].active = 1;
-                cache_flush_range(&contexts[active_worker], sizeof(contexts[active_worker]));
-                run_control->startup_count = 1;
+            if (run_control->classification_error == 0) {
+                run_control->startup_phase = static_cast<uint64_t>(AicoreRunPhaseV0::RUN);
                 cache_flush_range(run_control, sizeof(*run_control));
                 while (true) {
                     cache_invalidate_range(run_control, sizeof(*run_control));
@@ -263,41 +304,31 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                     }
                     SPIN_WAIT_HINT();
                 }
-                if (run_control->classification_error != 0) {
-                    LOG_ERROR(
-                        "HBG-AICore: graph execution failed at task=%" PRIu64 " status=%" PRIu64,
-                        run_control->error_task_id, run_control->classification_error
-                    );
-                    run_rc = -1;
-                }
+            }
+            if (run_control->classification_error != 0) {
+                LOG_ERROR(
+                    "HBG-AICore: graph execution failed at task=%" PRIu64 " status=%" PRIu64,
+                    run_control->error_task_id, run_control->classification_error
+                );
+                run_rc = -1;
             }
         }
 
         run_control->exit_requested = 1;
+        run_control->startup_phase = static_cast<uint64_t>(AicoreRunPhaseV0::EXIT);
         cache_flush_range(run_control, sizeof(*run_control));
         while (true) {
             cache_invalidate_range(run_control, sizeof(*run_control));
             if (run_control->finished_count == static_cast<uint64_t>(runtime->worker_count)) break;
             SPIN_WAIT_HINT();
         }
-        if (run_rc == 0 && (run_control->completed_count != run_control->expected_task_count ||
-                            run_control->queue_push_count != run_control->expected_task_count ||
-                            run_control->queue_pop_count != run_control->expected_task_count ||
-                            run_control->executed_count != run_control->expected_task_count)) {
+        if (run_rc == 0 && run_control->completed_count != run_control->expected_task_count) {
             LOG_ERROR(
-                "HBG-AICore: v0 count mismatch expected=%" PRIu64 " completed=%" PRIu64 " push=%" PRIu64 " pop=%" PRIu64
-                " executed=%" PRIu64,
-                run_control->expected_task_count, run_control->completed_count, run_control->queue_push_count,
-                run_control->queue_pop_count, run_control->executed_count
+                "HBG-AICore: v0 count mismatch expected=%" PRIu64 " completed=%" PRIu64,
+                run_control->expected_task_count, run_control->completed_count
             );
             run_rc = -1;
         }
-        LOG_INFO(
-            "HBG-AICore TIMING: classify=%" PRIu64 " ready_to_start=%" PRIu64 " payload=%" PRIu64 " kernel=%" PRIu64
-            " completion=%" PRIu64 " wake=%" PRIu64 " cycles",
-            run_control->classify_cycles, run_control->ready_to_start_cycles, run_control->payload_cycles,
-            run_control->kernel_cycles, run_control->completion_cycles, run_control->wake_cycles
-        );
         runtime_init_ready_.store(true, std::memory_order_release);
     } else {
         while (!runtime_init_ready_.load(std::memory_order_acquire))

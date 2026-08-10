@@ -55,6 +55,19 @@ TMR_EXAMPLE_ORDER=(
     qwen3_14b_decode
 )
 
+# --- host_build_graph_aicore and its frozen HBG oracle ---
+declare -A HBG_AICORE_EXAMPLE_CASES=(
+    [multi_core_dag]="mixed_chain_64,mixed_fanin32_1024,mixed_random_1024,mixed_multi_root_64,mixed_multi_root_1024,mixed_multi_root_4096"
+    [real_dataflow_dag]="real_chain,real_diamond,real_multi_root"
+)
+HBG_AICORE_EXAMPLE_ORDER=(multi_core_dag real_dataflow_dag)
+
+declare -A HBG_ORACLE_EXAMPLE_CASES=(
+    [multi_core_dag]="oracle_mixed_chain_64,oracle_mixed_fanin32_1024,oracle_mixed_random_1024,oracle_mixed_multi_root_64,oracle_mixed_multi_root_1024,oracle_mixed_multi_root_4096"
+    [real_dataflow_dag]="oracle_real_chain,oracle_real_diamond,oracle_real_multi_root"
+)
+HBG_ORACLE_EXAMPLE_ORDER=(multi_core_dag real_dataflow_dag)
+
 # ---------------------------------------------------------------------------
 # Parse arguments
 # ---------------------------------------------------------------------------
@@ -64,6 +77,7 @@ PLATFORM=a2a3
 RUNTIME=tensormap_and_ringbuffer
 VERBOSE=0
 SERIAL_ORCH_SCHED=0
+RAW_LOG_DIR=""
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -92,6 +106,10 @@ while [[ $# -gt 0 ]]; do
             SERIAL_ORCH_SCHED=1
             shift
             ;;
+        --raw-log-dir)
+            RAW_LOG_DIR="$2"
+            shift 2
+            ;;
         --help|-h)
             cat <<'USAGE'
 benchmark_rounds.sh — run all examples and report per-round timing from [STRACE] markers
@@ -103,11 +121,13 @@ Options:
   -p, --platform Platform to run on (default: a2a3)
   -d, --device   Device ID (default: 0)
   -n, --rounds   Override number of rounds for each example (default: 100)
-  -r, --runtime  Runtime to benchmark: tensormap_and_ringbuffer (default)
+  -r, --runtime  Runtime to benchmark: tensormap_and_ringbuffer,
+                 host_build_graph, or host_build_graph_aicore (default: TMR)
   -v, --verbose  Save detailed test_*.py output to a timestamped log file
   --serial-orch-sched
                  Run each case twice: default parallel mode, then serial
                  orch->sched mode with PTO2_SERIAL_ORCH_SCHED=1.
+  --raw-log-dir  Preserve one complete [STRACE] log per runtime/example/case.
   -h, --help     Show this help
 
 All other options are passed through to the underlying `python test_*.py`
@@ -155,6 +175,15 @@ EXAMPLES_DIRS=(
     "$PROJECT_ROOT/examples/${ARCH}/${RUNTIME}"
 )
 
+# HBG oracle scenes live beside HBG-AICore so both runtimes compile
+# exactly the same graph and kernels.
+if [[ "$RUNTIME" == "host_build_graph" ]]; then
+    EXAMPLES_DIRS=(
+        "$PROJECT_ROOT/tests/st/${ARCH}/host_build_graph_aicore"
+        "$PROJECT_ROOT/examples/${ARCH}/host_build_graph"
+    )
+fi
+
 # Validate platform (a2a3 / a5; the "sim" suffix was already stripped into ARCH).
 case "$PLATFORM" in
     a2a3|a2a3sim|a5|a5sim) ;;
@@ -167,8 +196,16 @@ case "$RUNTIME" in
         declare -n EXAMPLE_CASES=TMR_EXAMPLE_CASES
         EXAMPLE_ORDER=("${TMR_EXAMPLE_ORDER[@]}")
         ;;
+    host_build_graph_aicore)
+        declare -n EXAMPLE_CASES=HBG_AICORE_EXAMPLE_CASES
+        EXAMPLE_ORDER=("${HBG_AICORE_EXAMPLE_ORDER[@]}")
+        ;;
+    host_build_graph)
+        declare -n EXAMPLE_CASES=HBG_ORACLE_EXAMPLE_CASES
+        EXAMPLE_ORDER=("${HBG_ORACLE_EXAMPLE_ORDER[@]}")
+        ;;
     *)
-        echo "ERROR: unknown runtime '$RUNTIME'. Use tensormap_and_ringbuffer."
+        echo "ERROR: unknown runtime '$RUNTIME'. Use tensormap_and_ringbuffer, host_build_graph, or host_build_graph_aicore."
         exit 1
         ;;
 esac
@@ -228,7 +265,7 @@ run_bench() {
     if [[ -n "$test_file" ]]; then
         run_cmd=(
             python3 "$test_file"
-            --platform "$PLATFORM" --device "$DEVICE_ID"
+            --platform "$PLATFORM" --device "$DEVICE_ID" --runtime "$RUNTIME"
             --rounds "$ROUNDS" --skip-golden
         )
     else
@@ -252,6 +289,12 @@ run_bench() {
     fi
     if [[ -n "$VERBOSE_LOG" && -s "$fw_stdout_file" ]]; then
         cat "$fw_stdout_file" >> "$VERBOSE_LOG"
+    fi
+    if [[ -n "$RAW_LOG_DIR" ]]; then
+        local safe_case="${case_name:-default}"
+        safe_case="${safe_case//[^a-zA-Z0-9_.-]/_}"
+        mkdir -p "$RAW_LOG_DIR"
+        cp "$fw_stdout_file" "$RAW_LOG_DIR/${RUNTIME}_${example}_${safe_case}_${mode}.log"
     fi
     if [[ $rc -ne 0 ]]; then
         echo "  FAILED: benchmark run returned non-zero"

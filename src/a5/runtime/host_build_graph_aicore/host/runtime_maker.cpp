@@ -349,6 +349,7 @@ bool create_orch_so_tempfile(const uint8_t *data, size_t size, std::string *out_
 // The orchestration .so exports these (PTO2 submit_task form).
 typedef void (*OrchestrationEntryFunc)(const ChipTaskArgs &);
 typedef void (*OrchestrationBindFunc)(PTO2Runtime *);
+typedef PTO2OrchestrationConfig (*OrchestrationConfigFunc)(const ChipTaskArgs &);
 
 // Resolved orchestration .so entry points. register_callable_impl allocates one
 // of these (the entry, plus the .so's own framework_bind_runtime, which sets
@@ -358,6 +359,7 @@ typedef void (*OrchestrationBindFunc)(PTO2Runtime *);
 struct HostOrchEntryPoints {
     OrchestrationEntryFunc entry{nullptr};
     OrchestrationBindFunc bind{nullptr};
+    OrchestrationConfigFunc config{nullptr};
 };
 
 // Run the orchestrator on the host. `rt` was built with its scheduler half
@@ -476,7 +478,6 @@ bool create_aicore_sidecar_v0(
         static_cast<uint64_t>(total_tasks),
         task_window_size - 1,
     };
-    AicoreRootCoreTypeV0 graph_core_type = AicoreRootCoreTypeV0::NONE;
     uint64_t aic_task_count = 0;
     uint64_t aiv_task_count = 0;
     for (int64_t task_id = 0; task_id < total_tasks; ++task_id) {
@@ -488,13 +489,6 @@ bool create_aicore_sidecar_v0(
             );
             return false;
         }
-        if (graph_core_type == AicoreRootCoreTypeV0::NONE) {
-            graph_core_type = task.core_type;
-        } else if (graph_core_type != task.core_type) {
-            LOG_ERROR("HBG-AICore: M2 requires a homogeneous AIC-only or AIV-only graph");
-            return false;
-        }
-
         PTO2TaskSlotState &slot = host_sm_handle.header->ring.get_slot_state_by_task_id(task_id);
         uint8_t expected_mask = static_cast<uint8_t>(1u << task.subtask_slot);
         if (slot.active_mask.raw() != expected_mask || slot.logical_block_num != 1 ||
@@ -517,6 +511,12 @@ bool create_aicore_sidecar_v0(
         } else {
             ++aiv_task_count;
         }
+    }
+
+    if (total_tasks != 0 && runtime->aic_dependency_scheduler_limit == -1 &&
+        runtime->aiv_dependency_scheduler_limit == -1) {
+        LOG_ERROR("HBG-AICore: a non-empty graph requires at least one dependency resolver type");
+        return false;
     }
 
     AicoreExecutionSidecarLayoutV0 layout{};
@@ -551,7 +551,6 @@ bool create_aicore_sidecar_v0(
     const uint64_t device_sm_address = reinterpret_cast<uint64_t>(runtime->get_gm_sm_ptr());
     auto *run_control = aicore_sidecar_at_v0<AicoreRunControlV0>(host_base, layout.run_control_offset);
     run_control->expected_task_count = static_cast<uint64_t>(total_tasks);
-    run_control->root_core_type = static_cast<uint64_t>(graph_core_type);
     run_control->error_task_id = UINT64_MAX;
 
     auto *contexts = aicore_sidecar_at_v0<AicoreWorkerContextV0>(host_base, layout.worker_contexts_offset);
@@ -567,6 +566,7 @@ bool create_aicore_sidecar_v0(
         context.task_controls_offset = layout.task_controls_offset;
         context.aic_queue_offset = layout.aic_queue_offset;
         context.aiv_queue_offset = layout.aiv_queue_offset;
+        context.completion_queue_offset = layout.completion_queue_offset;
         context.graph_descriptors_address = device_sm_address + device_segments.descriptors;
         context.graph_payloads_address = device_sm_address + device_segments.payloads;
         context.sidecar_base_address = aligned_address;
@@ -651,6 +651,22 @@ int32_t run_host_orchestration(
         LOG_ERROR("host-orch: orch .so framework_bind_runtime was not resolved");
         return -1;
     }
+
+    if (eps->config == nullptr) {
+        LOG_ERROR("host-orch: orch .so aicpu_orchestration_config was not resolved");
+        return -1;
+    }
+    const PTO2OrchestrationConfig orch_config = eps->config(orch_l2);
+    if (orch_config.aic_dependency_scheduler_limit < -1 || orch_config.aiv_dependency_scheduler_limit < -1) {
+        LOG_ERROR(
+            "HBG-AICore: dependency scheduler limits must be -1, 0, or positive (AIC=%d AIV=%d)",
+            orch_config.aic_dependency_scheduler_limit, orch_config.aiv_dependency_scheduler_limit
+        );
+        return -1;
+    }
+    runtime->set_dependency_scheduler_limits(
+        orch_config.aic_dependency_scheduler_limit, orch_config.aiv_dependency_scheduler_limit
+    );
 
     rt_scope_begin(rt);
     eps->entry(orch_l2);
@@ -777,11 +793,18 @@ extern "C" int register_callable_impl(const ChipCallable *callable, const HostAp
             dlclose(handle);
             return -1;
         }
+        void *config_sym = dlsym(handle, "aicpu_orchestration_config");
+        if (config_sym == nullptr) {
+            LOG_ERROR("host-orch: orch .so does not export aicpu_orchestration_config: %s", dlerror());
+            dlclose(handle);
+            return -1;
+        }
         // Safe to unlink now: the handle keeps the .so mapped regardless of path.
         unlink(so_path.c_str());
         auto *eps = new HostOrchEntryPoints{};
         eps->entry = reinterpret_cast<OrchestrationEntryFunc>(entry);
         eps->bind = reinterpret_cast<OrchestrationBindFunc>(bind_sym);
+        eps->config = reinterpret_cast<OrchestrationConfigFunc>(config_sym);
         out->host_dlopen_handle = handle;
         out->host_orch_func_ptr = eps;
         LOG_INFO("host-orch: loaded orchestration entry '%s' on host", orch_func_name);
@@ -1116,12 +1139,58 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
                 host_sidecar, runtime->aicore_sidecar_layout.task_controls_offset
             );
             uint64_t active_workers = 0;
+            uint64_t resolver_workers = 0;
+            uint64_t expected_active = 0;
             uint64_t worker_executed = 0;
-            for (int32_t i = 0; i < runtime->worker_count; ++i)
+            uint64_t worker_resolved = 0;
+            uint64_t ready_push = 0;
+            uint64_t ready_pop = 0;
+            uint64_t completion_push = 0;
+            uint64_t completion_pop = 0;
+            uint64_t initial_ready = 0;
+            uint64_t initial_waiting = 0;
+            uint64_t fanin_scans = 0;
+            uint64_t fanin_edges = 0;
+            uint64_t wake_registers = 0;
+            uint64_t wake_closes = 0;
+            uint64_t wake_reclassifies = 0;
+            uint64_t wake_closed_retries = 0;
+            uint64_t classify_cycles = 0;
+            uint64_t ready_to_start_cycles = 0;
+            uint64_t payload_cycles = 0;
+            uint64_t kernel_cycles = 0;
+            uint64_t completion_cycles = 0;
+            uint64_t wake_cycles = 0;
+            for (int32_t i = 0; i < runtime->worker_count; ++i) {
+                bool type_has_tasks = static_cast<CoreType>(contexts[i].core_type) == CoreType::AIC ?
+                                          runtime->aicore_sidecar_layout.aic_task_count != 0 :
+                                          runtime->aicore_sidecar_layout.aiv_task_count != 0;
+                if (type_has_tasks) ++expected_active;
                 if (contexts[i].active != 0) {
                     ++active_workers;
-                    worker_executed += contexts[i].executed_task_count;
                 }
+                if (contexts[i].resolver_active != 0) ++resolver_workers;
+                worker_executed += contexts[i].executed_task_count;
+                worker_resolved += contexts[i].resolved_task_count;
+                ready_push += contexts[i].ready_push_count;
+                ready_pop += contexts[i].ready_pop_count;
+                completion_push += contexts[i].completion_push_count;
+                completion_pop += contexts[i].completion_pop_count;
+                initial_ready += contexts[i].initial_ready_count;
+                initial_waiting += contexts[i].initial_waiting_count;
+                fanin_scans += contexts[i].fanin_scan_count;
+                fanin_edges += contexts[i].fanin_edge_count;
+                wake_registers += contexts[i].wake_register_count;
+                wake_closes += contexts[i].wake_close_count;
+                wake_reclassifies += contexts[i].wake_reclassify_count;
+                wake_closed_retries += contexts[i].wake_closed_retry_count;
+                classify_cycles += contexts[i].classify_cycles;
+                ready_to_start_cycles += contexts[i].ready_to_start_cycles;
+                payload_cycles += contexts[i].payload_cycles;
+                kernel_cycles += contexts[i].kernel_cycles;
+                completion_cycles += contexts[i].completion_cycles;
+                wake_cycles += contexts[i].wake_cycles;
+            }
             bool task_controls_valid = true;
             for (int32_t task_id = 0; task_id < runtime->host_total_tasks; ++task_id) {
                 if (task_controls[task_id].completion != 1 ||
@@ -1134,42 +1203,41 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
                     break;
                 }
             }
-            uint64_t expected_active = runtime->host_total_tasks == 0 ? 0 : 1;
             if (control->classification_error != 0 ||
                 control->expected_task_count != static_cast<uint64_t>(runtime->host_total_tasks) ||
                 control->completed_count != control->expected_task_count ||
-                control->queue_push_count != control->expected_task_count ||
-                control->queue_pop_count != control->expected_task_count ||
-                control->executed_count != control->expected_task_count ||
-                control->initial_ready_count + control->initial_waiting_count != control->expected_task_count ||
-                control->wake_close_count != control->expected_task_count ||
+                ready_push != control->expected_task_count || ready_pop != control->expected_task_count ||
+                completion_push != control->expected_task_count || completion_pop != control->expected_task_count ||
+                initial_ready + initial_waiting != control->expected_task_count ||
+                wake_closes != control->expected_task_count || worker_resolved != control->expected_task_count ||
                 worker_executed != control->expected_task_count || active_workers != expected_active ||
+                resolver_workers != control->resolver_count || control->classified_count != control->resolver_count ||
                 control->finished_count != static_cast<uint64_t>(runtime->worker_count) || !task_controls_valid) {
                 LOG_ERROR(
                     "HBG-AICore: invalid v0 final state expected=%" PRIu64 " completed=%" PRIu64 " push=%" PRIu64
-                    " pop=%" PRIu64 " executed=%" PRIu64 " active=%" PRIu64 " worker_executed=%" PRIu64
-                    " finished=%" PRIu64 " error=%" PRIu64,
-                    control->expected_task_count, control->completed_count, control->queue_push_count,
-                    control->queue_pop_count, control->executed_count, active_workers, worker_executed,
+                    " pop=%" PRIu64 " completion_push=%" PRIu64 " completion_pop=%" PRIu64 " executed=%" PRIu64
+                    " resolved=%" PRIu64 " active=%" PRIu64 " resolvers=%" PRIu64 " finished=%" PRIu64
+                    " error=%" PRIu64,
+                    control->expected_task_count, control->completed_count, ready_push, ready_pop, completion_push,
+                    completion_pop, worker_executed, worker_resolved, active_workers, resolver_workers,
                     control->finished_count, control->classification_error
                 );
                 rc = -1;
             } else if (control->expected_task_count != 0) {
-                uint64_t aicore_total_cycles = control->ready_to_start_cycles + control->payload_cycles +
-                                               control->kernel_cycles + control->completion_cycles;
+                uint64_t aicore_total_cycles =
+                    ready_to_start_cycles + payload_cycles + kernel_cycles + completion_cycles + wake_cycles;
                 LOG_INFO(
-                    "HBG-AICore HOST TIMING: ready_to_start=%" PRIu64 " payload=%" PRIu64 " kernel=%" PRIu64
-                    " completion=%" PRIu64 " total=%" PRIu64 " cycles",
-                    control->ready_to_start_cycles, control->payload_cycles, control->kernel_cycles,
-                    control->completion_cycles, aicore_total_cycles
+                    "HBG-AICore HOST TIMING: classify=%" PRIu64 " ready_to_start=%" PRIu64 " payload=%" PRIu64
+                    " kernel=%" PRIu64 " completion=%" PRIu64 " wake=%" PRIu64 " total=%" PRIu64 " cycles",
+                    classify_cycles, ready_to_start_cycles, payload_cycles, kernel_cycles, completion_cycles,
+                    wake_cycles, aicore_total_cycles
                 );
                 LOG_INFO(
-                    "HBG-AICore M2 COUNTERS: initial_ready=%" PRIu64 " initial_waiting=%" PRIu64 " fanin_scans=%" PRIu64
-                    " fanin_edges=%" PRIu64 " registers=%" PRIu64 " closes=%" PRIu64 " reclassifies=%" PRIu64
-                    " closed_retries=%" PRIu64,
-                    control->initial_ready_count, control->initial_waiting_count, control->fanin_scan_count,
-                    control->fanin_edge_count, control->wake_register_count, control->wake_close_count,
-                    control->wake_reclassify_count, control->wake_closed_retry_count
+                    "HBG-AICore DEPENDENCY COUNTERS: initial_ready=%" PRIu64 " initial_waiting=%" PRIu64
+                    " fanin_scans=%" PRIu64 " fanin_edges=%" PRIu64 " registers=%" PRIu64 " closes=%" PRIu64
+                    " reclassifies=%" PRIu64 " closed_retries=%" PRIu64 " resolvers=%" PRIu64,
+                    initial_ready, initial_waiting, fanin_scans, fanin_edges, wake_registers, wake_closes,
+                    wake_reclassifies, wake_closed_retries, resolver_workers
                 );
             }
         }

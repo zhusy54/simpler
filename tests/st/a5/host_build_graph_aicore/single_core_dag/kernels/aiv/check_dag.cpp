@@ -23,18 +23,6 @@
 #define __aicore__ [aicore]  // NOLINT(whitespace/braces)
 #endif
 
-#ifdef PTO_CPUSTUB_HPP
-#define dcci(...) \
-    do {          \
-    } while (0)
-#endif
-#ifndef SINGLE_CACHE_LINE
-#define SINGLE_CACHE_LINE 0
-#endif
-#ifndef CACHELINE_OUT
-#define CACHELINE_OUT 0
-#endif
-
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ ChipTensor *tensor = reinterpret_cast<__gm__ ChipTensor *>(args[0]);
     __gm__ int64_t *state = reinterpret_cast<__gm__ int64_t *>(tensor->buffer.addr) + tensor->start_offset;
@@ -43,10 +31,11 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     for (int64_t producer = 0; producer < 64; ++producer) {
         if ((producer_mask & (UINT64_C(1) << producer)) != 0 && state[producer] != producer + 1) {
             state[task_id] = -(producer + 1);
-            dcci(&state[task_id], SINGLE_CACHE_LINE, CACHELINE_OUT);
             return;
         }
     }
+    // Publication is intentionally owned by the HBG-AICore runtime. Keeping
+    // this kernel free of DCCI makes mixed AIC/AIV tests exercise the generic
+    // producer-publish / consumer-invalidate protocol.
     state[task_id] = task_id + 1;
-    dcci(&state[task_id], SINGLE_CACHE_LINE, CACHELINE_OUT);
 }

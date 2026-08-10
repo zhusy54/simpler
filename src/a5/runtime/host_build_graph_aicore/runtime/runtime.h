@@ -152,6 +152,8 @@ public:
     // to AICore. The highest-index thread additionally performs the one-time
     // host-orch boot (attach SM, latch task count) before it starts dispatching.
     int aicpu_thread_num;
+    int32_t aic_dependency_scheduler_limit;
+    int32_t aiv_dependency_scheduler_limit;
     int ready_queue_shards;  // Number of ready queue shards (1..MAX_AICPU_THREADS, default MAX-1)
 
     // Filter-style affinity gate input (a2a3 onboard). Host fills these
@@ -228,6 +230,10 @@ public:
     void set_worker_count(int n) { worker_count = n; }
     int get_aicpu_thread_num() const { return aicpu_thread_num; }
     void set_aicpu_thread_num(int n) { aicpu_thread_num = n; }
+    void set_dependency_scheduler_limits(int32_t aic, int32_t aiv) {
+        aic_dependency_scheduler_limit = aic;
+        aiv_dependency_scheduler_limit = aiv;
+    }
     Handshake *get_workers() { return workers; }
     int32_t get_aicpu_allowed_cpu_count() const { return aicpu_allowed_cpu_count; }
     void set_aicpu_allowed_cpu_count(int32_t n) { aicpu_allowed_cpu_count = n; }

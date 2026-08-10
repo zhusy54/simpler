@@ -16,4 +16,5 @@ Invoke via ``python -m simpler_setup.tools.<name>``:
 - ``deps_viewer``           : deps.json -> text or pan/zoom HTML dependency graph
 - ``dump_viewer``           : inspect args dumps
 - ``strace_timing``         : per-stage / per-round timing from [STRACE] log markers
+- ``hbg_aicore_m3_compare`` : HBG vs HBG-AICore percentile and regression report
 """

@@ -30,6 +30,8 @@ Runtime::Runtime() {
     memset(workers, 0, sizeof(workers));
     worker_count = 0;
     aicpu_thread_num = 1;
+    aic_dependency_scheduler_limit = -1;
+    aiv_dependency_scheduler_limit = 0;
     ready_queue_shards = RUNTIME_DEFAULT_READY_QUEUE_SHARDS;
     memset(aicpu_allowed_cpus, 0, sizeof(aicpu_allowed_cpus));
     aicpu_allowed_cpu_count = 0;

@@ -33,6 +33,13 @@ inline constexpr uint64_t AICORE_WORKER_CAPACITY_V0 = 108;
 inline constexpr int64_t AICORE_TASK_ID_INVALID_V0 = -1;
 inline constexpr int64_t AICORE_WAKE_LIST_CLOSED_V0 = -2;
 
+enum class AicoreRunPhaseV0 : uint64_t {
+    ATTACH = 0,
+    CLASSIFY = 1,
+    RUN = 2,
+    EXIT = 3,
+};
+
 struct alignas(128) AicoreTaskControlV0 {
     // Cross-core RMW and publication words occupy the first cache line.
     int64_t completion;
@@ -70,29 +77,15 @@ struct alignas(128) AicoreRunControlV0 {
     uint64_t completed_count;
     uint64_t exit_requested;
     uint64_t finished_count;
-    uint64_t startup_count;
-    uint64_t root_core_type;
+    uint64_t startup_phase;
+    uint64_t resolver_count;
     uint64_t classification_error;
-    uint64_t queue_push_count;
-    uint64_t queue_pop_count;
-    uint64_t executed_count;
-    uint64_t ready_to_start_cycles;
-    uint64_t payload_cycles;
-    uint64_t kernel_cycles;
-    uint64_t completion_cycles;
-    uint64_t initial_ready_count;
-    uint64_t initial_waiting_count;
-    uint64_t fanin_scan_count;
-    uint64_t fanin_edge_count;
-    uint64_t wake_register_count;
-    uint64_t wake_close_count;
-    uint64_t wake_reclassify_count;
-    uint64_t wake_closed_retry_count;
-    uint64_t classify_cycles;
-    uint64_t wake_cycles;
-    uint64_t empty_scan_count;
     uint64_t error_task_id;
-    uint64_t reserved[4];
+    uint64_t aic_resolver_count;
+    uint64_t aiv_resolver_count;
+    uint64_t completion_push_count;
+    uint64_t completion_pop_count;
+    uint64_t reserved[18];
 };
 
 struct alignas(128) AicoreWorkerContextV0 {
@@ -100,20 +93,52 @@ struct alignas(128) AicoreWorkerContextV0 {
     int32_t physical_core_id;
     int32_t type_rank;
     int32_t active;
+    int32_t resolver_active;
+    int32_t classifier_rank;
+    int32_t resolver_reserved[2];
     uint64_t run_control_offset;
     uint64_t task_controls_offset;
     uint64_t aic_queue_offset;
     uint64_t aiv_queue_offset;
+    uint64_t completion_queue_offset;
     uint64_t graph_descriptors_address;
     uint64_t graph_payloads_address;
     uint64_t sidecar_base_address;
     uint64_t dispatch_payload_offset;
     uint64_t task_window_mask;
+    uint64_t graph_task_count;
+    uint8_t config_padding[8];
+
+    // The second cache line is written only by this worker.
     uint64_t local_completed_delta;
     uint64_t poll_count;
-    uint64_t graph_task_count;
     uint64_t executed_task_count;
-    uint8_t padding[8];
+    uint64_t resolved_task_count;
+    uint64_t ready_pop_count;
+    uint64_t ready_empty_count;
+    uint64_t completion_push_count;
+    uint64_t completion_pop_count;
+    uint64_t completion_empty_count;
+    uint64_t initial_ready_count;
+    uint64_t initial_waiting_count;
+    uint64_t fanin_scan_count;
+    uint64_t fanin_edge_count;
+    uint64_t wake_register_count;
+    uint64_t wake_close_count;
+    uint64_t wake_reclassify_count;
+    uint64_t ready_push_count;
+    uint64_t wake_closed_retry_count;
+    uint64_t classify_cycles;
+    uint64_t ready_to_start_cycles;
+    uint64_t payload_cycles;
+    uint64_t kernel_cycles;
+    uint64_t completion_cycles;
+    uint64_t wake_cycles;
+    uint64_t resolved_flush_count;
+    uint64_t resolved_flush_tasks;
+    uint64_t completion_queue_full_count;
+    uint64_t ready_queue_full_count;
+    uint64_t dfx_reserved[4];
 };
 
 struct AicoreExecutionSidecarLayoutV0 {
@@ -123,6 +148,7 @@ struct AicoreExecutionSidecarLayoutV0 {
     uint64_t aiv_task_count;
     uint64_t aic_queue_capacity;
     uint64_t aiv_queue_capacity;
+    uint64_t completion_queue_capacity;
     uint64_t run_control_offset;
     uint64_t worker_contexts_offset;
     uint64_t dispatch_payloads_offset;
@@ -131,6 +157,8 @@ struct AicoreExecutionSidecarLayoutV0 {
     uint64_t aic_queue_slots_offset;
     uint64_t aiv_queue_offset;
     uint64_t aiv_queue_slots_offset;
+    uint64_t completion_queue_offset;
+    uint64_t completion_queue_slots_offset;
 };
 
 static_assert(sizeof(AicoreTaskControlV0) == 128, "AICore task control must be exactly 128 bytes");
@@ -144,7 +172,7 @@ static_assert(offsetof(AicoreReadyQueueV0, enqueue_pos) == 128, "enqueue cursor 
 static_assert(offsetof(AicoreReadyQueueV0, dequeue_pos) == 256, "dequeue cursor must have its own line");
 static_assert(sizeof(AicoreRunControlV0) == 256, "run control layout changed");
 static_assert(alignof(AicoreRunControlV0) == 128, "run control must be 128-byte aligned");
-static_assert(sizeof(AicoreWorkerContextV0) == 128, "worker context layout changed");
+static_assert(sizeof(AicoreWorkerContextV0) == 384, "worker context layout changed");
 
 #if !defined(__CCE_AICORE__)
 #include <type_traits>
@@ -221,7 +249,8 @@ inline bool aicore_sidecar_plan_v0(
     next.aic_task_count = aic_task_count;
     next.aiv_task_count = aiv_task_count;
     if (!aicore_sidecar_next_power_of_two_v0(aic_task_count, &next.aic_queue_capacity) ||
-        !aicore_sidecar_next_power_of_two_v0(aiv_task_count, &next.aiv_queue_capacity)) {
+        !aicore_sidecar_next_power_of_two_v0(aiv_task_count, &next.aiv_queue_capacity) ||
+        !aicore_sidecar_next_power_of_two_v0(task_count, &next.completion_queue_capacity)) {
         return false;
     }
 
@@ -246,6 +275,13 @@ inline bool aicore_sidecar_plan_v0(
         ) ||
         !aicore_sidecar_checked_mul_v0(next.aiv_queue_capacity, sizeof(AicoreReadyQueueSlotV0), &bytes) ||
         !aicore_sidecar_reserve_v0(&cursor, bytes, alignof(AicoreReadyQueueSlotV0), &next.aiv_queue_slots_offset) ||
+        !aicore_sidecar_reserve_v0(
+            &cursor, sizeof(AicoreReadyQueueV0), alignof(AicoreReadyQueueV0), &next.completion_queue_offset
+        ) ||
+        !aicore_sidecar_checked_mul_v0(next.completion_queue_capacity, sizeof(AicoreReadyQueueSlotV0), &bytes) ||
+        !aicore_sidecar_reserve_v0(
+            &cursor, bytes, alignof(AicoreReadyQueueSlotV0), &next.completion_queue_slots_offset
+        ) ||
         !aicore_sidecar_checked_align_v0(cursor, AICORE_SIDECAR_ALIGNMENT_V0, &next.total_size)) {
         return false;
     }
@@ -274,10 +310,14 @@ inline bool aicore_sidecar_init_v0(void *base, const AicoreExecutionSidecarLayou
 
     AicoreReadyQueueV0 *aic_queue = aicore_sidecar_at_v0<AicoreReadyQueueV0>(base, layout.aic_queue_offset);
     AicoreReadyQueueV0 *aiv_queue = aicore_sidecar_at_v0<AicoreReadyQueueV0>(base, layout.aiv_queue_offset);
+    AicoreReadyQueueV0 *completion_queue =
+        aicore_sidecar_at_v0<AicoreReadyQueueV0>(base, layout.completion_queue_offset);
     AicoreReadyQueueSlotV0 *aic_slots =
         aicore_sidecar_at_v0<AicoreReadyQueueSlotV0>(base, layout.aic_queue_slots_offset);
     AicoreReadyQueueSlotV0 *aiv_slots =
         aicore_sidecar_at_v0<AicoreReadyQueueSlotV0>(base, layout.aiv_queue_slots_offset);
+    AicoreReadyQueueSlotV0 *completion_slots =
+        aicore_sidecar_at_v0<AicoreReadyQueueSlotV0>(base, layout.completion_queue_slots_offset);
 
     aic_queue->slots_offset = layout.aic_queue_slots_offset;
     aic_queue->capacity = layout.aic_queue_capacity;
@@ -285,6 +325,9 @@ inline bool aicore_sidecar_init_v0(void *base, const AicoreExecutionSidecarLayou
     aiv_queue->slots_offset = layout.aiv_queue_slots_offset;
     aiv_queue->capacity = layout.aiv_queue_capacity;
     aiv_queue->mask = layout.aiv_queue_capacity - 1;
+    completion_queue->slots_offset = layout.completion_queue_slots_offset;
+    completion_queue->capacity = layout.completion_queue_capacity;
+    completion_queue->mask = layout.completion_queue_capacity - 1;
     for (uint64_t i = 0; i < layout.aic_queue_capacity; ++i) {
         aic_slots[i].sequence = static_cast<int64_t>(i);
         aic_slots[i].task_id = AICORE_TASK_ID_INVALID_V0;
@@ -292,6 +335,10 @@ inline bool aicore_sidecar_init_v0(void *base, const AicoreExecutionSidecarLayou
     for (uint64_t i = 0; i < layout.aiv_queue_capacity; ++i) {
         aiv_slots[i].sequence = static_cast<int64_t>(i);
         aiv_slots[i].task_id = AICORE_TASK_ID_INVALID_V0;
+    }
+    for (uint64_t i = 0; i < layout.completion_queue_capacity; ++i) {
+        completion_slots[i].sequence = static_cast<int64_t>(i);
+        completion_slots[i].task_id = AICORE_TASK_ID_INVALID_V0;
     }
     return true;
 }

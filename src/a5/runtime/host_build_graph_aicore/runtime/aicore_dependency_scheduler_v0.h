@@ -36,25 +36,23 @@ aicore_record_scheduler_error_v0(__gm__ AicoreRunControlV0 *run_control, int64_t
 }
 
 inline __aicore__ AicoreRouteResultV0 aicore_classify_and_route_v0(
-    const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ const AicoreWorkerContextV0 *context,
+    const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV0 *context,
     __gm__ AicoreRunControlV0 *run_control, int64_t task_id
 ) {
     AicoreTaskInfoV0 task{};
     AicoreRootStatusV0 status = aicore_classify_task_v0(graph, task_id, &task);
-    if (status != AicoreRootStatusV0::OK || static_cast<uint64_t>(task.core_type) != run_control->root_core_type) {
-        aicore_record_scheduler_error_v0(
-            run_control, task_id, status == AicoreRootStatusV0::OK ? AicoreRootStatusV0::MIXED_CORE_TYPE : status
-        );
+    if (status != AicoreRootStatusV0::OK) {
+        aicore_record_scheduler_error_v0(run_control, task_id, status);
         return AicoreRouteResultV0::ERROR;
     }
 
     __gm__ uint8_t *payload = aicore_graph_payload_v0(graph, task_id);
     int32_t fanin_count = *reinterpret_cast<__gm__ int32_t *>(payload + AICORE_GRAPH_FANIN_COUNT_OFFSET_V0);
     while (true) {
-        aicore_gm_fetch_add_v0(run_control->fanin_scan_count, UINT64_C(1));
+        aicore_gm_fetch_add_v0(context->fanin_scan_count, UINT64_C(1));
         int64_t unmet_producer = AICORE_TASK_ID_INVALID_V0;
         for (int32_t i = 0; i < fanin_count; ++i) {
-            aicore_gm_fetch_add_v0(run_control->fanin_edge_count, UINT64_C(1));
+            aicore_gm_fetch_add_v0(context->fanin_edge_count, UINT64_C(1));
             int64_t producer = aicore_graph_fanin_id_v0(graph, task_id, i);
             __gm__ AicoreTaskControlV0 *producer_control = aicore_task_control_at_v0(sidecar_base, context, producer);
             if (aicore_gm_load_v0(producer_control->completion) == 0) {
@@ -69,10 +67,11 @@ inline __aicore__ AicoreRouteResultV0 aicore_classify_and_route_v0(
                 task.core_type == AicoreRootCoreTypeV0::AIC ? context->aic_queue_offset : context->aiv_queue_offset
             );
             if (!aicore_ready_queue_push_v0(sidecar_base, queue, task_id)) {
+                aicore_gm_fetch_add_v0(context->ready_queue_full_count, UINT64_C(1));
                 aicore_record_scheduler_error_v0(run_control, task_id, AicoreRootStatusV0::QUEUE_FULL);
                 return AicoreRouteResultV0::ERROR;
             }
-            aicore_gm_fetch_add_v0(run_control->queue_push_count, UINT64_C(1));
+            aicore_gm_fetch_add_v0(context->ready_push_count, UINT64_C(1));
             return AicoreRouteResultV0::READY;
         }
 
@@ -80,14 +79,14 @@ inline __aicore__ AicoreRouteResultV0 aicore_classify_and_route_v0(
         while (true) {
             int64_t observed = aicore_gm_load_v0(producer_control->wake_list_head);
             if (observed == AICORE_WAKE_LIST_CLOSED_V0) {
-                aicore_gm_fetch_add_v0(run_control->wake_closed_retry_count, UINT64_C(1));
+                aicore_gm_fetch_add_v0(context->wake_closed_retry_count, UINT64_C(1));
                 break;
             }
             __gm__ AicoreTaskControlV0 *consumer_control = aicore_task_control_at_v0(sidecar_base, context, task_id);
             aicore_publish_next_waiter_v0(consumer_control, observed);
             int64_t actual = aicore_gm_compare_exchange_v0(producer_control->wake_list_head, observed, task_id);
             if (actual == observed) {
-                aicore_gm_fetch_add_v0(run_control->wake_register_count, UINT64_C(1));
+                aicore_gm_fetch_add_v0(context->wake_register_count, UINT64_C(1));
                 return AicoreRouteResultV0::WAITING;
             }
         }
@@ -95,13 +94,13 @@ inline __aicore__ AicoreRouteResultV0 aicore_classify_and_route_v0(
 }
 
 inline __aicore__ bool aicore_complete_and_wake_v0(
-    const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ const AicoreWorkerContextV0 *context,
+    const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV0 *context,
     __gm__ AicoreRunControlV0 *run_control, int64_t task_id
 ) {
     __gm__ AicoreTaskControlV0 *task_control = aicore_task_control_at_v0(sidecar_base, context, task_id);
     aicore_gm_store_v0(task_control->completion, INT64_C(1));
     int64_t waiter = aicore_gm_exchange_v0(task_control->wake_list_head, AICORE_WAKE_LIST_CLOSED_V0);
-    aicore_gm_fetch_add_v0(run_control->wake_close_count, UINT64_C(1));
+    aicore_gm_fetch_add_v0(context->wake_close_count, UINT64_C(1));
 
     while (waiter >= 0) {
         if (static_cast<uint64_t>(waiter) >= graph.task_count) {
@@ -110,7 +109,7 @@ inline __aicore__ bool aicore_complete_and_wake_v0(
         }
         __gm__ AicoreTaskControlV0 *waiter_control = aicore_task_control_at_v0(sidecar_base, context, waiter);
         int64_t next = aicore_observe_next_waiter_v0(waiter_control);
-        aicore_gm_fetch_add_v0(run_control->wake_reclassify_count, UINT64_C(1));
+        aicore_gm_fetch_add_v0(context->wake_reclassify_count, UINT64_C(1));
         if (aicore_classify_and_route_v0(graph, sidecar_base, context, run_control, waiter) ==
             AicoreRouteResultV0::ERROR) {
             return false;

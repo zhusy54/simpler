@@ -12,7 +12,6 @@
 #include <cstdint>
 #include <pto/pto-inst.hpp>
 
-#include "intrinsic.h"
 #include "tensor.h"
 
 #ifndef __gm__
@@ -26,16 +25,20 @@
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ ChipTensor *tensor = reinterpret_cast<__gm__ ChipTensor *>(args[0]);
     __gm__ int64_t *state = reinterpret_cast<__gm__ int64_t *>(tensor->buffer.addr) + tensor->start_offset;
-    int64_t task_id = args[1];
-    uint64_t producer_mask = static_cast<uint64_t>(args[2]);
-    for (int64_t producer = 0; producer < 64; ++producer) {
-        if ((producer_mask & (UINT64_C(1) << producer)) != 0 && state[producer] != producer + 1) {
-            state[task_id] = -(producer + 1);
-            return;
+    const int64_t task_id = args[1];
+    const int64_t graph_case = args[2];
+    const int64_t fanin_count = args[3];
+    bool ready = true;
+    if (graph_case == 1 && task_id >= 32) {
+        for (int64_t producer = 0; producer < 32; ++producer) {
+            ready = ready && state[producer + 1] == producer + 1;
+        }
+    } else {
+        const int64_t checked = fanin_count < 4 ? fanin_count : 4;
+        for (int64_t i = 0; i < checked; ++i) {
+            const int64_t producer = args[4 + i];
+            ready = ready && producer >= 0 && state[producer + 1] == producer + 1;
         }
     }
-    // Publication is intentionally owned by the HBG-AICore runtime. Keeping
-    // this kernel free of DCCI makes mixed AIC/AIV tests exercise the generic
-    // producer-publish / consumer-invalidate protocol.
-    state[task_id] = task_id + 1;
+    state[task_id + 1] = ready ? task_id + 1 : -(task_id + 1);
 }

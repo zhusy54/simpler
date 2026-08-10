@@ -9,21 +9,27 @@ invoke them via `python -m simpler_setup.tools.<name>`.
 
 ## benchmark_rounds.sh
 
-Batch-run a predefined set of ST examples on hardware, parse `orch_start` /
-`orch_end` / `sched_end` timestamps from the device log, and report per-round
-elapsed time.
+Batch-run a predefined set of ST examples on hardware, parse host-emitted
+`[STRACE]` markers, and report per-round Host/Device/Effective/Orch/Sched
+latency.
 
 ```bash
-# Use defaults (device 0, 10 rounds)
+# Use defaults (device 0, 100 rounds)
 ./tools/benchmark_rounds.sh
 
 # Specify device / rounds / runtime
 ./tools/benchmark_rounds.sh -p a2a3 -d 4 -n 20 -r tensormap_and_ringbuffer
+
+# M3: run the frozen HBG oracle and HBG-AICore on the same A5 device.
+./tools/benchmark_rounds.sh -p a5 -d 0 -n 30 -r host_build_graph --raw-log-dir outputs/m3
+./tools/benchmark_rounds.sh -p a5 -d 0 -n 30 -r host_build_graph_aicore --raw-log-dir outputs/m3
 ```
 
-Requires `SIMPLER_DFX=1` in the runtime; device log must include the
-`orch_*` / `sched_*` lines. The `TMR_EXAMPLE_CASES` map at the top of the
-script controls which examples/cases are run.
+Timing is parsed from `[STRACE]` markers. The runtime-specific case maps at the
+top of the script control which examples/cases are run. For the M3 report,
+capture the per-case raw logs and pass each matching pair to
+`python -m simpler_setup.tools.hbg_aicore_m3_compare`; run HBG and HBG-AICore
+serially on the same device.
 
 ## verify_packaging.sh
 

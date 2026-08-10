@@ -15,6 +15,9 @@
 
 inline __aicore__ bool
 aicore_ready_queue_push_v0(__gm__ void *sidecar_base, __gm__ AicoreReadyQueueV0 *queue, int64_t task_id) {
+    // Both slot words use raw-GM operations. Do not DCCI this cache line: a
+    // cached writeback could overwrite a newer sequence published by another
+    // core when the bounded queue wraps and reuses the slot.
     uint64_t pos = aicore_gm_load_v0(queue->enqueue_pos, __ATOMIC_RELAXED);
     while (true) {
         __gm__ AicoreReadyQueueSlotV0 *slots =

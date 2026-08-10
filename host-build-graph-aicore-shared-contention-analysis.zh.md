@@ -21,10 +21,10 @@ sequence 等多项原子操作。O3 候选实现的 bitmap word 原子操作在�
 | ---- | -------- | ---------- | -------- |
 | 1 | `WAITING -> READY` | 可选的重复发布诊断 | 正确 Pull 协议没有竞争，建议从正确性热路径删除 |
 | 2 | ReadySet 所有权转移 | 保证 task exactly-once | M3 以 v0 task-id MPMC 成功 pop 完成领取；O3 候选也必须复用自身唯一消费操作，不设独立 claim 字段 |
-| 3 | completion 发布 | 让其他 core 观察 kernel/DUMMY 完成 | 唯一 writer，使用 publish store + DCCI/barrier，不做 CAS |
+| 3 | completion 发布 | 让其他 core 观察 kernel/DUMMY 完成 | executor 先发布数据并 push CompletionQ；唯一 pop resolver 写 completion，不做 CAS |
 | 4 | wake-list 注册协议 | 发布 `next_waiter`，并把 waiter 挂到 producer | `next_waiter` 不做 RMW；仅对 head 做 CAS push |
 | 5 | `wake_list_head` 关闭 | completion 与 waiter 注册并发时不丢唤醒 | 保留 atomic exchange |
-| 6 | `completed_count` | 判断整图完成 | 每核本地累计；完整空闲扫描后批量 `fetch_add` |
+| 6 | `completed_count` | 判断整图完成 | 每 resolver 本地累计；CompletionQ 暂空后批量 `fetch_add` |
 
 真正预期发生多 writer 竞争的是 ReadyQ、wake-list head，以及低频批量更新的 `completed_count`。
 `WAITING -> READY` 和独立 task claim 都不属于最终运行期共享操作；task 所有权由 ReadySet 的
@@ -40,8 +40,8 @@ sequence 等多项原子操作。O3 候选实现的 bitmap word 原子操作在�
 
 因此 v0 只为 HBG descriptor/payload/fanin 定义只读 ABI view；所有 AICore 可变状态从 M0 起进入
 graph-sized execution sidecar。每个 `AicoreTaskControlV0` 独占 128B，word-sized completion 和
-wake-head 原子与需要 DCCI 发布的 `next_waiter` 分处不同 cache line；ReadyQ 从首版即保存 task id，
-不复用 HBG pointer slot。Host 编译单元必须用 C/POD、trivially-copyable、standard-layout、
+wake-head 原子与需要 DCCI 发布的 `next_waiter` 分处不同 cache line；ReadyQ 和 CompletionQ 从
+首版即保存 task id，不复用 HBG pointer slot。Host 编译单元必须用 C/POD、trivially-copyable、standard-layout、
 `sizeof`、`alignof` 和关键 `offsetof` 断言约束 wire；intra-sidecar 引用只使用 offset/task id。
 
 实现允许从 `simpler-dist` FDWIC 的 `runtime/dist_engine/common/atomic.h` 和
@@ -237,21 +237,21 @@ MPMC 方案必须把“task 只 push 一次”提升为正式不变量：initial
 
 ### 4.3 Completion 发布
 
-- **在做什么**：业务 kernel 或 DUMMY 路径结束后，执行 core 先发布输出数据，再把 producer
-  标记为完成。其他 core 在 initial classify 或 wake reclassify 中读取该标志，决定 consumer
-  是否仍需等待。
+- **在做什么**：业务 kernel 或 DUMMY 路径结束后，executor 先发布输出数据，再把 producer task id
+  推入 CompletionQ；成功 pop 的 resolver 把 producer 标记为完成。其他 resolver 在 initial classify
+  或 wake reclassify 中读取该标志，决定 consumer 是否仍需等待。
 - **为什么需要**：完成标志不仅表示“kernel 已返回”，还必须表示“producer output 已对其他
   core 可见”。若先写 completion、后 clean 输出，consumer 可能观察到完成并立即读取旧 tensor，
   产生不报错的错误结果。
-- **竞争在哪里**：ReadySet exactly-once 领取保证只有一个 completion writer，因此没有 writer-writer
-  竞争；竞争表现为一个 core 发布时，多个 classifier/relayer core 并发 acquire-load 同一个
-  completion word。它是发布/观察同步点，而不是 CAS winner 竞争。
+- **竞争在哪里**：ReadySet exactly-once 领取保证 task 只执行一次，CompletionQ exactly-once pop
+  再保证只有一个 resolver 写 completion，因此没有 writer-writer 竞争；竞争表现为一个 resolver
+  发布时，多个 classifier/relayer core 并发读取同一个 completion word。
 - **为什么同步有必要**：A5 普通 GM 不提供可假定的跨核自动一致性。v0 沿用 HBG 的通用
   DCCI/barrier 顺序发布普通数据，但 completion 自 M0 起写入 128B control 的 word-sized 字段；
   reader acquire 观察完成后，在读取 payload/输入前执行对应观察操作。只有这条 happens-before
   链能把数据和控制状态关联。
-- **如何消减**：completion 由唯一 writer 用 runtime-local word-sized publish store 加明确的
-  DCCI/barrier，不使用 exchange/CAS；fanin 扫描
+- **如何消减**：executor 的 whole-data-cache clean + barrier 先于 CompletionQ raw-GM 发布；唯一
+  pop resolver 用 runtime-local word-sized store 写 completion，不使用 exchange/CAS；fanin 扫描
   遇到第一个未完成 producer 即停止，减少 completion load；每 task 独立 control cache line，
   避免相邻 task 的 DCCI 或原子访问互相覆盖。
 - **为什么有效**：release store 保留所需的单向发布顺序，但避免 RMW 带来的独占 cache-line
@@ -309,32 +309,33 @@ MPMC 方案必须把“task 只 push 一次”提升为正式不变量：initial
 
 ### 4.6 `completed_count`
 
-- **在做什么**：每个 core 私有维护 `local_completed_delta`。kernel 或 DUMMY task 完成完整的
-  completion 发布和 wake relay 后，只增加本地 delta；当本核完整扫描所有兼容 ReadyQ 均无任务
-  可领取时，才把 delta 批量 `fetch_add` 到全局 `completed_count`。AICPU 控制面在
+- **在做什么**：每个 resolver 私有维护 `local_completed_delta`。完成 CompletionQ pop、completion
+  发布和 wake relay 后，只增加本地 delta；当 CompletionQ 暂时为空时，才把 delta 批量
+  `fetch_add` 到全局 `completed_count`。AICPU 控制面在
   `completed_count == expected_task_count` 时判断正常完成。
 - **为什么需要**：ReadyQ 为空不能表示完成——所有剩余 task 可能仍挂在 wake list，或某个 core
   正在执行最后一个 task。逐 task 扫描所有 task-control completion 开销为 O(task 数)，全局 count 提供
   O(1) 的完成判定。
-- **竞争在哪里**：多个 core 可能同时从 busy 转为空闲，并发 `fetch_add` 同一个全局 counter。
-  竞争没有完全消失，但从“每 task 一次”降为“每个 core 每段 busy period 一次”；持续执行期间
+- **竞争在哪里**：多个 resolver 可能同时把本地批次提交到同一个全局 counter。
+  竞争没有完全消失，但从“每 task 一次”降为“每个 resolver 每批一次”；持续 relay 期间
   只修改本地 delta，不触碰共享 cache line。
 - **为什么原子有必要**：普通 read-modify-write 会丢增量：两个 core 同时读到 N，各自写 N+1，
   最终少计一次并导致永不退出，因此批量提交仍需 atomic `fetch_add`。该原子只聚合计数，
   不负责发布 kernel 数据，可以使用 relaxed 语义；数据可见性由 completion 协议单独承担。
 - **如何消减**：`local_completed_delta` 放在寄存器或每核私有存储中；delta 为零时不执行 RMW。
-  core 完整空闲扫描后提交非零 delta，并且只在 `fetch_add` 完成后清零。提交后若又出现 ready
-  task，正常执行并累计下一批；不尝试先判断“所有 core 全局空闲”，避免引入另一套 idle 同步。
+  resolver 观察 CompletionQ 暂空后提交非零 delta，并且只在 `fetch_add` 完成后清零。提交后若又
+  出现 completion，正常 relay 并累计下一批；不尝试先判断“所有 core 全局空闲”。
   wide/MIX task 只由唯一逻辑完成者累计一次，错误路径仍走 first-error/drain。
 - **为什么有效**：全局 counter 和 O(1) 完成判断保持不变，但原子次数从 O(task 数) 降到
-  O(busy period 数)。最后一批任务完成后，执行 core 必然回到调度循环、完成一次空闲扫描并
-  提交剩余 delta，因此不会漏计；新任务在提交后出现也只会进入下一批，不会提前完成。
+  O(relay batch 数)。最后一批任务完成后，resolver 必然观察到 CompletionQ 暂空并提交剩余
+  delta，因此不会漏计；新 completion 在提交后出现也只会进入下一批，不会提前完成。
 
 ## 5. M3/v1 基线与 O3 候选的 DFX 和验证
 
 每 core 记录局部 counters，结束时汇总，避免 DFX 自身制造共享热点：
 
 - MPMC enqueue/dequeue CAS attempt、fail、sequence wait cycle；
+- CompletionQ push/pop/full/empty、resolver relay 和 batch flush；
 - O3 增加 bitmap L0/L1 atomic、bit-clear retry、fallback scan、hot-word max retry；
 - MPMC pop winner；O3 增加 bitmap duplicate-set/clear-bit winner；
 - wake register CAS retry、close-race reclassify；
