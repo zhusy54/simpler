@@ -2,21 +2,22 @@
 
 | 项目 | 内容 |
 | ---- | ---- |
-| 状态 | 已重规划，待第一阶段可行性与性能验证 |
-| 文档类型 | 架构设计与实施计划，不代表功能已经落地 |
+| 状态 | M0～M2 已实现并通过 A5sim；M3、A5 真机与性能签署待完成 |
+| 文档类型 | 架构设计、当前实现状态与后续实施计划 |
 | 首发平台 | A5sim、A5 |
 | 方案代号 | `host_build_graph_aicore`，简称 HBG-AICore |
 | 基线 | `host_build_graph`（HBG） |
 | 参考 | `../simpler-dist/src/a5/runtime/fully_distributed_within_core/`（FDWIC）实现、设计和验证 |
-| 日期 | 2026-08-07 |
+| 日期 | 2026-08-10 |
 
 ## 1. 结论、目标和边界
 
 ### 1.1 架构结论
 
-本方案具备实现基础，但在 A5 真机上是否有足够的调度收益尚未得到证明。建议新增显式
-Runtime 变体 `host_build_graph_aicore`，先用最小改造验证 AICore 解依赖的正确性、扩展性和
-性能，再由人工架构评审决定是否进入完整实现；不直接改变现有 `host_build_graph` 的默认行为。
+当前分支已新增显式 Runtime 变体 `host_build_graph_aicore`，并完成 M0～M2：单 root 与单核
+同质 DAG 的首次分类、依赖等待、完成传播和任务领取已在 A5sim 验证。A5 真机可见性、性能收益
+和 M3 多核扩展尚未证明，完成后仍须由人工架构评审决定是否进入完整实现；现有
+`host_build_graph` 的默认行为不变。
 
 新 Runtime 位于 `simpler/src/a5/runtime/host_build_graph_aicore/`，与现有
 `simpler/src/a5/runtime/host_build_graph/` 平级。第一阶段从当前 A5 HBG 复制完整实现代码作为
@@ -483,7 +484,7 @@ AICore 调度并发自动策略/可选上限和队列回退次数。第一阶段
 | 区域 | 当前参考点 | 计划修改 |
 | ---- | ---------- | -------- |
 | Runtime 发现 | `simpler_setup/runtime_builder.py` | 已按 `build_config.py` 动态发现；新增平级目录即可，无额外 registry |
-| Orchestrator 编译 | `simpler_setup/kernel_compiler.py` | 将 toolchain 选择改为 runtime build-config capability，避免新增名称硬编码 |
+| Orchestrator 编译 | `simpler_setup/kernel_compiler.py` | 按 Runtime 名称选择：两个 HBG Runtime 使用 Host GXX；TRB 仿真使用 Host GXX、板端使用 AArch64 GXX；未知名称失败 |
 | 每次运行配置 | `CallConfig`、binding、mailbox、remote protocol、SceneTest | M0～M2 不变；M3 若实验需要，增加可选 `aicore_scheduler_limit`，0=自动、正数=调度并发上限；其他 Runtime 忽略 |
 | Runtime 基线 | 新增 `src/a5/runtime/host_build_graph_aicore/` | 机械复制完整 A5 HBG 实现，记录来源 commit/tree hash 后独立维护 |
 | Runtime 构建清单 | 新 Runtime 的 `build_config.py` | 保持复制基线的 Host/orchestration，后续替换 AICPU supervisor 和 AICore scheduler |

@@ -24,6 +24,10 @@
 第一阶段只回答“Host 已知完整 DAG 能否由 AICore scheduler 正确、高效执行”。M3 完成后不得
 直接进入 M4，必须先根据 ABI v0 的实测结果决定是否继续以及 v1 的具体形态。
 
+当前分支已经实现 M1 功能和 M2 单核同质 DAG：CPU reference、AICore first-unmet/wake relay、
+Host 启动前校验以及纯 AIC/纯 AIV 标准图族均已落地并通过 A5sim。M1/M2 的 A5 真机签署和
+HBG 性能对比仍须在架构预检恢复后补齐，不能用 A5sim 结果替代。
+
 ## 2. 已锁定的实现契约
 
 ### 2.1 Runtime、复制基线与公共接口
@@ -155,12 +159,13 @@ A5 真机测试在占用设备前必须执行架构预检，随后通过项目�
 - 固化目录关系、复制/独立维护边界、HBG oracle、第一阶段能力边界和 M3 人工闸门。
 - 验证：文档链接、术语和 M0～M3 交叉引用一致。
 
-#### 提交 2：`build: make orchestration toolchain runtime-configurable`
+#### 提交 2：`build: route orchestration toolchain by runtime name`
 
-- 用 `build_config.py` capability 选择 Host 或 AArch64 orchestration toolchain，替代 Runtime 名称
-  硬编码。
-- 更新现有 HBG/TRB 配置并保持编译 flags、cache key 和产物不变。
-- 验证：RuntimeBuilder/KernelCompiler UT 覆盖两类 toolchain 和未知配置失败。
+- 由共享 `KernelCompiler` 按 Runtime 名称选择 orchestration toolchain，不增加 build-config capability：
+  `host_build_graph` 和 `host_build_graph_aicore` 固定使用 Host GXX；
+  `tensormap_and_ringbuffer` 在仿真使用 Host GXX、板端使用 AArch64 GXX。
+- 保持各 Runtime 的编译 flags、cache key 和产物不变；未知 Runtime 名称明确失败。
+- 验证：RuntimeBuilder/KernelCompiler UT 覆盖上述名称映射和未知名称失败。
 
 #### 提交 3：`refactor: import frozen A5 HBG runtime as HBG-AICore baseline`
 
