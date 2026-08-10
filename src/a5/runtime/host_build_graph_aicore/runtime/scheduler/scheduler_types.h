@@ -170,7 +170,7 @@ public:
         // A mask with exactly `offset` set. The shift lives here so a caller
         // cannot silently narrow it by writing `1ULL << offset`, which is
         // undefined once offset reaches 64.
-        static BitStates bit(int32_t offset) { return BitStates(Storage(1) << offset); }
+        static BitStates bit(int32_t offset) { return BitStates(static_cast<Storage>(1) << offset); }
 
         BitStates operator~() const { return BitStates(~states_); }
         BitStates operator&(const BitStates &other) const { return BitStates(states_ & other.states_); }
@@ -187,7 +187,7 @@ public:
             return __builtin_popcountll(static_cast<uint64_t>(states_)) +
                    __builtin_popcountll(static_cast<uint64_t>(states_ >> 64));
         }
-        void clear_bit(int32_t offset) { states_ &= ~(Storage(1) << offset); }
+        void clear_bit(int32_t offset) { states_ &= ~(static_cast<Storage>(1) << offset); }
 
         // Extract the lowest set bit from mask, clear it, and return its position.
         // Returns -1 if mask is empty.

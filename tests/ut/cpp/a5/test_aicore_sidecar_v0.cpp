@@ -11,14 +11,17 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdlib>
 #include <thread>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "aicore_execution_sidecar_v0.h"
+#include "aicore_dependency_model_v0.h"
 #include "aicore_graph_view_v0.h"
 #include "aicore_gm_atomic.h"
 #include "aicore_ready_queue_v0.h"
@@ -243,7 +246,10 @@ TEST(AicoreSidecarV0, ClassifiesEmptyAicAndAivRoots) {
     alignas(64) PTO2TaskDescriptor descriptors[2]{};
     alignas(64) PTO2TaskPayload payloads[2]{};
     AicoreReadonlyGraphV0 graph{
-        reinterpret_cast<uint64_t>(descriptors), reinterpret_cast<uint64_t>(payloads), 0, 1,
+        reinterpret_cast<uint64_t>(descriptors),
+        reinterpret_cast<uint64_t>(payloads),
+        0,
+        1,
     };
     AicoreRootInfoV0 root{};
     EXPECT_EQ(aicore_classify_single_root_v0(graph, &root), AicoreRootStatusV0::EMPTY);
@@ -272,7 +278,10 @@ TEST(AicoreSidecarV0, RejectsNonRootAndUnsupportedShapes) {
     alignas(64) PTO2TaskDescriptor descriptors[2]{};
     alignas(64) PTO2TaskPayload payloads[2]{};
     AicoreReadonlyGraphV0 graph{
-        reinterpret_cast<uint64_t>(descriptors), reinterpret_cast<uint64_t>(payloads), 2, 1,
+        reinterpret_cast<uint64_t>(descriptors),
+        reinterpret_cast<uint64_t>(payloads),
+        2,
+        1,
     };
     AicoreRootInfoV0 root{};
     EXPECT_EQ(aicore_classify_single_root_v0(graph, &root), AicoreRootStatusV0::INVALID_TASK_COUNT);
@@ -302,14 +311,16 @@ TEST(AicoreSidecarV0, MapsPayloadArgumentsAndResolvesCallableAddress) {
     payloads[0].scalars[0] = UINT64_C(0x1234);
     payloads[0].scalars[1] = UINT64_C(0x5678);
     AicoreReadonlyGraphV0 graph{
-        reinterpret_cast<uint64_t>(descriptors), reinterpret_cast<uint64_t>(payloads), 1, 0,
+        reinterpret_cast<uint64_t>(descriptors),
+        reinterpret_cast<uint64_t>(payloads),
+        1,
+        0,
     };
     AicoreRootInfoV0 root{};
     ASSERT_EQ(aicore_classify_single_root_v0(graph, &root), AicoreRootStatusV0::OK);
 
     alignas(8) uint8_t callable_bytes[AICORE_CORE_CALLABLE_RESOLVED_ADDR_OFFSET_V0 + sizeof(uint64_t)]{};
-    *reinterpret_cast<uint64_t *>(callable_bytes + AICORE_CORE_CALLABLE_RESOLVED_ADDR_OFFSET_V0) =
-        UINT64_C(0xabcdef00);
+    *reinterpret_cast<uint64_t *>(callable_bytes + AICORE_CORE_CALLABLE_RESOLVED_ADDR_OFFSET_V0) = UINT64_C(0xabcdef00);
     PTO2DispatchPayload dispatch{};
     ASSERT_EQ(
         aicore_materialize_root_payload_v0(graph, root, reinterpret_cast<uint64_t>(callable_bytes), &dispatch),
@@ -325,6 +336,85 @@ TEST(AicoreSidecarV0, MapsPayloadArgumentsAndResolvesCallableAddress) {
     EXPECT_EQ(dispatch.local_context.block_idx, 0);
     EXPECT_EQ(dispatch.local_context.block_num, 1);
     EXPECT_EQ(dispatch.local_context.async_ctx.task_token.raw, 0u);
+}
+
+TEST(AicoreDependencyModelV0, RegisterBeforeCloseWakesEveryWaiterExactlyOnce) {
+    AicoreDependencyModelV0 model({{}, {0}, {0}});
+    ASSERT_TRUE(model.classify_all());
+    EXPECT_EQ(model.state(0), AicoreModelTaskStateV0::READY);
+    EXPECT_EQ(model.state(1), AicoreModelTaskStateV0::WAITING);
+    EXPECT_EQ(model.state(2), AicoreModelTaskStateV0::WAITING);
+
+    int64_t task_id = -1;
+    ASSERT_TRUE(model.pop_ready(&task_id));
+    ASSERT_EQ(task_id, 0);
+    ASSERT_TRUE(model.complete(task_id));
+    EXPECT_EQ(model.ready_count(), 2u);
+    EXPECT_TRUE(model.validate_invariants());
+
+    std::vector<int64_t> completed;
+    while (model.pop_ready(&task_id)) {
+        completed.push_back(task_id);
+        ASSERT_TRUE(model.complete(task_id));
+    }
+    EXPECT_EQ(completed, (std::vector<int64_t>{2, 1}));
+    EXPECT_EQ(model.completed_count(), 3u);
+    EXPECT_TRUE(model.validate_invariants());
+}
+
+TEST(AicoreDependencyModelV0, CloseBeforeRegisterAndMultiFaninRehang) {
+    AicoreDependencyModelV0 model({{}, {}, {0, 1}});
+    ASSERT_TRUE(model.classify(0));
+    int64_t task_id = -1;
+    ASSERT_TRUE(model.pop_ready(&task_id));
+    ASSERT_EQ(task_id, 0);
+    ASSERT_TRUE(model.complete(task_id));
+
+    ASSERT_TRUE(model.classify(2));
+    EXPECT_EQ(model.state(2), AicoreModelTaskStateV0::WAITING);
+    ASSERT_TRUE(model.classify(1));
+    ASSERT_TRUE(model.pop_ready(&task_id));
+    ASSERT_EQ(task_id, 1);
+    ASSERT_TRUE(model.complete(task_id));
+    EXPECT_EQ(model.state(2), AicoreModelTaskStateV0::READY);
+    ASSERT_TRUE(model.pop_ready(&task_id));
+    ASSERT_EQ(task_id, 2);
+    ASSERT_TRUE(model.complete(task_id));
+    EXPECT_EQ(model.completed_count(), 3u);
+    EXPECT_TRUE(model.validate_invariants());
+}
+
+TEST(AicoreDependencyModelV0, FixedSeedRandomDagCompletesExactlyOnce) {
+    constexpr int64_t kTaskCount = 64;
+    std::vector<std::vector<int64_t>> fanins(kTaskCount);
+    uint64_t random = UINT64_C(0x9e3779b97f4a7c15);
+    for (int64_t task_id = 1; task_id < kTaskCount; ++task_id) {
+        random = random * UINT64_C(6364136223846793005) + 1;
+        int64_t fanin_count = static_cast<int64_t>(random % 5);
+        for (int64_t edge = 0; edge < fanin_count; ++edge) {
+            random = random * UINT64_C(6364136223846793005) + 1;
+            int64_t producer = static_cast<int64_t>(random % static_cast<uint64_t>(task_id));
+            if (std::find(fanins[task_id].begin(), fanins[task_id].end(), producer) == fanins[task_id].end()) {
+                fanins[task_id].push_back(producer);
+            }
+        }
+    }
+
+    AicoreDependencyModelV0 model(std::move(fanins));
+    ASSERT_TRUE(model.classify_all());
+    std::vector<int> seen(kTaskCount, 0);
+    while (model.completed_count() != kTaskCount) {
+        int64_t task_id = -1;
+        ASSERT_TRUE(model.pop_ready(&task_id));
+        ASSERT_GE(task_id, 0);
+        ASSERT_LT(task_id, kTaskCount);
+        ++seen[task_id];
+        ASSERT_TRUE(model.complete(task_id));
+        ASSERT_TRUE(model.validate_invariants());
+    }
+    EXPECT_EQ(model.ready_count(), 0u);
+    for (int count : seen)
+        EXPECT_EQ(count, 1);
 }
 
 }  // namespace
