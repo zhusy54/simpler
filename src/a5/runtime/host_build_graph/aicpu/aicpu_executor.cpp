@@ -265,8 +265,12 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             }
             if (run_control->classification_error != 0) {
                 LOG_ERROR(
-                    "A5 HBG AICore scheduler: graph execution failed at task=%" PRIu64 " status=%" PRIu64,
-                    run_control->error_task_id, run_control->classification_error
+                    "A5 HBG AICore scheduler: graph execution failed at task=%" PRIu64 " status=%" PRIu64
+                    " core=%" PRIu64 " type=%" PRIu64 " graph_tasks=%" PRIu64 " descriptors=0x%" PRIx64
+                    " payloads=0x%" PRIx64 " mask=0x%" PRIx64,
+                    run_control->error_task_id, run_control->classification_error, run_control->reserved[5],
+                    run_control->reserved[6], run_control->reserved[1], run_control->reserved[2],
+                    run_control->reserved[3], run_control->reserved[4]
                 );
                 run_rc = -1;
             }

@@ -175,6 +175,37 @@ TEST(AicoreSidecarV0, TaskIdQueueMpmcIsExactlyOnce) {
         EXPECT_EQ(count.load(), 1);
 }
 
+TEST(AicoreSidecarV0, TaskIdQueueWaitsForPayloadAfterSequencePublication) {
+    AicoreExecutionSidecarLayoutV0 layout{};
+    ASSERT_TRUE(aicore_sidecar_plan_v0(1, 1, 0, &layout));
+    SidecarBuffer storage(layout);
+    auto *queue = aicore_sidecar_at_v0<AicoreReadyQueueV0>(storage.base(), layout.aic_queue_offset);
+    auto *slots = aicore_sidecar_at_v0<AicoreReadyQueueSlotV0>(storage.base(), layout.aic_queue_slots_offset);
+
+    // Model the A5 store-store reordering that exposed sequence before task_id.
+    aicore_gm_store_v0(queue->enqueue_pos, UINT64_C(1));
+    aicore_gm_store_v0(slots[0].sequence, INT64_C(1));
+    ASSERT_EQ(slots[0].task_id, AICORE_TASK_ID_INVALID_V0);
+
+    std::atomic<bool> done{false};
+    bool popped = false;
+    int64_t task_id = AICORE_TASK_ID_INVALID_V0;
+    std::thread consumer([&] {
+        popped = aicore_ready_queue_pop_v0(storage.base(), queue, &task_id);
+        done.store(true, std::memory_order_release);
+    });
+
+    while (aicore_gm_load_v0(queue->dequeue_pos) == 0)
+        std::this_thread::yield();
+    EXPECT_FALSE(done.load(std::memory_order_acquire));
+    aicore_gm_store_v0(slots[0].task_id, INT64_C(42));
+    consumer.join();
+
+    EXPECT_TRUE(popped);
+    EXPECT_EQ(task_id, 42);
+    EXPECT_EQ(slots[0].task_id, AICORE_TASK_ID_INVALID_V0);
+}
+
 TEST(AicoreSidecarV0, TaskIdQueueHonorsVyukovSequenceInvariant) {
     AicoreExecutionSidecarLayoutV0 layout{};
     ASSERT_TRUE(aicore_sidecar_plan_v0(4, 4, 0, &layout));
@@ -199,6 +230,8 @@ TEST(AicoreSidecarV0, TaskIdQueueHonorsVyukovSequenceInvariant) {
     }
     for (uint64_t i = 0; i < layout.aic_queue_capacity; ++i)
         EXPECT_EQ(slots[i].sequence, static_cast<int64_t>(i + layout.aic_queue_capacity));
+    for (uint64_t i = 0; i < layout.aic_queue_capacity; ++i)
+        EXPECT_EQ(slots[i].task_id, AICORE_TASK_ID_INVALID_V0);
 
     // A second round wraps the cursor; sequence advances by another capacity step and stays monotonic.
     for (int64_t i = 0; i < 4; ++i)

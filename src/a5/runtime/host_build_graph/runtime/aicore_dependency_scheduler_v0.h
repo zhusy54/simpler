@@ -30,10 +30,26 @@ aicore_task_control_at_v0(__gm__ void *sidecar_base, __gm__ const AicoreWorkerCo
     );
 }
 
-inline __aicore__ void
-aicore_record_scheduler_error_v0(__gm__ AicoreRunControlV0 *run_control, int64_t task_id, AicoreRootStatusV0 status) {
+inline __aicore__ void aicore_record_scheduler_error_v0(
+    __gm__ AicoreRunControlV0 *run_control, int64_t task_id, AicoreRootStatusV0 status,
+    const AicoreReadonlyGraphV0 *graph = nullptr, __gm__ const AicoreWorkerContextV0 *context = nullptr
+) {
+    // Preserve the first failure and publish its diagnostics before the status
+    // flag makes AICPU stop the graph. Concurrent failures must not overwrite
+    // the task id with a less useful secondary symptom.
+    if (aicore_gm_compare_exchange_v0(run_control->reserved[0], UINT64_C(0), UINT64_C(1)) != 0) return;
     aicore_gm_store_v0(run_control->error_task_id, static_cast<uint64_t>(task_id));
-    aicore_gm_store_v0(run_control->classification_error, static_cast<uint64_t>(status));
+    if (graph != nullptr) {
+        aicore_gm_store_v0(run_control->reserved[1], graph->task_count);
+        aicore_gm_store_v0(run_control->reserved[2], graph->descriptors_address);
+        aicore_gm_store_v0(run_control->reserved[3], graph->payloads_address);
+        aicore_gm_store_v0(run_control->reserved[4], graph->task_window_mask);
+    }
+    if (context != nullptr) {
+        aicore_gm_store_v0(run_control->reserved[5], static_cast<uint64_t>(context->physical_core_id));
+        aicore_gm_store_v0(run_control->reserved[6], static_cast<uint64_t>(context->core_type));
+    }
+    aicore_gm_publish_v0(run_control->classification_error, static_cast<uint64_t>(status));
 }
 
 inline __aicore__ AicoreRouteResultV0 aicore_classify_and_route_v0(
@@ -41,7 +57,7 @@ inline __aicore__ AicoreRouteResultV0 aicore_classify_and_route_v0(
     __gm__ AicoreRunControlV0 *run_control, int64_t task_id
 ) {
     if (task_id < 0 || static_cast<uint64_t>(task_id) >= graph.task_count) {
-        aicore_record_scheduler_error_v0(run_control, task_id, AicoreRootStatusV0::INVALID_TASK_ID);
+        aicore_record_scheduler_error_v0(run_control, task_id, AicoreRootStatusV0::INVALID_TASK_ID, &graph, context);
         return AicoreRouteResultV0::ERROR;
     }
     __gm__ AicoreTaskControlV0 *task_control = aicore_task_control_at_v0(sidecar_base, context, task_id);
@@ -52,7 +68,7 @@ inline __aicore__ AicoreRouteResultV0 aicore_classify_and_route_v0(
     AicoreTaskInfoV0 task{};
     AicoreRootStatusV0 status = aicore_classify_task_v0(graph, task_id, &task);
     if (status != AicoreRootStatusV0::OK) {
-        aicore_record_scheduler_error_v0(run_control, task_id, status);
+        aicore_record_scheduler_error_v0(run_control, task_id, status, &graph, context);
         return AicoreRouteResultV0::ERROR;
     }
 
@@ -78,7 +94,7 @@ inline __aicore__ AicoreRouteResultV0 aicore_classify_and_route_v0(
             );
             if (!aicore_ready_queue_push_v0(sidecar_base, queue, task_id)) {
                 aicore_gm_fetch_add_v0(context->ready_queue_full_count, UINT64_C(1));
-                aicore_record_scheduler_error_v0(run_control, task_id, AicoreRootStatusV0::QUEUE_FULL);
+                aicore_record_scheduler_error_v0(run_control, task_id, AicoreRootStatusV0::QUEUE_FULL, &graph, context);
                 return AicoreRouteResultV0::ERROR;
             }
             aicore_gm_fetch_add_v0(context->ready_push_count, UINT64_C(1));
@@ -113,7 +129,7 @@ inline __aicore__ bool aicore_complete_and_wake_v0(
 
     while (waiter >= 0) {
         if (static_cast<uint64_t>(waiter) >= graph.task_count) {
-            aicore_record_scheduler_error_v0(run_control, waiter, AicoreRootStatusV0::INVALID_TASK_ID);
+            aicore_record_scheduler_error_v0(run_control, waiter, AicoreRootStatusV0::INVALID_TASK_ID, &graph, context);
             return false;
         }
         __gm__ AicoreTaskControlV0 *waiter_control = aicore_task_control_at_v0(sidecar_base, context, waiter);

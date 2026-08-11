@@ -176,7 +176,8 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                 static_cast<uint64_t>(task.core_type) != static_cast<uint64_t>(core_type)) {
                 aicore_record_scheduler_error_v0(
                     run_control, task_id,
-                    status == AicoreRootStatusV0::OK ? AicoreRootStatusV0::UNSUPPORTED_SHAPE : status
+                    status == AicoreRootStatusV0::OK ? AicoreRootStatusV0::UNSUPPORTED_SHAPE : status, &graph,
+                    worker_context
                 );
                 break;
             }
@@ -190,7 +191,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                 aicore_sidecar_at_v0<PTO2DispatchPayload>(sidecar_base, worker_context->dispatch_payload_offset);
             status = aicore_materialize_task_payload_v0(graph, task, callable_address, dispatch_payload);
             if (status != AicoreRootStatusV0::OK) {
-                aicore_record_scheduler_error_v0(run_control, task_id, status);
+                aicore_record_scheduler_error_v0(run_control, task_id, status, &graph, worker_context);
                 break;
             }
 
@@ -206,7 +207,9 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             );
             if (!aicore_ready_queue_push_v0(sidecar_base, completion_queue, task_id)) {
                 aicore_gm_fetch_add_v0(worker_context->completion_queue_full_count, UINT64_C(1));
-                aicore_record_scheduler_error_v0(run_control, task_id, AicoreRootStatusV0::QUEUE_FULL);
+                aicore_record_scheduler_error_v0(
+                    run_control, task_id, AicoreRootStatusV0::QUEUE_FULL, &graph, worker_context
+                );
                 break;
             }
             uint64_t completion_end = get_sys_cnt_aicore();

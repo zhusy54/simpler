@@ -1256,6 +1256,24 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
                     completion_pop, worker_executed, worker_resolved, executable_task_count, active_workers,
                     resolver_workers, control->finished_count, control->classification_error
                 );
+                LOG_ERROR(
+                    "A5 HBG AICore scheduler: invalid DEPENDENCY COUNTERS initial_ready=%" PRIu64
+                    " initial_waiting=%" PRIu64 " fanin_scans=%" PRIu64 " fanin_edges=%" PRIu64 " registers=%" PRIu64
+                    " closes=%" PRIu64 " reclassifies=%" PRIu64 " closed_retries=%" PRIu64 " classified=%" PRIu64
+                    "/%" PRIu64,
+                    initial_ready, initial_waiting, fanin_scans, fanin_edges, wake_registers, wake_closes,
+                    wake_reclassifies, wake_closed_retries, control->classified_count, control->resolver_count
+                );
+                if (control->classification_error != 0) {
+                    LOG_ERROR(
+                        "A5 HBG AICore scheduler: first error task=%" PRIu64 " status=%" PRIu64 " core=%" PRIu64
+                        " type=%" PRIu64 " graph_tasks=%" PRIu64 " descriptors=0x%" PRIx64 " payloads=0x%" PRIx64
+                        " mask=0x%" PRIx64,
+                        control->error_task_id, control->classification_error, control->reserved[5],
+                        control->reserved[6], control->reserved[1], control->reserved[2], control->reserved[3],
+                        control->reserved[4]
+                    );
+                }
                 rc = -1;
             } else if (control->expected_task_count != 0) {
                 uint64_t aicore_total_cycles =

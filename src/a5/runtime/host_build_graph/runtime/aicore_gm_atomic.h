@@ -101,6 +101,16 @@ aicore_gm_store_v0(__gm__ volatile uint64_t &value, uint64_t desired, int order 
 #endif
 }
 
+inline __aicore__ void
+aicore_gm_publish_v0(__gm__ volatile uint64_t &value, uint64_t desired, int order = __ATOMIC_RELEASE) {
+#if defined(__CCE_AICORE__)
+    (void)order;
+    (void)atomicExch(const_cast<__gm__ uint64_t *>(&value), desired);
+#else
+    __atomic_store_n(&value, desired, order);
+#endif
+}
+
 inline __aicore__ int64_t
 aicore_gm_exchange_v0(__gm__ volatile int64_t &value, int64_t desired, int order = __ATOMIC_ACQ_REL) {
 #if defined(__CCE_AICORE__)

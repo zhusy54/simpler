@@ -30,6 +30,9 @@ aicore_ready_queue_push_v0(__gm__ void *sidecar_base, __gm__ AicoreReadyQueueV0 
                 aicore_gm_compare_exchange_v0(queue->enqueue_pos, pos, pos + 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
             if (observed == pos) {
                 aicore_gm_store_v0(slot->task_id, task_id, __ATOMIC_RELAXED);
+                // The consumer claims this generation, then waits for task_id
+                // to leave its invalid sentinel. Correctness therefore does
+                // not rely on store-store ordering between these raw-GM writes.
                 aicore_gm_store_v0(slot->sequence, static_cast<int64_t>(pos + 1), __ATOMIC_RELEASE);
                 return true;
             }
@@ -56,7 +59,12 @@ aicore_ready_queue_pop_v0(__gm__ void *sidecar_base, __gm__ AicoreReadyQueueV0 *
             uint64_t observed =
                 aicore_gm_compare_exchange_v0(queue->dequeue_pos, pos, pos + 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
             if (observed == pos) {
-                *task_id = aicore_gm_load_v0(slot->task_id, __ATOMIC_ACQUIRE);
+                int64_t observed_task_id = AICORE_TASK_ID_INVALID_V0;
+                while (observed_task_id < 0) {
+                    observed_task_id = aicore_gm_load_v0(slot->task_id, __ATOMIC_ACQUIRE);
+                }
+                *task_id = observed_task_id;
+                aicore_gm_store_v0(slot->task_id, AICORE_TASK_ID_INVALID_V0, __ATOMIC_RELAXED);
                 aicore_gm_store_v0(slot->sequence, static_cast<int64_t>(pos + queue->capacity), __ATOMIC_RELEASE);
                 return true;
             }
