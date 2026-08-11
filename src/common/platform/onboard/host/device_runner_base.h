@@ -872,7 +872,7 @@ protected:
      * `dep_gen_collector_` + its `dep_gen_replay_emit_deps_json` export)
      * inline their own teardown after calling this helper.
      */
-    void teardown_shared_collectors_after_run();
+    int teardown_shared_collectors_after_run();
 
     /**
      * Shared body of `finalize()`. Each arch subclass's `finalize()`

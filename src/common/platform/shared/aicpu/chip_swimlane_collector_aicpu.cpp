@@ -646,6 +646,15 @@ int chip_swimlane_aicpu_complete_task(
     return 0;
 }
 
+void chip_swimlane_aicpu_set_aicore_counts(int core_id, uint64_t total_record_count, uint64_t dropped_record_count) {
+    if (!g_enable_chip_swimlane || core_id < 0 || core_id >= PLATFORM_MAX_CORES) return;
+    ChipSwimlaneAicoreTaskPool *state = s_aicore_task_pools[core_id];
+    if (state == nullptr) return;
+    state->head.total_record_count = static_cast<uint32_t>(total_record_count);
+    state->head.dropped_record_count = static_cast<uint32_t>(dropped_record_count);
+    wmb();
+}
+
 void chip_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int core_num) {
     if (!g_enable_chip_swimlane) {
         return;

@@ -32,6 +32,9 @@ inline constexpr uint64_t AICORE_SIDECAR_ALIGNMENT_V0 = 128;
 inline constexpr uint64_t AICORE_WORKER_CAPACITY_V0 = 108;
 inline constexpr int64_t AICORE_TASK_ID_INVALID_V0 = -1;
 inline constexpr int64_t AICORE_WAKE_LIST_CLOSED_V0 = -2;
+inline constexpr uint32_t AICORE_PROFILE_ATTEMPTED_INDEX_V0 = 0;
+inline constexpr uint32_t AICORE_PROFILE_WRITTEN_INDEX_V0 = 1;
+inline constexpr uint32_t AICORE_PROFILE_DROPPED_INDEX_V0 = 2;
 
 enum class AicoreRunPhaseV0 : uint64_t {
     ATTACH = 0,

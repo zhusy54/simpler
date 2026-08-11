@@ -62,8 +62,8 @@ static_assert(
 // Byte offsets into PTO2TaskPayload used by AICore to materialize args[] on the
 // not_ready (early-dispatch) path. The AICore .o does not include
 // pto_runtime2_types.h, so it reads tensor_count / scalar_count / tensors[] /
-// scalars[] through these constants. The AICPU side (scheduler_dispatch.cpp)
-// static_asserts them against offsetof where the full struct is visible, so any
+// scalars[] through these constants. The graph-view header static_asserts them
+// against offsetof where the full struct is visible, so any
 // PTO2TaskPayload layout drift fails the build rather than corrupting args[].
 constexpr uint32_t PTO2_TASKPAYLOAD_TENSOR_COUNT_OFFSET = 0;
 constexpr uint32_t PTO2_TASKPAYLOAD_SCALAR_COUNT_OFFSET = 4;
@@ -75,9 +75,8 @@ constexpr uint32_t PTO2_TASKPAYLOAD_TENSOR_STRIDE = 128;  // sizeof(ChipTensor)
 /**
  * Per-core dispatch payload: function address + args[] + SPMD context.
  *
- * AICPU maintains a static array s_payload_per_core[RUNTIME_MAX_WORKER].
- * AICore caches a pointer to its per-core slot at startup (via Handshake.task)
- * and reads from it on each dispatch.
+ * Each AICore worker owns one payload slot in the execution sidecar and
+ * materializes it immediately before kernel execution.
  *
  * The struct is cache-line aligned to prevent false sharing across
  * concurrently dispatched cores.

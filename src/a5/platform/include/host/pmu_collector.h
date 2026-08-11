@@ -230,6 +230,7 @@ public:
         const PmuAllocCallback &alloc_cb, PmuRegisterCallback register_cb, const PmuFreeCallback &free_cb, int device_id
     );
 
+    // NOLINTNEXTLINE(bugprone-derived-method-shadowing-base-method) -- CRTP hook intentionally specializes start().
     void start(const profiling_common::ThreadFactory &thread_factory);
 
     /**
@@ -346,7 +347,7 @@ inline PmuEventType resolve_pmu_event_type(int requested_event_type) {
     if (pmu_env == nullptr) {
         return resolved;
     }
-    int val = std::atoi(pmu_env);
+    int val = std::atoi(pmu_env);  // NOLINT(bugprone-unchecked-string-to-number-conversion)
     if (val > 0 && pmu_resolve_event_config_a5(static_cast<PmuEventType>(val)) != nullptr) {
         resolved = static_cast<PmuEventType>(val);
         LOG_INFO("PMU event type set to %u from SIMPLER_PMU_EVENT_TYPE", static_cast<uint32_t>(resolved));

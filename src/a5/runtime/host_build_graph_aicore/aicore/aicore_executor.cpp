@@ -10,8 +10,10 @@
  */
 
 #include "aicore/aicore.h"
+#include "aicore/aicore_profiling_state.h"
 #include "common/platform_config.h"
 #include "aicore_dependency_scheduler_v0.h"
+#include "aicore_task_profiling_v0.h"
 #include "pto2_dispatch_payload.h"
 #include "runtime.h"
 
@@ -56,6 +58,13 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     worker_context->physical_core_id = static_cast<int32_t>(my_hank->physical_core_id);
     worker_context->core_type = static_cast<int32_t>(core_type);
     publish_worker_config(worker_context);
+
+    const bool chip_swimlane_enabled =
+        SIMPLER_GET_DFX_FLAG(get_aicore_profiling_flag(), SIMPLER_DFX_FLAG_CHIP_SWIMLANE);
+    AicoreTaskProfilingStateV0 task_profiling{};
+    aicore_task_profiling_init_v0(
+        &task_profiling, chip_swimlane_enabled, chip_swimlane_enabled ? get_chip_swimlane_aicore_head() : nullptr
+    );
 
     __gm__ void *sidecar_base = reinterpret_cast<__gm__ void *>(worker_context->sidecar_base_address);
     __gm__ AicoreRunControlV0 *run_control =
@@ -150,6 +159,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             }
 
             aicore_gm_fetch_add_v0(worker_context->ready_pop_count, UINT64_C(1));
+            uint64_t receive_time = chip_swimlane_enabled ? get_sys_cnt_aicore() : 0;
             uint64_t payload_start = get_sys_cnt_aicore();
             aicore_observe_data_cache_v0(aicore_graph_descriptor_v0(graph, task_id));
             AicoreTaskInfoV0 task{};
@@ -177,10 +187,15 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             }
 
             OUT_OF_ORDER_STORE_BARRIER();
+            __gm__ ChipSwimlaneAicoreTaskRecord *profile_record =
+                aicore_task_profiling_reserve_v0(&task_profiling, worker_context);
             uint64_t kernel_start = get_sys_cnt_aicore();
             execute_task(dispatch_payload);
             uint64_t kernel_end = get_sys_cnt_aicore();
             aicore_publish_data_cache_v0(dispatch_payload);
+            aicore_task_profiling_commit_v0(
+                profile_record, worker_context, static_cast<uint64_t>(task_id), receive_time, kernel_start, kernel_end
+            );
             if (!aicore_ready_queue_push_v0(sidecar_base, completion_queue, task_id)) {
                 aicore_gm_fetch_add_v0(worker_context->completion_queue_full_count, UINT64_C(1));
                 aicore_record_scheduler_error_v0(run_control, task_id, AicoreRootStatusV0::QUEUE_FULL);

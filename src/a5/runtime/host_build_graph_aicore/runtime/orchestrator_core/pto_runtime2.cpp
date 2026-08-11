@@ -110,6 +110,7 @@ void rt_orchestration_done(PTO2Runtime *rt) { rt->orchestrator.mark_done(); }
 
 static bool is_fatal_impl(PTO2Runtime *rt) { return rt->orchestrator.fatal; }
 
+// NOLINTNEXTLINE(modernize-avoid-variadic-functions) -- runtime ops expose a printf-style fatal callback.
 void rt_report_fatal(PTO2Runtime *rt, int32_t error_code, const char *func, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
@@ -194,7 +195,7 @@ wait_for_tensor_ready(PTO2Runtime *rt, const ChipTensor &tensor, bool wait_for_c
                     orch.report_fatal(
                         PTO2_ERROR_TENSOR_WAIT_TIMEOUT, caller,
                         "Timeout (%llu cycles): producer (ring=%d, local=%d) not completed",
-                        (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id
+                        static_cast<unsigned long long>(PTO2_TENSOR_DATA_TIMEOUT_CYCLES), ring_id, local_id
                     );
                     failed = true;
                     return;
@@ -226,7 +227,7 @@ wait_for_tensor_ready(PTO2Runtime *rt, const ChipTensor &tensor, bool wait_for_c
                     orch.report_fatal(
                         PTO2_ERROR_TENSOR_WAIT_TIMEOUT, caller,
                         "Timeout (%llu cycles): consumers of producer (ring=%d, local=%d) not done",
-                        (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id
+                        static_cast<unsigned long long>(PTO2_TENSOR_DATA_TIMEOUT_CYCLES), ring_id, local_id
                     );
                     failed = true;
                     return;
@@ -304,7 +305,7 @@ uint64_t get_tensor_data(PTO2Runtime *rt, const ChipTensor &tensor, uint32_t ndi
             PTO2_ERROR_INVALID_ARGS, __FUNCTION__,
             "no host view for device address %#llx (%llu bytes): during host orchestration only tensors the "
             "runtime staged are readable, not runtime-created or child-memory buffers",
-            (unsigned long long)elem_addr, (unsigned long long)elem_size
+            static_cast<unsigned long long>(elem_addr), static_cast<unsigned long long>(elem_size)
         );
         return 0;
     }
@@ -335,7 +336,7 @@ void set_tensor_data(
             PTO2_ERROR_INVALID_ARGS, __FUNCTION__,
             "no writable host view for device address %#llx (%llu bytes): during host orchestration only tensors "
             "the runtime staged are writable, not runtime-created or child-memory buffers",
-            (unsigned long long)elem_addr, (unsigned long long)elem_size
+            static_cast<unsigned long long>(elem_addr), static_cast<unsigned long long>(elem_size)
         );
     }
 }
@@ -377,14 +378,14 @@ static const PTO2RuntimeOps s_runtime_ops = {
 };
 
 // =============================================================================
-// Runtime Lifecycle (AICPU-only fixup)
+// Runtime Lifecycle (host graph finalization)
 // =============================================================================
 //
 // Layout / init_data / wire / destroy live in
 // runtime/shared/pto_runtime2_init.cpp so the host build can pre-populate the
 // prebuilt arena image. The pieces below — wiring the ops table and the
-// SPMD core counts — depend on the device-side s_runtime_ops global and the
-// AICPU SchedulerContext respectively, so they remain in the AICPU build.
+// The host binds the runtime ops table and records the topology counts before
+// uploading the graph image.
 
 void runtime_finalize_after_wire(PTO2Runtime *rt, int32_t aic_count, int32_t aiv_count) {
     rt->ops = &s_runtime_ops;

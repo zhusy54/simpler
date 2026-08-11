@@ -12,6 +12,7 @@
 #include "inner_kernel.h"
 #undef OUT_OF_ORDER_STORE_BARRIER
 #include "aicore/chip_swimlane_collector_aicore.h"
+#include "aicore_task_profiling_v0.h"
 
 #include <gtest/gtest.h>
 
@@ -44,4 +45,26 @@ TEST(ChipSwimlaneAicoreTest, CommitUsesReservedBufferGeneration) {
 
     ChipSwimlaneAicoreTaskRecord *next = chip_swimlane_aicore_reserve_task_record(&head, &local);
     EXPECT_EQ(next, &second.records[0]);
+}
+
+TEST(ChipSwimlaneAicoreTest, SidecarCountsOverflowWithoutWritingPastCapacity) {
+    ChipSwimlaneAicoreTaskBuffer buffer{};
+    ChipSwimlaneActiveHead head{};
+    head.current_buf_ptr = reinterpret_cast<uint64_t>(&buffer);
+    head.current_buf_seq = 0;
+
+    AicoreWorkerContextV0 worker{};
+    AicoreTaskProfilingStateV0 profiling{};
+    aicore_task_profiling_init_v0(&profiling, true, &head);
+    for (uint32_t task_id = 0; task_id < PLATFORM_AICORE_BUFFER_SIZE; ++task_id) {
+        auto *record = aicore_task_profiling_reserve_v0(&profiling, &worker);
+        ASSERT_NE(record, nullptr);
+        aicore_task_profiling_commit_v0(record, &worker, task_id, 10 + task_id, 20 + task_id, 30 + task_id);
+    }
+
+    EXPECT_EQ(aicore_task_profiling_reserve_v0(&profiling, &worker), nullptr);
+    EXPECT_EQ(worker.dfx_reserved[AICORE_PROFILE_ATTEMPTED_INDEX_V0], PLATFORM_AICORE_BUFFER_SIZE + 1);
+    EXPECT_EQ(worker.dfx_reserved[AICORE_PROFILE_WRITTEN_INDEX_V0], PLATFORM_AICORE_BUFFER_SIZE);
+    EXPECT_EQ(worker.dfx_reserved[AICORE_PROFILE_DROPPED_INDEX_V0], 1u);
+    EXPECT_EQ(buffer.records[PLATFORM_AICORE_BUFFER_SIZE - 1].task_token_raw, PLATFORM_AICORE_BUFFER_SIZE - 1);
 }

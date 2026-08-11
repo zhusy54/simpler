@@ -9,6 +9,9 @@
 # -----------------------------------------------------------------------------------------------------------
 """Manual M1 gates for one dependency-free AIC or AIV root."""
 
+import json
+from pathlib import Path
+
 import torch
 from simpler.task_interface import ArgDirection as D
 
@@ -51,6 +54,28 @@ class TestHbgAicoreSingleAicRoot(SceneTestCase):
 
     def compute_golden(self, args, params):
         args.out[0] = 42.0
+
+    def _build_config(self, config_dict, *args, **kwargs):
+        config = super()._build_config(config_dict, *args, **kwargs)
+        self._profiling_level = int(kwargs.get("enable_chip_swimlane", args[0] if args else 0))
+        output_prefix = kwargs.get("output_prefix", "")
+        self._profiling_path = Path(output_prefix) / "chip_swimlane_records.json" if output_prefix else None
+        return config
+
+    def compare_outputs(self, test_args, golden_args, output_names, params):
+        super().compare_outputs(test_args, golden_args, output_names, params)
+        if getattr(self, "_profiling_level", 0) == 0:
+            return
+        assert self._profiling_level == 1
+        path = self._profiling_path
+        assert path is not None and path.exists()
+        with path.open() as f:
+            capture = json.load(f)
+        assert capture["chip_swimlane_level"] == 1
+        assert len(capture["aicore_tasks"]) == 1
+        assert capture["aicpu_tasks"] == []
+        assert not any("phase" in key for key in capture)
+        assert not Path(f"{path}.tmp").exists()
 
 
 @scene_test(level=2, runtime="host_build_graph_aicore")

@@ -20,24 +20,11 @@
 #include <sys/mman.h>
 #endif
 
-#include "aicpu/device_time.h"
-#include "aicpu/device_phase_aicpu.h"
+#include "aicore_lifecycle.h"
 #include "aicpu/cache_maintenance.h"
-#include "callable_protocol.h"
-#include "pto2_dispatch_payload.h"
 #include "runtime.h"
 #include "spin_hint.h"
 
-// Runtime headers (full struct definition for create/destroy + PTO2_SCOPE)
-#include "pto_runtime2.h"
-#include "pto_runtime2_types.h"
-#include "pto_shared_memory.h"
-
-// Performance profiling headers
-#include "aicpu/chip_swimlane_collector_aicpu.h"
-#include "aicpu/scope_stats_collector_aicpu.h"
-#include "aicpu/args_dump_aicpu.h"
-#include "common/chip_swimlane_profiling.h"
 #include "common/unified_log.h"
 
 // Register-based communication
@@ -45,34 +32,6 @@
 #include "aicpu/platform_regs.h"
 #include "common/platform_config.h"
 #include "utils/thread_completion_gate.h"
-
-// Core type definitions
-#include "common/core_type.h"
-
-// CoreCallable for resolved dispatch address
-#include "callable.h"
-
-// Scheduler data structures (CoreExecState, CoreTracker, etc.)
-#include "scheduler/scheduler_types.h"
-
-// Scheduler context class
-#include "scheduler/scheduler_context.h"
-
-static int32_t read_pto2_runtime_status(Runtime *runtime) {
-    if (runtime == nullptr) {
-        return 0;
-    }
-
-    void *sm = runtime->get_gm_sm_ptr();
-    if (sm == nullptr) {
-        return 0;
-    }
-
-    auto *header = static_cast<PTO2SharedMemoryHeader *>(sm);
-    int32_t orch_error_code = header->orch_error_code.load(std::memory_order_acquire);
-    int32_t sched_error_code = header->sched_error_code.load(std::memory_order_acquire);
-    return runtime_status_from_error_codes(orch_error_code, sched_error_code);
-}
 
 struct AicpuExecutor {
     // ===== Thread management state =====
@@ -92,13 +51,12 @@ struct AicpuExecutor {
 
     int32_t aicpu_thread_num_{0};
 
-    // ===== Task queue state (managed by scheduler ready queues) =====
-
     simpler::ThreadCompletionGate completion_gate_;
     std::atomic<bool> runtime_init_ready_{false};
 
-    // ===== Scheduler context (owns all dispatch/completion/drain state) =====
-    SchedulerContext sched_ctx_;
+    // AICPU owns only the AICore launch/teardown lifecycle. AICore owns graph
+    // dependency resolution, ready/completion queues, and task execution.
+    AicoreLifecycle aicore_lifecycle_;
 
     // ===== Methods =====
     int32_t init(Runtime *runtime);
@@ -124,7 +82,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     // after a barrier. Non-leaders spin on init_done_.
     int32_t nthreads = runtime->aicpu_thread_num;
     if (nthreads == 0) nthreads = 1;
-    if (nthreads < 1 || nthreads > MAX_AICPU_THREADS) {
+    if (nthreads < 1 || nthreads > PLATFORM_MAX_AICPU_THREADS) {
         LOG_ERROR("Invalid aicpu_thread_num: %d", nthreads);
         init_failed_.store(true, std::memory_order_release);
         return -1;
@@ -135,7 +93,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     // thread — hand those a distinct index from a counter (mirrors run()'s
     // thread_idx_++ fallback) instead of collapsing them all to leader 0, which
     // would run pre_/post_handshake_init on every thread and race the shared
-    // scheduler state. Exactly nthreads threads reach init (the gate drops the
+    // lifecycle state. Exactly nthreads threads reach init (the gate drops the
     // rest), so the counter yields a gap-free [0, nthreads).
     int32_t tidx = platform_aicpu_affinity_thread_idx();
     if (tidx < 0) tidx = hs_thread_seq_.fetch_add(1, std::memory_order_acq_rel);
@@ -157,7 +115,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         aicpu_thread_num_ = nthreads;
 
         hs_arrived_.store(0, std::memory_order_relaxed);
-        if (sched_ctx_.pre_handshake_init(runtime, aicpu_thread_num_, get_platform_regs()) != 0) {
+        if (aicore_lifecycle_.pre_handshake_init(runtime, aicpu_thread_num_, get_platform_regs()) != 0) {
             init_failed_.store(true, std::memory_order_release);
             hs_setup_done_.store(true, std::memory_order_release);
             return -1;
@@ -171,14 +129,14 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     }
 
     // All threads: handshake this thread's slice of cores in parallel.
-    sched_ctx_.handshake_partition(runtime, tidx, nthreads);
+    aicore_lifecycle_.handshake_partition(runtime, tidx, nthreads);
 
     // Barrier: leader waits for every slice to finish, then completes init.
     hs_arrived_.fetch_add(1, std::memory_order_acq_rel);
     if (is_leader) {
         while (hs_arrived_.load(std::memory_order_acquire) < nthreads) {}
         completion_gate_.reset();
-        if (sched_ctx_.post_handshake_init(runtime) != 0) {
+        if (aicore_lifecycle_.post_handshake_init(runtime) != 0) {
             init_failed_.store(true, std::memory_order_release);
             init_done_.store(true, std::memory_order_release);
             return -1;
@@ -200,10 +158,10 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
 int32_t AicpuExecutor::run(Runtime *runtime) {
     int32_t affinity_exec_idx = platform_aicpu_affinity_thread_idx();
     int32_t thread_idx = (affinity_exec_idx >= 0) ? affinity_exec_idx : (thread_idx_++);
-    if (thread_idx < 0 || thread_idx >= aicpu_thread_num_ || thread_idx >= MAX_AICPU_THREADS) {
+    if (thread_idx < 0 || thread_idx >= aicpu_thread_num_ || thread_idx >= PLATFORM_MAX_AICPU_THREADS) {
         LOG_ERROR(
             "Thread index %d out of bounds (active=%d max=%d exec_idx=%d)", thread_idx, aicpu_thread_num_,
-            MAX_AICPU_THREADS, affinity_exec_idx
+            PLATFORM_MAX_AICPU_THREADS, affinity_exec_idx
         );
         return -1;
     }
@@ -335,11 +293,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             SPIN_WAIT_HINT();
     }
 
-    int32_t m0_shutdown_rc = sched_ctx_.shutdown(thread_idx);
+    int32_t m0_shutdown_rc = aicore_lifecycle_.shutdown(thread_idx, runtime);
     if (m0_shutdown_rc != 0 && run_rc == 0) run_rc = m0_shutdown_rc;
-    completion_gate_.arrive_and_finalize_if_last(aicpu_thread_num_, [&] {
-        aicpu_publish_task_timing_tail_usage(aicpu_thread_num_);
-    });
+    completion_gate_.arrive_and_finalize_if_last(aicpu_thread_num_, [] {});
     return run_rc;
 }
 
@@ -349,8 +305,7 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     //    bypasses this cache. Invalidating now ensures next round reads from HBM.
     cache_invalidate_range(runtime, sizeof(Runtime));
 
-    // Reset all SchedulerContext-owned state in one place.
-    sched_ctx_.deinit();
+    aicore_lifecycle_.deinit();
 
     completion_gate_.reset();
     runtime_init_ready_.store(false, std::memory_order_release);
@@ -417,17 +372,10 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
         LOG_ERROR("aicpu_execute: Thread execution failed with rc=%d", rc);
     }
 
-    int32_t runtime_rc = read_pto2_runtime_status(runtime);
-
     // The finalizer publishes cleanup eligibility only after runtime destruction.
     if (g_aicpu_executor.completion_gate_.claim_cleanup()) {
         LOG_INFO("aicpu_execute: All threads finished, cleaning up");
         g_aicpu_executor.deinit(runtime);
-    }
-
-    if (runtime_rc != 0) {
-        LOG_ERROR("aicpu_execute: PTO2 runtime failed with rc=%d", runtime_rc);
-        return runtime_rc;
     }
 
     if (rc != 0) {

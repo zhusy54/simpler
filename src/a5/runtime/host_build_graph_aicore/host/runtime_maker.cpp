@@ -62,6 +62,7 @@
 #include "../../../../common/worker/pto_runtime_c_api.h"
 #include "callable.h"
 #include "common/platform_config.h"
+#include "common/chip_swimlane_policy.h"
 #include "common/unified_log.h"
 #include "utils/device_arena.h"
 #include "prepare_callable_common.h"
@@ -90,6 +91,14 @@ extern "C" int concurrent_native_prepare_supported_impl(void) {
     // the sequential path until their state is per-epoch.
     return 1;
 }
+
+extern "C" int validate_chip_swimlane_level_impl(int32_t level) {
+    if (level == 0 || level == static_cast<int32_t>(ChipSwimlaneLevel::AICORE_TIMING)) return 0;
+    LOG_ERROR("HBG-AICore supports enable_chip_swimlane values 0 and 1 only, got %d", level);
+    return -1;
+}
+
+extern "C" bool strict_chip_swimlane_validation_impl() { return true; }
 
 // RuntimeEnv (call_config.h) is the cross-runtime ABI for per-ring config and
 // carries RUNTIME_ENV_RING_COUNT slots, shared with tensormap_and_ringbuffer.
@@ -1119,12 +1128,13 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
 
     LOG_INFO("ChipTensor pairs to process: %d", tensor_pair_count);
 
-    bool skip_tensor_copy_back = execution_rc != 0;
+    const bool profiling_only_failure = execution_rc == SIMPLER_PROFILING_VALIDATION_ERROR;
+    bool skip_tensor_copy_back = execution_rc != 0 && !profiling_only_failure;
     int32_t runtime_status = 0;
     PTO2SharedMemoryHeader host_header;
     memset(&host_header, 0, sizeof(host_header));
 
-    if (execution_rc != 0) {
+    if (execution_rc != 0 && !profiling_only_failure) {
         runtime_status = pto2_read_runtime_status(runtime, api, &host_header);
     }
     if (runtime_status != 0) {
@@ -1329,6 +1339,9 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
 
     if (rc == 0 && runtime_status != 0) {
         rc = runtime_status;
+    }
+    if (rc == 0 && profiling_only_failure) {
+        rc = execution_rc;
     }
 
     return rc;
