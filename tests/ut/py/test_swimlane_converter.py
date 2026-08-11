@@ -137,6 +137,68 @@ def test_task_statistics_level_one_hides_aicpu_metrics(capsys):
     assert "Total Test Time" not in output
 
 
+def test_level_one_aicore_resolve_phases_render_on_resolver_lanes(tmp_path):
+    input_path = tmp_path / "chip_swimlane_records.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "chip_swimlane_level": 1,
+                "metadata": {
+                    "clock_freq_hz": 1_000_000,
+                    "num_cores": 2,
+                    "core_types": ["aic", "aiv"],
+                },
+                "aicore_tasks": [[0, 7, 7, 110, 125, 5]],
+                "aicore_resolve_phases": [[1, 7, 130, 145]],
+                "aicpu_tasks": [],
+            }
+        )
+    )
+
+    parsed = sc.read_perf_data(input_path)
+
+    assert parsed["aicore_resolve_phases"] == [
+        {
+            "core_id": 1,
+            "core_type": "aiv",
+            "task_id": 7,
+            "start_time_us": 25.0,
+            "end_time_us": 40.0,
+            "duration_us": 15.0,
+        }
+    ]
+
+    output_path = tmp_path / "merged_swimlane.json"
+    sc.generate_chrome_trace_json(
+        parsed["tasks"],
+        str(output_path),
+        aicore_resolve_phases=parsed["aicore_resolve_phases"],
+    )
+    events = json.loads(output_path.read_text())["traceEvents"]
+    assert any(
+        event.get("ph") == "M"
+        and event.get("pid") == 4
+        and event.get("tid") == _core_tid(1) + 1
+        and event.get("args", {}).get("name") == "AIV_1 Resolve"
+        for event in events
+    )
+    assert next(event for event in events if event.get("name") == "resolve(t7)") == {
+        "args": {
+            "event-hint": "Resolve Task:t7, CoreId:1",
+            "taskId": 7,
+            "duration-us": 15.0,
+        },
+        "cat": "dependency",
+        "cname": "vsync_highlight_color",
+        "name": "resolve(t7)",
+        "ph": "X",
+        "pid": 4,
+        "tid": _core_tid(1) + 1,
+        "ts": 25.0,
+        "dur": 15.0,
+    }
+
+
 def test_load_func_names_auto_discovery_and_explicit_precedence(tmp_path):
     input_path = tmp_path / "chip_swimlane_records.json"
     name_map_path = tmp_path / "name_map_case.json"

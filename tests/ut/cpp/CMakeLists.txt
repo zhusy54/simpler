@@ -622,9 +622,12 @@ add_executable(test_chip_swimlane_aicore
 )
 target_include_directories(test_chip_swimlane_aicore PRIVATE
     ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/host_build_graph/runtime
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/host_build_graph/common
     ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/sim/aicore
     ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/include
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
 )
 target_link_libraries(test_chip_swimlane_aicore PRIVATE
     ${GTEST_MAIN_LIB}
@@ -633,6 +636,28 @@ target_link_libraries(test_chip_swimlane_aicore PRIVATE
 )
 add_test(NAME test_chip_swimlane_aicore COMMAND test_chip_swimlane_aicore)
 set_tests_properties(test_chip_swimlane_aicore PROPERTIES LABELS "no_hardware")
+
+add_executable(test_chip_swimlane_collector
+    common/test_chip_swimlane_collector.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/chip_swimlane_collector.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/sim/host/profiling_copy.cpp
+    ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
+)
+target_include_directories(test_chip_swimlane_collector PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+)
+target_link_libraries(test_chip_swimlane_collector PRIVATE
+    ${GTEST_MAIN_LIB}
+    ${GTEST_LIB}
+    pthread
+)
+add_test(NAME test_chip_swimlane_collector COMMAND test_chip_swimlane_collector)
+set_tests_properties(test_chip_swimlane_collector PROPERTIES LABELS "no_hardware")
 
 # AICPU-side dep_gen writer. The shared-memory layout is byte-identical across
 # platforms, so compiling against a2a3's platform_config covers a5 too.
@@ -758,7 +783,7 @@ target_sources(test_hbg_submit_poison PRIVATE
     ${HBG_RUNTIME_DIR}/shared/runtime.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
 )
-add_a5_hbg_runtime_test(test_a5_hbg_core_tracker common/test_hbg_core_tracker.cpp)
+add_a5_hbg_runtime_test(test_a5_hbg_sidecar a5/test_aicore_sidecar_v0.cpp)
 add_a2a3_hbg_runtime_test(test_graph_cache a2a3/test_graph_cache.cpp)
 target_sources(test_graph_cache PRIVATE
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/host_build_graph/runtime/scheduler/graph_execution.cpp
