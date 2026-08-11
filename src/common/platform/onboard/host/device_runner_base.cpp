@@ -37,6 +37,7 @@
 #include "call_config.h"
 #include "chip_callable_layout.h"
 #include "common/core_type.h"
+#include "common/chip_swimlane_policy.h"
 #include "common/host_api.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
@@ -1037,6 +1038,9 @@ extern "C" __attribute__((weak)) int prewarm_config_impl(
     return 0;
 }
 
+extern "C" __attribute__((weak)) int validate_chip_swimlane_level_impl(int32_t) { return 0; }
+extern "C" __attribute__((weak)) bool strict_chip_swimlane_validation_impl() { return false; }
+
 void DeviceRunnerBase::apply_call_config(const CallConfig &config) {
     set_chip_swimlane_enabled(config.enable_chip_swimlane);
     set_dump_args_enabled(config.enable_dump_args);
@@ -1576,7 +1580,8 @@ void DeviceRunnerBase::start_shared_collectors_for_run() {
     }
 }
 
-void DeviceRunnerBase::teardown_shared_collectors_after_run() {
+int DeviceRunnerBase::teardown_shared_collectors_after_run() {
+    int profiling_rc = 0;
     // Tear down collectors. stop() joins mgmt then collector in the only safe
     // order (mgmt's final-drain pass into L2 has poll as its consumer).
     // Diagnostic exports use the per-task `output_prefix_` directory the user
@@ -1584,8 +1589,11 @@ void DeviceRunnerBase::teardown_shared_collectors_after_run() {
     if (enable_chip_swimlane_) {
         chip_swimlane_collector_.stop();
         chip_swimlane_collector_.read_phase_header_metadata();
-        chip_swimlane_collector_.reconcile_counters();
-        chip_swimlane_collector_.export_swimlane_json();
+        const bool counters_ok = chip_swimlane_collector_.reconcile_counters();
+        const int export_rc = chip_swimlane_collector_.export_swimlane_json();
+        if (strict_chip_swimlane_validation_impl() && (!counters_ok || export_rc != 0)) {
+            profiling_rc = SIMPLER_PROFILING_VALIDATION_ERROR;
+        }
     }
 
     if (enable_dump_args_) {
@@ -1604,6 +1612,7 @@ void DeviceRunnerBase::teardown_shared_collectors_after_run() {
         scope_stats_collector_.reconcile_counters();
         scope_stats_collector_.write_jsonl(output_prefix_);
     }
+    return profiling_rc;
 }
 
 bool DeviceRunnerBase::try_acquire_native_run(

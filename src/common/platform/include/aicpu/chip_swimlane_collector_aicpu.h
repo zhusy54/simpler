@@ -154,6 +154,15 @@ int chip_swimlane_aicpu_complete_task(
 );
 
 /**
+ * Publish AICore-owned profiling attempt/drop counters before final flush.
+ *
+ * Runtimes whose AICore workers schedule their own tasks cannot call the
+ * AICPU dispatch hook. They publish the final per-core counters from their
+ * execution sidecar during teardown instead.
+ */
+void chip_swimlane_aicpu_set_aicore_counts(int core_id, uint64_t total_record_count, uint64_t dropped_record_count);
+
+/**
  * Flush remaining performance data
  *
  * Marks non-empty buffers as ready and enqueues them for host collection.

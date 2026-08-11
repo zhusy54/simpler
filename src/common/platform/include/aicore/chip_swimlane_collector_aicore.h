@@ -47,9 +47,9 @@ struct ChipSwimlaneAicoreLocalState {
 /**
  * Reserve the record slot for one task.
  *
- * AICore reserves from the currently-published per-core buffer before ACK.
- * The returned record pointer remains the task's write target after FIN even
- * if AICPU has published the next buffer by then.
+ * AICore reserves from the currently-published per-core buffer before making
+ * task progress visible. The returned record pointer remains the task's write
+ * target even if AICPU publishes the next buffer before commit.
  */
 __aicore__ __attribute__((always_inline)) static inline __gm__ ChipSwimlaneAicoreTaskRecord *
 chip_swimlane_aicore_reserve_task_record(__gm__ ChipSwimlaneActiveHead *head, ChipSwimlaneAicoreLocalState *local) {
@@ -76,8 +76,9 @@ chip_swimlane_aicore_reserve_task_record(__gm__ ChipSwimlaneActiveHead *head, Ch
 /**
  * Commit one task's timestamps and identity to its pre-ACK reservation.
  *
- * `end_time` is captured immediately after execute_task and before FIN. The
- * commit itself runs after FIN and never reads the possibly-rotated head.
+ * `end_time` is captured immediately after execute_task. Commit never reads the
+ * possibly-rotated head and may therefore run on either side of a runtime's
+ * completion signal, subject to that runtime's publication invariant.
  */
 __aicore__ __attribute__((always_inline)) static inline void chip_swimlane_aicore_commit_task_record(
     __gm__ ChipSwimlaneAicoreTaskRecord *record, uint64_t task_token_raw, uint32_t reg_task_id, uint64_t receive_time,

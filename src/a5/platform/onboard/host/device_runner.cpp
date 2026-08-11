@@ -38,6 +38,7 @@
 #include "callable.h"
 #include "callable_protocol.h"
 #include "call_config.h"
+#include "common/chip_swimlane_policy.h"
 #include "utils/elf_build_id.h"
 #include "utils/fnv1a_64.h"
 #include "host/host_regs.h"  // Register address retrieval
@@ -143,6 +144,7 @@ int DeviceRunner::prepare_execution(
     std::unique_ptr<PreparedExecution> *prepared
 ) {
     if (prepared == nullptr || *prepared != nullptr) return -1;
+    if (validate_chip_swimlane_level_impl(config.enable_chip_swimlane) != 0) return -1;
     auto execution = std::make_unique<PreparedExecution>(identity, runtime, config, pipeline_slot);
     execution->resources_owned = true;
     const uint32_t selected_pipeline_slot = pipeline_slot;
@@ -479,7 +481,7 @@ int DeviceRunner::drain_execution(ActiveExecution &active) {
     }
 
     read_device_wall_ns();
-    teardown_shared_collectors_after_run();
+    const int collector_rc = teardown_shared_collectors_after_run();
 
     // a5-specific dep_gen teardown: stop + reconcile + replay emit.
     if (enable_dep_gen_) {
@@ -496,7 +498,7 @@ int DeviceRunner::drain_execution(ActiveExecution &active) {
 
     // Reads device memory, so it must precede KernelArgs/runtime cleanup.
     print_handshake_results(prepared.kernel_args);
-    return 0;
+    return collector_rc;
 }
 
 void DeviceRunner::cleanup_execution(PreparedExecution &prepared, bool launched) noexcept {
@@ -867,6 +869,7 @@ int DeviceRunner::init_chip_swimlane(
         /*register_cb=*/nullptr, free_cb, output_prefix_
     );
     if (rc == 0) {
+        chip_swimlane_collector_.set_strict_validation(strict_chip_swimlane_validation_impl());
         kernel_args.args.chip_swimlane_data_base =
             reinterpret_cast<uint64_t>(chip_swimlane_collector_.get_chip_swimlane_setup_device_ptr());
         kernel_args.args.chip_swimlane_aicore_rotation_table =

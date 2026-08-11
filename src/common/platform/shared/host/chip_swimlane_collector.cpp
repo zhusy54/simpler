@@ -24,6 +24,7 @@
 #include <cassert>
 #include <chrono>
 #include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
@@ -125,6 +126,8 @@ int ChipSwimlaneCollector::initialize(
     total_orch_phase_collected_ = 0;
     has_phase_data_ = false;
     collector_shards_merged_ = false;
+    reconciled_ = false;
+    last_reconcile_ok_ = false;
 
     // Stash the memory context on the base up-front so alloc_paired_buffer
     // sees consistent values during init. shm_host_ stays nullptr until the
@@ -693,11 +696,14 @@ void ChipSwimlaneCollector::on_buffer_collected(const ReadyBufferInfo &info, int
 // clear current_buf_ptr on the device side. Host's job here is purely
 // accounting + sanity check.
 
-void ChipSwimlaneCollector::reconcile_counters() {
+bool ChipSwimlaneCollector::reconcile_counters() {
     if (shm_host_ == nullptr) {
-        return;
+        reconciled_ = true;
+        last_reconcile_ok_ = false;
+        return false;
     }
     merge_collector_shards();
+    bool all_ok = true;
 
     // Refresh the pool states (current_buf_ptr + total/dropped counters) from
     // device before the sanity loop so leftovers reflect post-stop() device
@@ -724,9 +730,10 @@ void ChipSwimlaneCollector::reconcile_counters() {
     // written) are fine; AICPU's flush legitimately skips them.
     auto reconcile_one = [&](const char *kind, const char *unit_name, int unit_count, auto get_state,
                              auto read_buf_count, size_t buf_size, uint64_t collected, bool optional) {
+        bool ok = true;
         int leftover_active = 0;
         for (int i = 0; i < unit_count; i++) {
-            ChipSwimlaneAicpuTaskPool *state = get_state(i);
+            auto *state = get_state(i);
             uint64_t buf_ptr = state->head.current_buf_ptr;
             if (buf_ptr == 0) continue;
             void *host_ptr = manager_.resolve_host_ptr(reinterpret_cast<void *>(buf_ptr));
@@ -748,7 +755,7 @@ void ChipSwimlaneCollector::reconcile_counters() {
         uint64_t total_device = 0;
         uint64_t dropped_device = 0;
         for (int i = 0; i < unit_count; i++) {
-            ChipSwimlaneAicpuTaskPool *state = get_state(i);
+            auto *state = get_state(i);
             total_device += state->head.total_record_count;
             dropped_device += state->head.dropped_record_count;
         }
@@ -756,7 +763,7 @@ void ChipSwimlaneCollector::reconcile_counters() {
         // PHASE counters are populated only by runtimes that actually emit
         // phase records; skip the comparison entirely when nothing happened.
         if (optional && total_device == 0 && collected == 0 && dropped_device == 0) {
-            return;
+            return true;
         }
 
         if (dropped_device > 0) {
@@ -764,6 +771,7 @@ void ChipSwimlaneCollector::reconcile_counters() {
                 "ChipSwimlane reconcile: %lu %s records dropped on device side.",
                 static_cast<unsigned long>(dropped_device), kind
             );
+            ok = false;
         }
         uint64_t accounted = collected + dropped_device;
         if (accounted != total_device) {
@@ -773,6 +781,7 @@ void ChipSwimlaneCollector::reconcile_counters() {
                 kind, static_cast<unsigned long>(collected), static_cast<unsigned long>(dropped_device),
                 static_cast<unsigned long>(total_device), static_cast<long>(total_device) - static_cast<long>(accounted)
             );
+            ok = false;
         } else {
             LOG_INFO(
                 "ChipSwimlane reconcile: %s counts match (collected=%lu, dropped=%lu, device_total=%lu)", kind,
@@ -786,41 +795,75 @@ void ChipSwimlaneCollector::reconcile_counters() {
                 "ChipSwimlane reconcile: %d %s(s) had un-cleared %s current_buf_ptr — see prior errors",
                 leftover_active, unit_name, kind
             );
+            ok = false;
         }
+        return ok;
     };
 
-    reconcile_one(
-        "PERF", "core", num_aicore_,
-        [this](int core_index) {
-            return get_perf_buffer_state(shm_host_, core_index);
-        },
-        [](void *host_ptr) {
-            return reinterpret_cast<ChipSwimlaneAicpuTaskBuffer *>(host_ptr)->count;
-        },
-        sizeof(ChipSwimlaneAicpuTaskBuffer), total_perf_collected_, /*optional=*/false
-    );
+    all_ok = reconcile_one(
+                 "PERF", "core", num_aicore_,
+                 [this](int core_index) {
+                     return get_perf_buffer_state(shm_host_, core_index);
+                 },
+                 [](void *host_ptr) {
+                     return reinterpret_cast<ChipSwimlaneAicpuTaskBuffer *>(host_ptr)->count;
+                 },
+                 sizeof(ChipSwimlaneAicpuTaskBuffer), total_perf_collected_, /*optional=*/false
+             ) &&
+             all_ok;
 
-    reconcile_one(
-        "SCHED_PHASE", "thread", PLATFORM_MAX_AICPU_THREADS,
-        [this](int thread_index) {
-            return get_sched_phase_buffer_state(shm_host_, num_aicore_, thread_index);
-        },
-        [](void *host_ptr) {
-            return reinterpret_cast<ChipSwimlaneAicpuSchedPhaseBuffer *>(host_ptr)->count;
-        },
-        sizeof(ChipSwimlaneAicpuSchedPhaseBuffer), total_sched_phase_collected_, /*optional=*/true
-    );
+    uint64_t total_aicore_collected = 0;
+    for (const auto &records : collected_aicore_records_) {
+        total_aicore_collected += records.size();
+        for (const auto &record : records) {
+            if (record.start_time == 0 || record.end_time < record.start_time) {
+                LOG_ERROR(
+                    "ChipSwimlane reconcile: invalid AICore record task=%lu start=%lu end=%lu",
+                    static_cast<unsigned long>(record.task_token_raw), static_cast<unsigned long>(record.start_time),
+                    static_cast<unsigned long>(record.end_time)
+                );
+                all_ok = false;
+            }
+        }
+    }
+    all_ok = reconcile_one(
+                 "AICORE", "core", num_aicore_,
+                 [this](int core_index) {
+                     return get_aicore_buffer_state(shm_host_, num_aicore_, core_index);
+                 },
+                 [](void *host_ptr) {
+                     return reinterpret_cast<ChipSwimlaneAicoreTaskBuffer *>(host_ptr)->count;
+                 },
+                 sizeof(ChipSwimlaneAicoreTaskBuffer), total_aicore_collected, /*optional=*/false
+             ) &&
+             all_ok;
 
-    reconcile_one(
-        "ORCH_PHASE", "thread", PLATFORM_MAX_AICPU_THREADS,
-        [this](int thread_index) {
-            return get_orch_phase_buffer_state(shm_host_, num_aicore_, thread_index);
-        },
-        [](void *host_ptr) {
-            return reinterpret_cast<ChipSwimlaneAicpuOrchPhaseBuffer *>(host_ptr)->count;
-        },
-        sizeof(ChipSwimlaneAicpuOrchPhaseBuffer), total_orch_phase_collected_, /*optional=*/true
-    );
+    all_ok = reconcile_one(
+                 "SCHED_PHASE", "thread", PLATFORM_MAX_AICPU_THREADS,
+                 [this](int thread_index) {
+                     return get_sched_phase_buffer_state(shm_host_, num_aicore_, thread_index);
+                 },
+                 [](void *host_ptr) {
+                     return reinterpret_cast<ChipSwimlaneAicpuSchedPhaseBuffer *>(host_ptr)->count;
+                 },
+                 sizeof(ChipSwimlaneAicpuSchedPhaseBuffer), total_sched_phase_collected_, /*optional=*/true
+             ) &&
+             all_ok;
+
+    all_ok = reconcile_one(
+                 "ORCH_PHASE", "thread", PLATFORM_MAX_AICPU_THREADS,
+                 [this](int thread_index) {
+                     return get_orch_phase_buffer_state(shm_host_, num_aicore_, thread_index);
+                 },
+                 [](void *host_ptr) {
+                     return reinterpret_cast<ChipSwimlaneAicpuOrchPhaseBuffer *>(host_ptr)->count;
+                 },
+                 sizeof(ChipSwimlaneAicpuOrchPhaseBuffer), total_orch_phase_collected_, /*optional=*/true
+             ) &&
+             all_ok;
+    reconciled_ = true;
+    last_reconcile_ok_ = all_ok;
+    return all_ok;
 }
 
 void ChipSwimlaneCollector::read_phase_header_metadata() {
@@ -908,6 +951,22 @@ int ChipSwimlaneCollector::export_swimlane_json() {
     }
     merge_collector_shards();
 
+    const std::string filepath = output_prefix_ + "/chip_swimlane_records.json";
+    const std::string temp_filepath = filepath + ".tmp";
+    auto discard_artifacts = [&]() {
+        std::error_code remove_ec;
+        std::filesystem::remove(temp_filepath, remove_ec);
+        if (strict_validation_) {
+            remove_ec.clear();
+            std::filesystem::remove(filepath, remove_ec);
+        }
+    };
+    if (strict_validation_ && (!reconciled_ || !last_reconcile_ok_)) {
+        LOG_ERROR("ChipSwimlane export refused because strict reconciliation failed");
+        discard_artifacts();
+        return -1;
+    }
+
     // Empty-export guard: nothing useful on disk if every per-stream source is
     // empty. AICPU_TIMING+ relies on `collected_perf_records_`; AICORE_TIMING
     // (level=1) relies on `collected_aicore_records_` alone.
@@ -928,6 +987,7 @@ int ChipSwimlaneCollector::export_swimlane_json() {
     }
     if (!has_any_records) {
         LOG_WARN("Warning: No performance data to export.");
+        discard_artifacts();
         return -1;
     }
 
@@ -935,13 +995,14 @@ int ChipSwimlaneCollector::export_swimlane_json() {
     std::filesystem::create_directories(output_prefix_, ec);
     if (ec) {
         LOG_ERROR("Error: Failed to create output directory %s: %s", output_prefix_.c_str(), ec.message().c_str());
+        discard_artifacts();
         return -1;
     }
 
-    std::string filepath = output_prefix_ + "/chip_swimlane_records.json";
-    std::ofstream outfile(filepath);
+    std::ofstream outfile(temp_filepath, std::ios::out | std::ios::trunc);
     if (!outfile.is_open()) {
-        LOG_ERROR("Error: Failed to open file: %s", filepath.c_str());
+        LOG_ERROR("Error: Failed to open file: %s", temp_filepath.c_str());
+        discard_artifacts();
         return -1;
     }
 
@@ -978,8 +1039,10 @@ int ChipSwimlaneCollector::export_swimlane_json() {
     // file size). Column order is documented in the schema comment at the top
     // of swimlane_converter.py's v2 reader.
     //
-    //   aicore_tasks: [core_id, task_token_raw, reg_task_id, start_cycles, end_cycles, receive_to_start_cycles]
-    //   aicpu_tasks:  [core_id, reg_task_id, dispatch_cycles, finish_cycles]
+    //   aicore_tasks:          [core_id, task_token_raw, reg_task_id, start_cycles, end_cycles,
+    //                           receive_to_start_cycles]
+    //   aicore_resolve_phases: [core_id, task_token_raw, start_cycles, end_cycles]
+    //   aicpu_tasks:           [core_id, reg_task_id, dispatch_cycles, finish_cycles]
     {
         // copy_aicore_buffer already drops r.start_time == 0 slots when
         // collecting from the device side, so no defensive filter here.
@@ -988,6 +1051,10 @@ int ChipSwimlaneCollector::export_swimlane_json() {
         size_t total = 0;
         for (size_t core_idx = 0; core_idx < collected_aicore_records_.size(); core_idx++) {
             for (const auto &r : collected_aicore_records_[core_idx]) {
+                if (chip_swimlane_level_ == ChipSwimlaneLevel::AICORE_TIMING &&
+                    (r.reg_task_id & CHIP_SWIMLANE_AICORE_RESOLVE_RECORD_TAG) != 0) {
+                    continue;
+                }
                 if (!first) outfile << ",";
                 outfile << "\n    [" << core_idx << ", " << r.task_token_raw << ", " << r.reg_task_id << ", "
                         << r.start_time << ", " << r.end_time << ", " << r.receive_to_start_cycles << "]";
@@ -998,6 +1065,27 @@ int ChipSwimlaneCollector::export_swimlane_json() {
         if (!first) outfile << "\n  ";
         outfile << "]";
         LOG_INFO("  aicore_tasks: %zu records", total);
+    }
+    {
+        outfile << ",\n  \"aicore_resolve_phases\": [";
+        bool first = true;
+        size_t total = 0;
+        for (size_t core_idx = 0; core_idx < collected_aicore_records_.size(); core_idx++) {
+            for (const auto &r : collected_aicore_records_[core_idx]) {
+                if (chip_swimlane_level_ != ChipSwimlaneLevel::AICORE_TIMING ||
+                    (r.reg_task_id & CHIP_SWIMLANE_AICORE_RESOLVE_RECORD_TAG) == 0) {
+                    continue;
+                }
+                if (!first) outfile << ",";
+                outfile << "\n    [" << core_idx << ", " << r.task_token_raw << ", " << r.start_time << ", "
+                        << r.end_time << "]";
+                first = false;
+                total++;
+            }
+        }
+        if (!first) outfile << "\n  ";
+        outfile << "]";
+        LOG_INFO("  aicore_resolve_phases: %zu records", total);
     }
     {
         outfile << ",\n  \"aicpu_tasks\": [";
@@ -1127,10 +1215,18 @@ int ChipSwimlaneCollector::export_swimlane_json() {
     }
 
     outfile << "\n}\n";
+    outfile.flush();
+    if (!outfile.good()) {
+        LOG_ERROR("Failed to write JSON file (stream error): %s", temp_filepath.c_str());
+        outfile.close();
+        discard_artifacts();
+        return -1;
+    }
     outfile.close();
 
-    if (!outfile) {
-        LOG_ERROR("Failed to write JSON file (stream error): %s", filepath.c_str());
+    if (std::rename(temp_filepath.c_str(), filepath.c_str()) != 0) {
+        LOG_ERROR("Failed to publish JSON file: %s", filepath.c_str());
+        discard_artifacts();
         return -1;
     }
 

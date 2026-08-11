@@ -228,6 +228,7 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
           },
           "aicore_tasks": [[core_id, task_token_raw, reg_task_id, start_cycles,
                             end_cycles, receive_to_start_cycles], ...],
+          "aicore_resolve_phases": [[core_id, task_token_raw, start_cycles, end_cycles], ...],
           "aicpu_tasks":  [[core_id, reg_task_id, dispatch_cycles, finish_cycles], ...],
           "aicpu_scheduler_phases":     [ [ {kind, start_cycles, end_cycles, ...}, ... ], ... ],
           "aicpu_orchestrator_phases":  [ [ {submit_idx, task_id, start_cycles, end_cycles}, ... ], ... ]
@@ -281,6 +282,7 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
     core_to_thread = list(metadata.get("core_to_thread") or [])
 
     aicore_rows = data.get("aicore_tasks") or []
+    aicore_resolve_rows = data.get("aicore_resolve_phases") or []
     aicpu_rows = data.get("aicpu_tasks") or []
     sched_phases_raw = data.get("aicpu_scheduler_phases") or []
     orch_phases_raw = data.get("aicpu_orchestrator_phases") or []
@@ -324,6 +326,9 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
         r2s_c = int(row[5]) if len(row) > 5 else 0
         _track(start_c - r2s_c)
         _track(end_c)
+    for _, _, start_c, end_c in aicore_resolve_rows:
+        _track(int(start_c))
+        _track(int(end_c))
     for _, _, d, f in aicpu_rows:
         _track(int(d))
         _track(int(f))
@@ -420,6 +425,23 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
 
     tasks.sort(key=lambda t: int(t["task_id"]))
 
+    aicore_resolve_phases = []
+    for core_id, task_token_raw, start_cycles, end_cycles in aicore_resolve_rows:
+        core_id = int(core_id)
+        start_us = _to_us(int(start_cycles))
+        end_us = _to_us(int(end_cycles))
+        aicore_resolve_phases.append(
+            {
+                "core_id": core_id,
+                "core_type": _core_type(core_id),
+                "task_id": int(task_token_raw),
+                "start_time_us": start_us,
+                "end_time_us": end_us,
+                "duration_us": end_us - start_us,
+            }
+        )
+    aicore_resolve_phases.sort(key=lambda phase: (phase["start_time_us"], phase["core_id"]))
+
     total_unmatched = sum(unmatched_per_core.values())
     if total_unmatched > 0:
         worst = sorted(unmatched_per_core.items(), key=lambda kv: -kv[1])[:3]
@@ -467,6 +489,8 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
         "chip_swimlane_level": level,
         "tasks": tasks,
     }
+    if aicore_resolve_phases:
+        out["aicore_resolve_phases"] = aicore_resolve_phases
     if aicpu_scheduler_phases:
         out["aicpu_scheduler_phases"] = aicpu_scheduler_phases
     if aicpu_orchestrator_phases:
@@ -1189,6 +1213,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     deps_kernel_map=None,
     deps_block_map=None,
     emit_overhead=False,
+    aicore_resolve_phases=None,
 ):
     """Generate Chrome Trace Event Format JSON from task data.
 
@@ -1204,6 +1229,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         scheduler_phases: Optional list of per-thread phase record lists (chip_swimlane_level >= 3)
         orchestrator_phases: Optional list of per-task orchestrator phase records (chip_swimlane_level >= 4)
         core_to_thread: Optional list mapping core_id (index) to scheduler thread index (-1 = unassigned)
+        aicore_resolve_phases: Optional AICore dependency-resolution spans
 
     Generates processes in the trace:
         - pid=5 "Graph Execution": one end-to-end envelope per Graph task
@@ -1219,9 +1245,12 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             print(f"  Function names: {len(func_id_to_name)} entries")
 
     # Step 1: Build core_to_tid mapping (using only core_id, not core_type)
-    unique_cores = set()
+    task_core_ids = set()
     for task in tasks:
-        unique_cores.add(task["core_id"])
+        task_core_ids.add(task["core_id"])
+    unique_cores = set(task_core_ids)
+    for phase in aicore_resolve_phases or []:
+        unique_cores.add(phase["core_id"])
 
     core_to_tid = {}
     for core_id in sorted(unique_cores):
@@ -1323,6 +1352,8 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
 
     # Metadata events: Thread names (one per core)
     for core_id, tid in core_to_tid.items():
+        if core_id not in task_core_ids:
+            continue
         # Find first task with this core_id to get core_type
         core_type = None
         for task in tasks:
@@ -1335,6 +1366,41 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         thread_name = f"{core_type_str}_{core_id}"
         events.append(
             {"args": {"name": thread_name}, "cat": "__metadata", "name": "thread_name", "ph": "M", "pid": 4, "tid": tid}
+        )
+
+    resolve_core_types = {phase["core_id"]: phase.get("core_type", "unknown") for phase in aicore_resolve_phases or []}
+    for core_id in sorted(resolve_core_types):
+        core_type_str = str(resolve_core_types[core_id]).upper()
+        events.append(
+            {
+                "args": {"name": f"{core_type_str}_{core_id} Resolve"},
+                "cat": "__metadata",
+                "name": "thread_name",
+                "ph": "M",
+                "pid": 4,
+                "tid": core_to_tid[core_id] + 1,
+            }
+        )
+    for phase in aicore_resolve_phases or []:
+        task_id = phase["task_id"]
+        task_label = format_task_display(task_id)
+        duration_us = phase["duration_us"]
+        events.append(
+            {
+                "args": {
+                    "event-hint": f"Resolve Task:{task_label}, CoreId:{phase['core_id']}",
+                    "taskId": task_id,
+                    "duration-us": duration_us,
+                },
+                "cat": "dependency",
+                "cname": "vsync_highlight_color",
+                "name": f"resolve({task_label})",
+                "ph": "X",
+                "pid": 4,
+                "tid": core_to_tid[phase["core_id"]] + 1,
+                "ts": phase["start_time_us"],
+                "dur": duration_us,
+            }
         )
 
     # Duration events (Complete events "X")
@@ -2693,6 +2759,7 @@ def _print_verbose_data_info(data, verbose):
     print()
     scheduler_phases = data.get("aicpu_scheduler_phases")
     orchestrator_phases = data.get("aicpu_orchestrator_phases")
+    aicore_resolve_phases = data.get("aicore_resolve_phases")
     core_to_thread = data.get("core_to_thread")
     if scheduler_phases:
         print(f"  Scheduler threads: {len(scheduler_phases)}")
@@ -2707,6 +2774,8 @@ def _print_verbose_data_info(data, verbose):
             submit_count = sum(1 for thread in orchestrator_phases for r in thread if r.get("phase") == "orch_fanin")
         if submit_count:
             print(f"  Orchestrator: {submit_count} tasks submitted")
+    if aicore_resolve_phases:
+        print(f"  AICore resolve phase records: {len(aicore_resolve_phases)}")
     if core_to_thread:
         print(f"  Core-to-thread mapping: {len(core_to_thread)} cores")
 
@@ -2814,6 +2883,7 @@ def main():
             deps_kernel_map=deps_kernel_map,
             deps_block_map=deps_block_map,
             emit_overhead=args.overhead,
+            aicore_resolve_phases=data.get("aicore_resolve_phases"),
         )
         if args.overhead and deps_edges is None:
             print(

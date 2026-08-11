@@ -37,6 +37,13 @@ int32_t AicoreLifecycle::pre_handshake_init(Runtime *runtime, int32_t aicpu_thre
 
     if (is_chip_swimlane_enabled()) {
         chip_swimlane_aicpu_init(core_count_);
+        if (get_chip_swimlane_level() != ChipSwimlaneLevel::AICORE_TIMING) {
+            LOG_ERROR(
+                "A5 HBG AICore scheduler supports chip swimlane level 1 only, got %u",
+                static_cast<uint32_t>(get_chip_swimlane_level())
+            );
+            return -1;
+        }
     }
     return 0;
 }
@@ -122,7 +129,7 @@ int32_t AicoreLifecycle::post_handshake_init(Runtime *) {
     return 0;
 }
 
-int32_t AicoreLifecycle::shutdown(int32_t thread_idx, Runtime *) {
+int32_t AicoreLifecycle::shutdown(int32_t thread_idx, Runtime *runtime) {
     const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(thread_idx) * core_count_) / aicpu_thread_num_);
     const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(thread_idx + 1) * core_count_) / aicpu_thread_num_);
     int32_t core_ids[kMaxWorkers]{};
@@ -130,6 +137,17 @@ int32_t AicoreLifecycle::shutdown(int32_t thread_idx, Runtime *) {
 
     for (int32_t i = lo; i < hi; ++i) {
         core_ids[count++] = i;
+        if (is_chip_swimlane_enabled()) {
+            auto *worker = aicore_sidecar_at_v0<AicoreWorkerContextV0>(
+                runtime->aicore_sidecar_base, runtime->aicore_sidecar_layout.worker_contexts_offset +
+                                                  static_cast<uint64_t>(i) * sizeof(AicoreWorkerContextV0)
+            );
+            cache_invalidate_range(worker, sizeof(*worker));
+            chip_swimlane_aicpu_set_aicore_counts(
+                i, worker->dfx_reserved[AICORE_PROFILE_ATTEMPTED_INDEX_V0],
+                worker->dfx_reserved[AICORE_PROFILE_DROPPED_INDEX_V0]
+            );
+        }
     }
 
     if (is_chip_swimlane_enabled()) chip_swimlane_aicpu_flush(thread_idx, core_ids, count);

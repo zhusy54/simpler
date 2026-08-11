@@ -182,6 +182,13 @@ struct ChipSwimlaneAicoreTaskRecord {
 
 static_assert(sizeof(ChipSwimlaneAicoreTaskRecord) == 32, "ChipSwimlaneAicoreTaskRecord must be 32B");
 
+// Level-1 AICore-owned runtimes may reuse the task-record transport for
+// dependency-resolution phases. The high reg_task_id bit distinguishes those
+// records before JSON export; ordinary level-1 task ids occupy the remaining
+// 31 bits. Level 2+ keeps the full reg_task_id as its AICore/AICPU join key.
+constexpr uint32_t CHIP_SWIMLANE_AICORE_RESOLVE_RECORD_TAG = UINT32_C(0x80000000);
+constexpr uint32_t CHIP_SWIMLANE_AICORE_RECORD_ID_MASK = UINT32_C(0x7fffffff);
+
 // =============================================================================
 // TypedBuffer<Record, N> - Templated Fixed-Size Profiling Buffer
 // =============================================================================

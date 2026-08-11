@@ -34,6 +34,7 @@
 #include "call_config.h"
 #include "callable_protocol.h"
 #include "common/memory_barrier.h"
+#include "common/chip_swimlane_policy.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 #include "cpu_sim_context.h"
@@ -256,6 +257,7 @@ int DeviceRunner::prepare_execution(
     std::unique_ptr<PreparedExecution> *prepared
 ) {
     if (prepared == nullptr || *prepared != nullptr) return -1;
+    if (validate_chip_swimlane_level_impl(config.enable_chip_swimlane) != 0) return -1;
     if (active_run_ != nullptr) {
         LOG_ERROR("prepare_execution called while another simulated run still owns execution state");
         return -1;
@@ -602,8 +604,11 @@ int DeviceRunner::drain_execution(ActiveExecution &) {
     if (enable_chip_swimlane_) {
         chip_swimlane_collector_.stop();
         chip_swimlane_collector_.read_phase_header_metadata();
-        chip_swimlane_collector_.reconcile_counters();
-        chip_swimlane_collector_.export_swimlane_json();
+        const bool counters_ok = chip_swimlane_collector_.reconcile_counters();
+        const int export_rc = chip_swimlane_collector_.export_swimlane_json();
+        if (strict_chip_swimlane_validation_impl() && (!counters_ok || export_rc != 0)) {
+            runtime_rc = SIMPLER_PROFILING_VALIDATION_ERROR;
+        }
     }
 
     if (enable_dump_args_) {
@@ -647,7 +652,7 @@ int DeviceRunner::drain_execution(ActiveExecution &) {
         aicore_so_path_.clear();
     }
 
-    return 0;
+    return runtime_rc;
 }
 
 void DeviceRunner::abandon_prepared_execution(PreparedExecution &) noexcept {
@@ -768,6 +773,7 @@ int DeviceRunner::init_chip_swimlane(int num_aicore, int aicpu_thread_num, int d
         /*register_cb=*/nullptr, prof_free_cb, output_prefix_
     );
     if (rc == 0) {
+        chip_swimlane_collector_.set_strict_validation(strict_chip_swimlane_validation_impl());
         kernel_args_.chip_swimlane_data_base =
             reinterpret_cast<uint64_t>(chip_swimlane_collector_.get_chip_swimlane_setup_device_ptr());
         kernel_args_.chip_swimlane_aicore_rotation_table =

@@ -25,6 +25,7 @@
 #include "callable_protocol.h"
 #include "call_config.h"
 #include "chip_callable_layout.h"
+#include "common/chip_swimlane_policy.h"
 #include "common/host_api.h"
 #include "cpu_sim_context.h"
 #include "host/raii_scope_guard.h"
@@ -664,6 +665,9 @@ extern "C" __attribute__((weak)) int prewarm_config_impl(
 ) {
     return 0;
 }
+
+extern "C" __attribute__((weak)) int validate_chip_swimlane_level_impl(int32_t) { return 0; }
+extern "C" __attribute__((weak)) bool strict_chip_swimlane_validation_impl() { return false; }
 
 void SimDeviceRunnerBase::apply_call_config(const CallConfig &config) {
     set_chip_swimlane_enabled(config.enable_chip_swimlane);

@@ -407,6 +407,9 @@ public:
      */
     void set_core_types(const CoreType *types, int n);
 
+    /** Require clean reconciliation before atomically publishing the final JSON. */
+    void set_strict_validation(bool enabled) { strict_validation_ = enabled; }
+
     /**
      * Export collected records as a Chrome Trace Event JSON (swimlane view).
      * Writes <output_prefix>/chip_swimlane_records.json — directory is captured at
@@ -460,15 +463,16 @@ public:
 
     /**
      * Sum per-core / per-thread total_record_count and dropped_record_count
-     * for both the PERF and PHASE pools, cross-check
+     * for PERF, AICORE, and PHASE pools, cross-check
      * `collected + dropped == device_total`, and LOG_ERROR any non-zero
      * current_buf_ptr (which would indicate a device-side flush failure that
      * left a buffer un-enqueued — see .claude/rules/discipline.md).
-     * The PHASE block is skipped silently when no phase activity was
+     * Returns false for drops, count mismatches, malformed AICore timestamps,
+     * or non-empty active buffers. The PHASE block is skipped when no activity was
      * recorded (runtimes that don't emit phase records). Must be called
      * after stop().
      */
-    void reconcile_counters();
+    bool reconcile_counters();
 
     /**
      * @return Per-core ChipSwimlaneAicpuTaskRecord vectors (indexed by core_index). For tests.
@@ -507,6 +511,9 @@ private:
     // does not encode the AICPU thread).
     int aicpu_thread_num_{0};
     ChipSwimlaneLevel chip_swimlane_level_{ChipSwimlaneLevel::DISABLED};
+    bool strict_validation_{false};
+    bool reconciled_{false};
+    bool last_reconcile_ok_{false};
 
     // Per-core core_type table populated by set_core_types(). Indexed by
     // core_id; size matches num_aicore_ once populated. Used by the level=1

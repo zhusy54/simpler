@@ -230,6 +230,7 @@ public:
         const DumpFreeCallback &free_cb, const std::string &output_prefix, DumpArgsLevel dump_args_level
     );
 
+    // NOLINTNEXTLINE(bugprone-derived-method-shadowing-base-method) -- CRTP hook intentionally specializes start().
     void start(const profiling_common::ThreadFactory &thread_factory);
 
     /**
@@ -277,7 +278,7 @@ public:
     void *get_dump_shm_device_ptr() const { return dump_shared_mem_dev_; }
 
     /** Return whether an active args-dump freeze may release. An idle call returns false. */
-    bool backpressure_release_ready() const;
+    bool backpressure_release_ready() const;  // NOLINT(bugprone-derived-method-shadowing-base-method)
 
 private:
     struct alignas(64) CollectorShardCounters {

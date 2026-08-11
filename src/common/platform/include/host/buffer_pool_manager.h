@@ -193,6 +193,7 @@ auto profiler_module_recycled_warm_target_impl(int kind, int, long) -> decltype(
 }
 
 template <typename Module>
+// NOLINTNEXTLINE(modernize-avoid-variadic-functions) -- ellipsis is the lowest-priority SFINAE fallback.
 int profiler_module_recycled_warm_target_impl(int, int, ...) {
     return 0;
 }
