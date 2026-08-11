@@ -68,15 +68,15 @@ class TestPagedAttentionHostBuildGraphA5(SceneTestCase):
 
     CASES = [
         {
-            # Marked manual for host_build_graph: this batch=256 case submits
-            # ~64K tasks, and host-orchestration populates the whole task graph
-            # before the device schedules — so the ring cannot reclaim
-            # mid-orchestration and must hold the entire graph at once. That
-            # exceeds the default ring window (16384 slots). Run it explicitly
-            # with a large PTO2_RING_TASK_WINDOW / PTO2_RING_HEAP if needed.
             "name": "Case1",
             "platforms": ["a5"],
             "manual": True,
+            "config": {
+                "runtime_env": {
+                    "ring_task_window": 131072,
+                    "ring_heap": 512 * 1024 * 1024,
+                }
+            },
             "params": {
                 "batch": 256,
                 "num_heads": 16,
