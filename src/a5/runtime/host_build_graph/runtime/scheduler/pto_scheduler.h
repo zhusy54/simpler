@@ -628,7 +628,7 @@ struct PTO2SchedulerState {
     // consumer here; every idle thread's early_dispatch pass pops one, stages a range
     // onto ITS OWN cores (range-claim via next_block_idx), and re-pushes if blocks
     // remain — exactly mirroring how a partially-dispatched SPMD task is re-pushed to
-    // the ready queue (scheduler_dispatch: pop -> claim -> re-push). A stale/released
+    // the ready queue (consumer pop -> claim -> re-push). A stale/released
     // entry fails the STAGING check on pop and is dropped; a push that overflows is
     // logged and the consumer's blocks fall back to normal dispatch.
     PTO2ReadyQueue early_dispatch_queues[PTO2_NUM_RESOURCE_SHAPES];

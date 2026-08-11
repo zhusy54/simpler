@@ -20,10 +20,8 @@
  * - Device orchestration state (gm_sm_ptr_, orch_args_)
  * - Function address mapping (func_id_to_addr_)
  *
- * Task dispatch uses a per-core PTO2DispatchPayload written by the scheduler.
- * At dispatch time, build_payload() copies tensor pointers and scalars from
- * the task payload into the per-core args[], populates SPMD context, then
- * signals AICore via DATA_MAIN_BASE.
+ * AICore workers materialize a PTO2DispatchPayload from the uploaded graph,
+ * execute it, and publish completion to the AICore dependency resolver.
  */
 
 #pragma once
@@ -39,6 +37,7 @@
 #include "common/chip_swimlane_profiling.h"
 #include "common/platform_config.h"
 #include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
+#include "aicore_execution_sidecar_v0.h"
 #include "pto2_dispatch_payload.h"
 #include "task_args.h"
 
@@ -68,10 +67,8 @@ constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 
  * Protocol State Machine:
  * 1. Initialization: AICPU sets aicpu_ready=1
  * 2. Acknowledgment: AICore sets aicore_done=core_id+1
- * 3. Task Dispatch: AICPU writes DATA_MAIN_BASE after updating the per-core payload
- * 4. Task Execution: AICore reads the cached PTO2DispatchPayload and executes
- * 5. Task Completion: AICore writes FIN to COND; AICPU observes completion
- * 6. Shutdown: AICPU sets control=1, AICore exits
+ * 3. Execution: AICore resolves dependencies and executes graph tasks
+ * 4. Shutdown: AICPU waits for all workers, then closes register windows
  *
  * Each AICore instance has its own handshake buffer to enable concurrent
  * task execution across multiple cores.
@@ -143,14 +140,16 @@ public:
     Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
     int worker_count;                       // Number of active workers
 
-    // Execution parameters for AICPU scheduling.
+    // Execution parameters for AICPU lifecycle threads and AICore resolvers.
     //
     // aicpu_thread_num is the total AICPU thread count launched on this run.
     // host_build_graph builds the task graph on the host, so there is no
-    // on-device orchestrator: every thread is a scheduler that dispatches tasks
-    // to AICore. The highest-index thread additionally performs the one-time
-    // host-orch boot (attach SM, latch task count) before it starts dispatching.
+    // on-device orchestrator. The highest-index thread supervises the AICore
+    // resolver-set publication and waits for graph completion; other threads
+    // wait until teardown.
     int aicpu_thread_num;
+    int32_t aic_dependency_scheduler_limit;
+    int32_t aiv_dependency_scheduler_limit;
     int ready_queue_shards;  // Number of ready queue shards (1..MAX_AICPU_THREADS, default MAX-1)
 
     // Filter-style affinity gate input (a2a3 onboard). Host fills these
@@ -166,11 +165,16 @@ public:
     // NOTE: Made public for direct access from aicore code
     uint64_t func_id_to_addr_[RUNTIME_MAX_FUNC_ID];
 
-    // Total tasks submitted by the host orchestrator — handed to the scheduler
-    // (SchedulerContext::on_orchestration_done) in place of latching the SM ring
-    // head on device. host_build_graph builds the whole graph on the host, so
-    // the boot thread reads this instead of counting SM ring heads.
+    // Total tasks submitted by the host orchestrator and consumed by the
+    // AICore execution sidecar.
     int32_t host_total_tasks;
+
+    // Per-run mutable AICore state. Device code uses the aligned base; Host
+    // cleanup retains the original allocation returned by device_malloc.
+    void *aicore_sidecar_base;
+    void *aicore_sidecar_allocation;
+    uint64_t aicore_sidecar_allocation_size;
+    AicoreExecutionSidecarLayoutV0 aicore_sidecar_layout;
 
 private:
     // Kernel binary tracking for cleanup
@@ -220,6 +224,10 @@ public:
     void set_worker_count(int n) { worker_count = n; }
     int get_aicpu_thread_num() const { return aicpu_thread_num; }
     void set_aicpu_thread_num(int n) { aicpu_thread_num = n; }
+    void set_dependency_scheduler_limits(int32_t aic, int32_t aiv) {
+        aic_dependency_scheduler_limit = aic;
+        aiv_dependency_scheduler_limit = aiv;
+    }
     Handshake *get_workers() { return workers; }
     int32_t get_aicpu_allowed_cpu_count() const { return aicpu_allowed_cpu_count; }
     void set_aicpu_allowed_cpu_count(int32_t n) { aicpu_allowed_cpu_count = n; }

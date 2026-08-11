@@ -20,23 +20,11 @@
 #include <sys/mman.h>
 #endif
 
-#include "aicpu/device_time.h"
-#include "aicpu/device_phase_aicpu.h"
-#include "callable_protocol.h"
-#include "pto2_dispatch_payload.h"
+#include "aicore_lifecycle.h"
+#include "aicpu/cache_maintenance.h"
 #include "runtime.h"
 #include "spin_hint.h"
 
-// Runtime headers (full struct definition for create/destroy + PTO2_SCOPE)
-#include "pto_runtime2.h"
-#include "pto_runtime2_types.h"
-#include "pto_shared_memory.h"
-
-// Performance profiling headers
-#include "aicpu/chip_swimlane_collector_aicpu.h"
-#include "aicpu/scope_stats_collector_aicpu.h"
-#include "aicpu/args_dump_aicpu.h"
-#include "common/chip_swimlane_profiling.h"
 #include "common/unified_log.h"
 
 // Register-based communication
@@ -44,40 +32,6 @@
 #include "aicpu/platform_regs.h"
 #include "common/platform_config.h"
 #include "utils/thread_completion_gate.h"
-
-// Core type definitions
-#include "common/core_type.h"
-
-// CoreCallable for resolved dispatch address
-#include "callable.h"
-
-// Scheduler data structures (CoreExecState, CoreTracker, etc.)
-#include "scheduler/scheduler_types.h"
-
-// Scheduler context class
-#include "scheduler/scheduler_context.h"
-
-// From orchestration/common.cpp linked into this DSO — updates g_current_runtime
-// here (cleared on teardown before runtime_destroy).
-extern "C" void framework_bind_runtime(PTO2Runtime *rt);
-
-static int32_t read_pto2_runtime_status(Runtime *runtime) {
-    if (runtime == nullptr) {
-        return 0;
-    }
-
-    void *sm = runtime->get_gm_sm_ptr();
-    if (sm == nullptr) {
-        return 0;
-    }
-
-    auto *header = static_cast<PTO2SharedMemoryHeader *>(sm);
-    int32_t orch_error_code = header->orch_error_code.load(std::memory_order_acquire);
-    int32_t sched_error_code = header->sched_error_code.load(std::memory_order_acquire);
-    return runtime_status_from_error_codes(orch_error_code, sched_error_code);
-}
-
-static PTO2Runtime *rt{nullptr};
 
 struct AicpuExecutor {
     // ===== Thread management state =====
@@ -95,28 +49,14 @@ struct AicpuExecutor {
     std::atomic<int32_t> hs_arrived_{0};
     std::atomic<int32_t> hs_thread_seq_{0};
 
-    // Parallel-boot-classify coordination (see AicpuExecutor::run). classify_ready_
-    // is published by the boot leader once its leader-only orchestration setup is
-    // visible; classify_arrived_ is the barrier counting threads that finished
-    // their slice of the initial classify. Both are one-shot per run and reset in
-    // deinit().
-    std::atomic<bool> classify_ready_{false};
-    std::atomic<int32_t> classify_arrived_{0};
-
     int32_t aicpu_thread_num_{0};
-
-    // ===== Task queue state (managed by scheduler ready queues) =====
 
     simpler::ThreadCompletionGate completion_gate_;
     std::atomic<bool> runtime_init_ready_{false};
 
-    // Per-Worker arena backing the PTO2Runtime + sm_handle + orch/sched/mailbox
-    // sub-regions (created in runtime_create_from_sm, released in runtime_destroy).
-    // Default-constructed: libc-backed backend, no ctx.
-    DeviceArena runtime_arena_;
-
-    // ===== Scheduler context (owns all dispatch/completion/drain state) =====
-    SchedulerContext sched_ctx_;
+    // AICPU owns only the AICore launch/teardown lifecycle. AICore owns graph
+    // dependency resolution, ready/completion queues, and task execution.
+    AicoreLifecycle aicore_lifecycle_;
 
     // ===== Methods =====
     int32_t init(Runtime *runtime);
@@ -142,7 +82,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     // after a barrier. Non-leaders spin on init_done_.
     int32_t nthreads = runtime->aicpu_thread_num;
     if (nthreads == 0) nthreads = 1;
-    if (nthreads < 1 || nthreads > MAX_AICPU_THREADS) {
+    if (nthreads < 1 || nthreads > PLATFORM_MAX_AICPU_THREADS) {
         LOG_ERROR("Invalid aicpu_thread_num: %d", nthreads);
         init_failed_.store(true, std::memory_order_release);
         return -1;
@@ -153,7 +93,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     // thread — hand those a distinct index from a counter (mirrors run()'s
     // thread_idx_++ fallback) instead of collapsing them all to leader 0, which
     // would run pre_/post_handshake_init on every thread and race the shared
-    // scheduler state. Exactly nthreads threads reach init (the gate drops the
+    // lifecycle state. Exactly nthreads threads reach init (the gate drops the
     // rest), so the counter yields a gap-free [0, nthreads).
     int32_t tidx = platform_aicpu_affinity_thread_idx();
     if (tidx < 0) tidx = hs_thread_seq_.fetch_add(1, std::memory_order_acq_rel);
@@ -175,7 +115,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         aicpu_thread_num_ = nthreads;
 
         hs_arrived_.store(0, std::memory_order_relaxed);
-        if (sched_ctx_.pre_handshake_init(runtime, aicpu_thread_num_, get_platform_regs()) != 0) {
+        if (aicore_lifecycle_.pre_handshake_init(runtime, aicpu_thread_num_, get_platform_regs()) != 0) {
             init_failed_.store(true, std::memory_order_release);
             hs_setup_done_.store(true, std::memory_order_release);
             return -1;
@@ -189,14 +129,14 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     }
 
     // All threads: handshake this thread's slice of cores in parallel.
-    sched_ctx_.handshake_partition(runtime, tidx, nthreads);
+    aicore_lifecycle_.handshake_partition(runtime, tidx, nthreads);
 
     // Barrier: leader waits for every slice to finish, then completes init.
     hs_arrived_.fetch_add(1, std::memory_order_acq_rel);
     if (is_leader) {
         while (hs_arrived_.load(std::memory_order_acquire) < nthreads) {}
         completion_gate_.reset();
-        if (sched_ctx_.post_handshake_init(runtime) != 0) {
+        if (aicore_lifecycle_.post_handshake_init(runtime) != 0) {
             init_failed_.store(true, std::memory_order_release);
             init_done_.store(true, std::memory_order_release);
             return -1;
@@ -218,159 +158,144 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
 int32_t AicpuExecutor::run(Runtime *runtime) {
     int32_t affinity_exec_idx = platform_aicpu_affinity_thread_idx();
     int32_t thread_idx = (affinity_exec_idx >= 0) ? affinity_exec_idx : (thread_idx_++);
-    if (thread_idx < 0 || thread_idx >= aicpu_thread_num_ || thread_idx >= MAX_AICPU_THREADS) {
+    if (thread_idx < 0 || thread_idx >= aicpu_thread_num_ || thread_idx >= PLATFORM_MAX_AICPU_THREADS) {
         LOG_ERROR(
             "Thread index %d out of bounds (active=%d max=%d exec_idx=%d)", thread_idx, aicpu_thread_num_,
-            MAX_AICPU_THREADS, affinity_exec_idx
+            PLATFORM_MAX_AICPU_THREADS, affinity_exec_idx
         );
         return -1;
     }
     int32_t run_rc = 0;
 
-    // Boot: the last AICPU thread (aicpu_thread_num_ - 1) performs the one-time
-    // host-orch attach. host_build_graph's orchestrator already ran on the host,
-    // which also relocated every cross-task pointer to its final device address
-    // before H2D — so the SM/arena this thread sees are already fully
-    // device-addressed. This thread attaches the prebuilt arena, points the SM
-    // handle's ring-header pointers at the device SM WITHOUT resetting the
-    // host-populated data, hands the host-computed task count to the scheduler,
-    // and releases the other threads. It then falls through and schedules its own
-    // cores like every other thread — host_build_graph has no device-side
-    // orchestrator, so there is no orch/sched split.
-    if (thread_idx == aicpu_thread_num_ - 1) {
-        void *prebuilt_arena = runtime->get_prebuilt_arena_base();
-        size_t off_runtime = runtime->get_prebuilt_runtime_offset();
-
-        // A boot failure falls through to the common teardown at the end of
-        // run() — it must NOT return early. This thread owns a core slice
-        // (handshake_partition assigns [lo, total) to the last thread), so an
-        // early return would skip shutdown(thread_idx) — leaving its AICore
-        // cores spinning on an unclosed register window — and the completion
-        // gate never opens, so the host hangs into the op-execute
-        // timeout (507018) instead of seeing the failure. On failure: record it
-        // in run_rc, leave rt null so the dispatch block below skips, and still
-        // publish runtime_init_ready_ (single point at the block's end) so the
-        // peer threads stop spinning.
-        bool boot_ok = (prebuilt_arena != nullptr);
-        if (!boot_ok) {
-            LOG_ERROR("Thread %d: host-orch: prebuilt_arena_base is null", thread_idx);
-            rt = nullptr;
-            run_rc = -1;
+    // The supervisor discovers topology and publishes the per-run resolver set.
+    // AICore owns graph classification, ReadyQ/CompletionQ processing, task
+    // execution, and completion propagation.
+    if (runtime->aicore_sidecar_base == nullptr || runtime->host_total_tasks < 0) {
+        LOG_ERROR("A5 HBG AICore scheduler requires an initialized graph");
+        run_rc = -1;
+        runtime_init_ready_.store(true, std::memory_order_release);
+    } else if (thread_idx == aicpu_thread_num_ - 1) {
+        auto *run_control = aicore_sidecar_at_v0<AicoreRunControlV0>(
+            runtime->aicore_sidecar_base, runtime->aicore_sidecar_layout.run_control_offset
+        );
+        auto *contexts = aicore_sidecar_at_v0<AicoreWorkerContextV0>(
+            runtime->aicore_sidecar_base, runtime->aicore_sidecar_layout.worker_contexts_offset
+        );
+        while (true) {
+            cache_invalidate_range(run_control, sizeof(*run_control));
+            if (run_control->attached_count == static_cast<uint64_t>(runtime->worker_count)) {
+                break;
+            }
+            SPIN_WAIT_HINT();
         }
 
-        if (boot_ok) {
-            runtime_arena_.attach(prebuilt_arena, DeviceArena::kDefaultBaseAlign);
-            rt = reinterpret_cast<PTO2Runtime *>(static_cast<char *>(prebuilt_arena) + off_runtime);
-            runtime_wire_arena_pointers(runtime_arena_, rt->prebuilt_layout, rt);
+        cache_invalidate_range(contexts, static_cast<size_t>(runtime->worker_count) * sizeof(*contexts));
+        int32_t aic_count = 0;
+        int32_t aiv_count = 0;
+        for (int32_t i = 0; i < runtime->worker_count; ++i) {
+            if (static_cast<CoreType>(contexts[i].core_type) == CoreType::AIC) {
+                contexts[i].type_rank = aic_count++;
+                contexts[i].active = runtime->aicore_sidecar_layout.aic_task_count != 0 ? 1 : 0;
+            } else {
+                contexts[i].type_rank = aiv_count++;
+                contexts[i].active = runtime->aicore_sidecar_layout.aiv_task_count != 0 ? 1 : 0;
+            }
+            contexts[i].resolver_active = 0;
+            contexts[i].classifier_rank = -1;
+        }
 
-            void *sm_ptr = runtime->get_gm_sm_ptr();
-            uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size_per_ring(rt->prebuilt_layout.task_window_sizes);
-            memset(rt->sm_handle, 0, sizeof(*rt->sm_handle));
-            if (!rt->sm_handle->attach_populated(sm_ptr, sm_size, rt->prebuilt_layout.task_window_sizes)) {
-                LOG_ERROR("Thread %d: host-orch: sm_handle->attach_populated failed", thread_idx);
-                rt = nullptr;
+        auto resolve_limit = [&](int32_t requested, int32_t available) {
+            if (requested < 0 || available == 0 || run_control->expected_task_count == 0) return 0;
+            uint64_t capped_tasks = run_control->expected_task_count;
+            if (capped_tasks > static_cast<uint64_t>(available)) capped_tasks = static_cast<uint64_t>(available);
+            int32_t automatic = static_cast<int32_t>(capped_tasks);
+            if (requested == 0) return automatic;
+            return requested < automatic ? requested : automatic;
+        };
+        int32_t aic_resolvers = resolve_limit(runtime->aic_dependency_scheduler_limit, aic_count);
+        int32_t aiv_resolvers = resolve_limit(runtime->aiv_dependency_scheduler_limit, aiv_count);
+        int32_t resolver_count = aic_resolvers + aiv_resolvers;
+        int32_t classifier_rank = 0;
+        for (int32_t i = 0; i < runtime->worker_count; ++i) {
+            bool selected = (static_cast<CoreType>(contexts[i].core_type) == CoreType::AIC) ?
+                                contexts[i].type_rank < aic_resolvers :
+                                contexts[i].type_rank < aiv_resolvers;
+            if (selected) {
+                contexts[i].resolver_active = 1;
+                contexts[i].classifier_rank = classifier_rank++;
+            }
+        }
+        run_control->resolver_count = static_cast<uint64_t>(resolver_count);
+        run_control->aic_resolver_count = static_cast<uint64_t>(aic_resolvers);
+        run_control->aiv_resolver_count = static_cast<uint64_t>(aiv_resolvers);
+        cache_flush_range(contexts, static_cast<size_t>(runtime->worker_count) * sizeof(*contexts));
+
+        if (run_control->expected_task_count != 0 &&
+            ((runtime->aicore_sidecar_layout.aic_task_count != 0 && aic_count == 0) ||
+             (runtime->aicore_sidecar_layout.aiv_task_count != 0 && aiv_count == 0) || resolver_count == 0)) {
+            LOG_ERROR(
+                "A5 HBG AICore scheduler: topology cannot execute graph (tasks AIC=%" PRIu64 " AIV=%" PRIu64
+                ", cores AIC=%d AIV=%d, resolvers=%d)",
+                runtime->aicore_sidecar_layout.aic_task_count, runtime->aicore_sidecar_layout.aiv_task_count, aic_count,
+                aiv_count, resolver_count
+            );
+            run_rc = -1;
+        } else if (run_control->expected_task_count != 0) {
+            run_control->startup_phase = static_cast<uint64_t>(AicoreRunPhaseV0::CLASSIFY);
+            cache_flush_range(run_control, sizeof(*run_control));
+            while (true) {
+                cache_invalidate_range(run_control, sizeof(*run_control));
+                if (run_control->classified_count == run_control->resolver_count ||
+                    run_control->classification_error != 0) {
+                    break;
+                }
+                SPIN_WAIT_HINT();
+            }
+            if (run_control->classification_error == 0) {
+                run_control->startup_phase = static_cast<uint64_t>(AicoreRunPhaseV0::RUN);
+                cache_flush_range(run_control, sizeof(*run_control));
+                while (true) {
+                    cache_invalidate_range(run_control, sizeof(*run_control));
+                    if (run_control->completed_count == run_control->expected_task_count ||
+                        run_control->classification_error != 0) {
+                        break;
+                    }
+                    SPIN_WAIT_HINT();
+                }
+            }
+            if (run_control->classification_error != 0) {
+                LOG_ERROR(
+                    "A5 HBG AICore scheduler: graph execution failed at task=%" PRIu64 " status=%" PRIu64,
+                    run_control->error_task_id, run_control->classification_error
+                );
                 run_rc = -1;
-                boot_ok = false;
             }
         }
 
-        if (boot_ok) {
-            memset(rt->aicore_mailbox, 0, sizeof(*rt->aicore_mailbox));
-            runtime_finalize_after_wire(rt, sched_ctx_.aic_count(), sched_ctx_.aiv_count());
-            runtime->set_slot_states_ptr(nullptr);
-
-            sched_ctx_.bind_runtime(rt);
-
-            // Latch the host-built task count (on_orchestration_done sets total_tasks_)
-            // BEFORE the runtime_init_ready_ release below — that store is the barrier
-            // that unblocks the scheduler threads. Otherwise they would acquire
-            // runtime_init_ready_ with total_tasks_=0 and race to an early exit before
-            // the host task count is visible (host-orch has no concurrent orchestrator
-            // to keep them alive).
-            // NOTE: do NOT call rt_orchestration_done(rt) here. The HOST already
-            // called it in run_host_orchestration; the orchestrator's own
-            // task-allocator pointers are intentionally NOT relocated (only the
-            // SM cross-task pointers and the host-built fanout adjacency —
-            // dep_pool / ready queues / fanout_head — were), so they still hold
-            // host addresses and mark_done()'s active_count() read would
-            // dereference host memory and fault the AICPU. on_orchestration_done
-            // only needs total_tasks and the scalar
-            // orchestrator.inline_completed_tasks, both already valid.
-            sched_ctx_.on_orchestration_done(runtime, rt, thread_idx, runtime->host_total_tasks);
-            LOG_INFO("Thread %d: host-orch boot complete (%d tasks)", thread_idx, runtime->host_total_tasks);
-        }
-
-        // Publish "leader setup done" (SM attached, task count latched, queues
-        // allocated). Every thread then classifies its slice below before any of
-        // them may dispatch — the leader holds runtime_init_ready_ until then.
-        classify_ready_.store(true, std::memory_order_release);
-    }
-
-    // Parallel initial classify. Every AICPU thread waits for the leader's
-    // orchestration setup, seeds its disjoint slice of the whole graph's ready
-    // set + wake lists, then barriers. Only once all slices are done does the
-    // leader publish runtime_init_ready_, so no thread dispatches against a
-    // half-seeded graph. This replaces the O(total_tasks) serial classify the
-    // leader used to run alone while the others idle-waited.
-    while (!classify_ready_.load(std::memory_order_acquire)) {
-        SPIN_WAIT_HINT();
-    }
-    if (!sched_ctx_.is_completed() && rt != nullptr) {
-        sched_ctx_.classify_partition(thread_idx, aicpu_thread_num_);
-    }
-    classify_arrived_.fetch_add(1, std::memory_order_acq_rel);
-    if (thread_idx == aicpu_thread_num_ - 1) {
-        while (classify_arrived_.load(std::memory_order_acquire) < aicpu_thread_num_) {
+        run_control->exit_requested = 1;
+        run_control->startup_phase = static_cast<uint64_t>(AicoreRunPhaseV0::EXIT);
+        cache_flush_range(run_control, sizeof(*run_control));
+        while (true) {
+            cache_invalidate_range(run_control, sizeof(*run_control));
+            if (run_control->finished_count == static_cast<uint64_t>(runtime->worker_count)) break;
             SPIN_WAIT_HINT();
+        }
+        if (run_rc == 0 && run_control->completed_count != run_control->expected_task_count) {
+            LOG_ERROR(
+                "A5 HBG AICore scheduler: v0 count mismatch expected=%" PRIu64 " completed=%" PRIu64,
+                run_control->expected_task_count, run_control->completed_count
+            );
+            run_rc = -1;
         }
         runtime_init_ready_.store(true, std::memory_order_release);
     } else {
-        while (!runtime_init_ready_.load(std::memory_order_acquire)) {
+        while (!runtime_init_ready_.load(std::memory_order_acquire))
             SPIN_WAIT_HINT();
-        }
     }
 
-    // Every AICPU thread schedules its assigned cores.
-    if (!sched_ctx_.is_completed()) {
-        if (rt == nullptr) {
-            LOG_ERROR("Thread %d: rt is null after orchestrator error, skipping dispatch", thread_idx);
-        } else {
-            sched_ctx_.bind_runtime(rt);
-            // 3S+1P: the last thread is the core-less resolution (P) thread; the
-            // rest are core-owning schedulers (S).
-            int32_t completed = (thread_idx == sched_ctx_.p_thread_idx()) ?
-                                    sched_ctx_.run_resolution_thread(runtime, thread_idx) :
-                                    sched_ctx_.resolve_and_dispatch(runtime, thread_idx);
-            if (completed < 0) {
-                LOG_ERROR("Thread %d: Scheduler failed with rc=%d", thread_idx, completed);
-                run_rc = completed;
-            } else {
-                LOG_INFO("Thread %d: Executed %d tasks from runtime", thread_idx, completed);
-            }
-        }
-    }
-
-    // Always shutdown AICore — even if sched_ctx_.completed_ was already true.
-    // platform_deinit_aicore_regs is idempotent.
-    int32_t shutdown_rc = sched_ctx_.shutdown(thread_idx);
-    if (shutdown_rc != 0 && run_rc == 0) {
-        run_rc = shutdown_rc;
-    }
-
-    LOG_INFO("Thread %d: Completed", thread_idx);
-
-    completion_gate_.arrive_and_finalize_if_last(aicpu_thread_num_, [&] {
-        aicpu_publish_task_timing_tail_usage(aicpu_thread_num_);
-        // Destroy the host_build_graph runtime. sm_handle / rt are recreated
-        // every run, so always tear them down here.
-        if (rt != nullptr) {
-            // Clear g_current_runtime in this DSO before destroying rt.
-            framework_bind_runtime(nullptr);
-            runtime_destroy(rt, runtime_arena_);
-            rt = nullptr;
-        }
-    });
-
+    int32_t m0_shutdown_rc = aicore_lifecycle_.shutdown(thread_idx, runtime);
+    if (m0_shutdown_rc != 0 && run_rc == 0) run_rc = m0_shutdown_rc;
+    completion_gate_.arrive_and_finalize_if_last(aicpu_thread_num_, [] {});
     return run_rc;
 }
 
@@ -380,16 +305,12 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     //    bypasses this cache. Invalidating now ensures next round reads from HBM.
     cache_invalidate_range(runtime, sizeof(Runtime));
 
-    // Reset all SchedulerContext-owned state in one place.
-    sched_ctx_.deinit();
+    aicore_lifecycle_.deinit();
 
     completion_gate_.reset();
     runtime_init_ready_.store(false, std::memory_order_release);
 
     aicpu_thread_num_ = 0;
-
-    // Clear the file-scope runtime pointer (freed by the last scheduler thread before deinit).
-    rt = nullptr;
 
     LOG_INFO("DeInit: Runtime execution state reset");
 
@@ -398,8 +319,6 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     hs_setup_done_.store(false, std::memory_order_release);
     hs_arrived_.store(0, std::memory_order_release);
     hs_thread_seq_.store(0, std::memory_order_release);
-    classify_ready_.store(false, std::memory_order_release);
-    classify_arrived_.store(0, std::memory_order_release);
     thread_idx_.store(0, std::memory_order_release);
 
     LOG_INFO("DeInit: AicpuExecutor reset complete");
@@ -453,17 +372,10 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
         LOG_ERROR("aicpu_execute: Thread execution failed with rc=%d", rc);
     }
 
-    int32_t runtime_rc = read_pto2_runtime_status(runtime);
-
     // The finalizer publishes cleanup eligibility only after runtime destruction.
     if (g_aicpu_executor.completion_gate_.claim_cleanup()) {
         LOG_INFO("aicpu_execute: All threads finished, cleaning up");
         g_aicpu_executor.deinit(runtime);
-    }
-
-    if (runtime_rc != 0) {
-        LOG_ERROR("aicpu_execute: PTO2 runtime failed with rc=%d", runtime_rc);
-        return runtime_rc;
     }
 
     if (rc != 0) {

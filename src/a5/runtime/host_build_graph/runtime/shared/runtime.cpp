@@ -30,11 +30,17 @@ Runtime::Runtime() {
     memset(workers, 0, sizeof(workers));
     worker_count = 0;
     aicpu_thread_num = 1;
+    aic_dependency_scheduler_limit = -1;
+    aiv_dependency_scheduler_limit = 0;
     ready_queue_shards = RUNTIME_DEFAULT_READY_QUEUE_SHARDS;
     memset(aicpu_allowed_cpus, 0, sizeof(aicpu_allowed_cpus));
     aicpu_allowed_cpu_count = 0;
     aicpu_launch_count = 0;
     host_total_tasks = 0;
+    aicore_sidecar_base = nullptr;
+    aicore_sidecar_allocation = nullptr;
+    aicore_sidecar_allocation_size = 0;
+    aicore_sidecar_layout = {};
 
     // Initialize shared-memory / orchestration argument plumbing
     gm_sm_ptr_ = nullptr;
