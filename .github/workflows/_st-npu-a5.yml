@@ -71,6 +71,7 @@ jobs:
           source .venv/bin/activate
           DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
           PYTEST="python -m pytest tests/st/a5/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py \
+            tests/st/a5/host_build_graph/dfx/dep_gen/test_dep_gen.py \
             --platform a5 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
             --require-pto-isa --enable-dep-gen"
           task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST"

@@ -102,10 +102,10 @@ public:
     // `DeviceRunnerBase`.
 
     /**
-     * a5 `dep_gen` enablement setter, overriding the base no-op. Captures
-     * orchestrator submit_task inputs for offline replay into deps.json.
+     * a5 `dep_gen` enablement setter, overriding the base no-op. Selects the
+     * host graph capture or device replay path provided by the linked runtime.
      */
-    void set_dep_gen_enabled(bool enable) override { enable_dep_gen_ = enable; }
+    void set_dep_gen_enabled(bool enable) override;
 
     /**
      * Cleanup all resources

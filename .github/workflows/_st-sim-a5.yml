@@ -104,6 +104,7 @@ jobs:
         if: inputs.include_dfx_smokes
         run: |
           pytest tests/st/a5/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py \
+            tests/st/a5/host_build_graph/dfx/dep_gen/test_dep_gen.py \
             --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
             --require-pto-isa --enable-dep-gen
 

@@ -266,6 +266,63 @@ def test_aicore_ticket_scheduler_phases_synthesize_tasks_and_render(tmp_path):
     }
 
 
+def test_level_one_scheduler_tasks_join_dependency_graph_and_kernel_names(tmp_path):
+    input_path = tmp_path / "chip_swimlane_records.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "chip_swimlane_level": 1,
+                "metadata": {"clock_freq_hz": 1_000_000, "num_cores": 2, "core_types": ["aic", "aiv"]},
+                "aicore_tasks": [],
+                "aicpu_tasks": [],
+                "aicore_scheduler_phases": [
+                    {
+                        "worker_id": 0,
+                        "core_type": 0,
+                        "task_id": 1,
+                        "phase": "Kernel",
+                        "start_cycles": 100,
+                        "end_cycles": 110,
+                    },
+                    {
+                        "worker_id": 1,
+                        "core_type": 1,
+                        "task_id": 2,
+                        "phase": "PendingWait",
+                        "start_cycles": 105,
+                        "end_cycles": 115,
+                    },
+                    {
+                        "worker_id": 1,
+                        "core_type": 1,
+                        "task_id": 2,
+                        "phase": "Kernel",
+                        "start_cycles": 120,
+                        "end_cycles": 130,
+                    },
+                ],
+            }
+        )
+    )
+
+    parsed = sc.read_perf_data(input_path)
+    output_path = tmp_path / "merged_swimlane.json"
+    sc.generate_chrome_trace_json(
+        parsed["tasks"],
+        str(output_path),
+        func_id_to_name={"0": "producer", "1": "consumer"},
+        deps_edges={1: [2]},
+        deps_kernel_map={1: [0, -1, -1], 2: [-1, 1, -1]},
+        deps_block_map={1: 1, 2: 1},
+        aicore_scheduler_phases=parsed["aicore_scheduler_phases"],
+    )
+
+    events = json.loads(output_path.read_text())["traceEvents"]
+    assert any(event.get("name") == "producer(t1)" for event in events)
+    assert any(event.get("name") == "consumer(t2)" for event in events)
+    assert _count_dependency_flow_starts(output_path, pid=4) == 1
+
+
 def test_load_func_names_auto_discovery_and_explicit_precedence(tmp_path):
     input_path = tmp_path / "chip_swimlane_records.json"
     name_map_path = tmp_path / "name_map_case.json"

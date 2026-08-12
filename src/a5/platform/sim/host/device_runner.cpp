@@ -43,19 +43,21 @@
 #include "host/runtime_timeout_config.h"
 #include "runtime.h"
 
-// dep_gen_replay_emit_deps_json: strong symbol provided by
-// runtime/tensormap_and_ringbuffer/host/dep_gen_replay.cpp when that runtime is
-// linked into host_runtime.so. host_build_graph has no replay implementation
-// today, so its host_runtime.so falls through to this weak stub. visibility=
-// hidden keeps the stub off the global dynamic symbol table so it can't
-// accidentally shadow the strong symbol via RTLD_GLOBAL.
-// LOG_DEBUG (not WARN): runtimes that don't link dep_gen never enable it in
-// practice, so this path is unreachable for end users — the symbol exists
-// purely to keep the .so loadable.
+// dep_gen has two shapes, one per orchestration site. Device orchestration
+// captures submits in a ring and replays them; host orchestration captures the
+// graph in host memory and emits it directly. Each runtime links only its own
+// strong symbols, so both halves need hidden weak fallbacks here.
 extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_replay_emit_deps_json(
     const struct DepGenRecord * /*records*/, size_t /*num_records*/, const char * /*deps_json_path*/
 ) {
     LOG_DEBUG("dep_gen replay not implemented for this runtime — deps.json skipped");
+    return -1;
+}
+
+extern "C" __attribute__((weak, visibility("hidden"))) bool dep_gen_host_graph_active() { return false; }
+extern "C" __attribute__((weak, visibility("hidden"))) void dep_gen_host_graph_set_enabled(bool /*enable*/) {}
+extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_host_graph_emit(const char * /*deps_json_path*/) {
+    LOG_DEBUG("dep_gen host graph not implemented for this runtime — deps.json skipped");
     return -1;
 }
 
@@ -92,6 +94,13 @@ struct DeviceRunner::ActiveRun {
 
 DeviceRunner::DeviceRunner() = default;
 DeviceRunner::~DeviceRunner() { finalize(); }
+
+void DeviceRunner::set_dep_gen_enabled(bool enable) {
+    enable_dep_gen_ = enable;
+    // The strong host_build_graph symbol arms host capture before bind; the
+    // weak fallback leaves device-orchestrated runtimes on replay capture.
+    dep_gen_host_graph_set_enabled(enable);
+}
 
 void DeviceRunner::cleanup_active_run() noexcept {
     if (active_run_ == nullptr) return;
@@ -310,7 +319,7 @@ int DeviceRunner::prepare_execution(
     if (enable_pmu_) {
         SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_PMU);
     }
-    if (enable_dep_gen_) {
+    if (enable_dep_gen_ && !dep_gen_host_graph_active()) {
         SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DEP_GEN);
     }
     if (enable_scope_stats_) {
@@ -369,7 +378,7 @@ int DeviceRunner::prepare_execution(
         }
     }
 
-    if (enable_dep_gen_) {
+    if (enable_dep_gen_ && !dep_gen_host_graph_active()) {
         rc = init_dep_gen(launch_aicpu_num, device_id_);
         if (rc != 0) {
             LOG_ERROR("init_dep_gen failed: %d", rc);
@@ -465,7 +474,7 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
                 set_platform_pmu_base_func_(kernel_args_.pmu_data_base);
                 set_pmu_enabled_func_(enable_pmu_);
                 set_platform_dep_gen_base_func_(kernel_args_.dep_gen_data_base);
-                set_dep_gen_enabled_func_(enable_dep_gen_);
+                set_dep_gen_enabled_func_(enable_dep_gen_ && !dep_gen_host_graph_active());
                 set_scope_stats_enabled_func_(enable_scope_stats_);
                 set_platform_scope_stats_base_func_(kernel_args_.scope_stats_data_base);
 
@@ -475,7 +484,7 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
                 if (enable_chip_swimlane_) chip_swimlane_collector_.start(thread_factory);
                 if (enable_dump_args_) dump_collector_.start(thread_factory);
                 if (enable_pmu_) pmu_collector_.start(thread_factory);
-                if (enable_dep_gen_) dep_gen_collector_.start(thread_factory);
+                if (enable_dep_gen_ && !dep_gen_host_graph_active()) dep_gen_collector_.start(thread_factory);
                 if (enable_scope_stats_) scope_stats_collector_.start(thread_factory);
 
                 if (kernel_args_.device_wall_data_base != 0) {
@@ -623,13 +632,20 @@ int DeviceRunner::drain_execution(ActiveExecution &) {
     }
 
     if (enable_dep_gen_) {
-        dep_gen_collector_.stop();
-        if (dep_gen_collector_.reconcile_counters()) {
-            const auto &records = dep_gen_collector_.records();
-            const std::string deps = make_deps_json_path(output_prefix_);
-            int replay_rc = dep_gen_replay_emit_deps_json(records.data(), records.size(), deps.c_str());
-            if (replay_rc != 0) {
-                LOG_ERROR("dep_gen replay failed (%d) — deps.json not produced", replay_rc);
+        const std::string deps = make_deps_json_path(output_prefix_);
+        if (dep_gen_host_graph_active()) {
+            int emit_rc = dep_gen_host_graph_emit(deps.c_str());
+            if (emit_rc != 0) {
+                LOG_ERROR("dep_gen host graph emit failed (%d) — deps.json not produced", emit_rc);
+            }
+        } else {
+            dep_gen_collector_.stop();
+            if (dep_gen_collector_.reconcile_counters()) {
+                const auto &records = dep_gen_collector_.records();
+                int replay_rc = dep_gen_replay_emit_deps_json(records.data(), records.size(), deps.c_str());
+                if (replay_rc != 0) {
+                    LOG_ERROR("dep_gen replay failed (%d) — deps.json not produced", replay_rc);
+                }
             }
         }
     }

@@ -597,9 +597,10 @@ def load_deps_json(deps_path):
 def load_deps_kernel_map(deps_path):
     """Build a ``task_id → kernel_ids[3]`` map from deps.json's ``tasks[]``.
 
-    a2a3 dep_gen captures per-task ``kernel_ids = [aic, aiv0, aiv1]`` so the
-    swimlane post-processor can resolve ``func_id`` at AICORE_TIMING (level=1)
-    where the AICore record alone is on disk and carries ``func_id == -1``.
+    HBG host-direct dep_gen captures per-task
+    ``kernel_ids = [aic, aiv0, aiv1]`` so the swimlane post-processor can
+    resolve ``func_id`` at AICORE_TIMING (level=1), where the AICore record
+    alone is on disk and carries ``func_id == -1``.
     The trace generator uses the per-record ``core_type`` to pick the right
     subslot: ``aic → kernel_ids[0]``, ``aiv → kernel_ids[1]`` (falling back
     to ``[2]`` if AIV0 is inactive). Same pattern fanout edges already use
