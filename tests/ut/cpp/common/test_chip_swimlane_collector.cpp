@@ -50,25 +50,6 @@ void collect_one_aicore_record(ChipSwimlaneCollector &collector, uint64_t task_i
     collector.on_buffer_collected(info, 0);
 }
 
-void collect_task_and_resolve_records(ChipSwimlaneCollector &collector, uint64_t task_id) {
-    ChipSwimlaneAicoreTaskBuffer buffer{};
-    buffer.count = 2;
-    buffer.records[0].task_token_raw = task_id;
-    buffer.records[0].reg_task_id = static_cast<uint32_t>(task_id);
-    buffer.records[0].start_time = 100;
-    buffer.records[0].end_time = 200;
-    buffer.records[1].task_token_raw = task_id;
-    buffer.records[1].reg_task_id = UINT32_C(0x80000000) | static_cast<uint32_t>(task_id);
-    buffer.records[1].start_time = 210;
-    buffer.records[1].end_time = 240;
-
-    ReadyBufferInfo info{};
-    info.type = ProfBufferType::AICORE_TASK;
-    info.index = 0;
-    info.host_buffer_ptr = &buffer;
-    collector.on_buffer_collected(info, 0);
-}
-
 void initialize_memory_ops(ChipSwimlaneCollector &collector) {
     collector.start([](std::function<void()> fn) {
         return std::thread(std::move(fn));
@@ -129,34 +110,6 @@ TEST(ChipSwimlaneCollectorTest, StrictExportRejectsDroppedAicoreRecords) {
     EXPECT_NE(collector.export_swimlane_json(), 0);
     EXPECT_FALSE(std::filesystem::exists(output / "chip_swimlane_records.json"));
     EXPECT_FALSE(std::filesystem::exists(output / "chip_swimlane_records.json.tmp"));
-
-    collector.finalize(nullptr, test_free);
-    std::filesystem::remove_all(output);
-}
-
-TEST(ChipSwimlaneCollectorTest, ExportSeparatesAicoreResolveRecords) {
-    const std::filesystem::path output = test_output("resolve");
-    std::filesystem::remove_all(output);
-
-    ChipSwimlaneCollector collector;
-    ASSERT_EQ(
-        collector.initialize(
-            1, 1, 0, ChipSwimlaneLevel::AICORE_TIMING, test_alloc, nullptr, test_free, output.string()
-        ),
-        0
-    );
-    initialize_memory_ops(collector);
-    collect_task_and_resolve_records(collector, 7);
-
-    auto *state = get_aicore_buffer_state(collector.get_chip_swimlane_setup_device_ptr(), 1, 0);
-    state->head.total_record_count = 2;
-
-    ASSERT_TRUE(collector.reconcile_counters());
-    ASSERT_EQ(collector.export_swimlane_json(), 0);
-    std::ifstream input(output / "chip_swimlane_records.json");
-    const std::string json((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-    EXPECT_NE(json.find("\"aicore_tasks\": [\n    [0, 7, 7, 100, 200, 0]\n  ]"), std::string::npos);
-    EXPECT_NE(json.find("\"aicore_resolve_phases\": [\n    [0, 7, 210, 240]\n  ]"), std::string::npos);
 
     collector.finalize(nullptr, test_free);
     std::filesystem::remove_all(output);

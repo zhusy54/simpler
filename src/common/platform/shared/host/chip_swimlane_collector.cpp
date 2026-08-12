@@ -1041,7 +1041,6 @@ int ChipSwimlaneCollector::export_swimlane_json() {
     //
     //   aicore_tasks:          [core_id, task_token_raw, reg_task_id, start_cycles, end_cycles,
     //                           receive_to_start_cycles]
-    //   aicore_resolve_phases: [core_id, task_token_raw, start_cycles, end_cycles]
     //   aicpu_tasks:           [core_id, reg_task_id, dispatch_cycles, finish_cycles]
     {
         // copy_aicore_buffer already drops r.start_time == 0 slots when
@@ -1051,10 +1050,6 @@ int ChipSwimlaneCollector::export_swimlane_json() {
         size_t total = 0;
         for (size_t core_idx = 0; core_idx < collected_aicore_records_.size(); core_idx++) {
             for (const auto &r : collected_aicore_records_[core_idx]) {
-                if (chip_swimlane_level_ == ChipSwimlaneLevel::AICORE_TIMING &&
-                    (r.reg_task_id & CHIP_SWIMLANE_AICORE_RESOLVE_RECORD_TAG) != 0) {
-                    continue;
-                }
                 if (!first) outfile << ",";
                 outfile << "\n    [" << core_idx << ", " << r.task_token_raw << ", " << r.reg_task_id << ", "
                         << r.start_time << ", " << r.end_time << ", " << r.receive_to_start_cycles << "]";
@@ -1065,27 +1060,6 @@ int ChipSwimlaneCollector::export_swimlane_json() {
         if (!first) outfile << "\n  ";
         outfile << "]";
         LOG_INFO("  aicore_tasks: %zu records", total);
-    }
-    {
-        outfile << ",\n  \"aicore_resolve_phases\": [";
-        bool first = true;
-        size_t total = 0;
-        for (size_t core_idx = 0; core_idx < collected_aicore_records_.size(); core_idx++) {
-            for (const auto &r : collected_aicore_records_[core_idx]) {
-                if (chip_swimlane_level_ != ChipSwimlaneLevel::AICORE_TIMING ||
-                    (r.reg_task_id & CHIP_SWIMLANE_AICORE_RESOLVE_RECORD_TAG) == 0) {
-                    continue;
-                }
-                if (!first) outfile << ",";
-                outfile << "\n    [" << core_idx << ", " << r.task_token_raw << ", " << r.start_time << ", "
-                        << r.end_time << "]";
-                first = false;
-                total++;
-            }
-        }
-        if (!first) outfile << "\n  ";
-        outfile << "]";
-        LOG_INFO("  aicore_resolve_phases: %zu records", total);
     }
     {
         outfile << ",\n  \"aicpu_tasks\": [";

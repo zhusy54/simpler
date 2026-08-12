@@ -83,42 +83,13 @@ void build_random(const ChipTensor &task_state, int64_t task_count) {
     }
 }
 
-template <typename Config>
-auto apply_resolver_profile(Config &config, const ChipTaskArgs &args, int)
-    -> decltype(config.aic_dependency_scheduler_limit = 0, config.aiv_dependency_scheduler_limit = 0, void()) {
-    switch (static_cast<int64_t>(args.scalar(2))) {
-    case 0:
-        break;
-    case 1:
-        config.aic_dependency_scheduler_limit = 0;
-        config.aiv_dependency_scheduler_limit = -1;
-        break;
-    case 2:
-        config.aic_dependency_scheduler_limit = 0;
-        config.aiv_dependency_scheduler_limit = 0;
-        break;
-    case 3:
-        config.aic_dependency_scheduler_limit = 1;
-        config.aiv_dependency_scheduler_limit = 1;
-        break;
-    default:
-        config.aic_dependency_scheduler_limit = -2;
-        config.aiv_dependency_scheduler_limit = -2;
-        break;
-    }
-}
-
-template <typename Config>
-void apply_resolver_profile(Config &, const ChipTaskArgs &, long) {}
-
 }  // namespace
 
 extern "C" {
 
 __attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &args) {
-    PTO2OrchestrationConfig config{.expected_arg_count = 4};
-    apply_resolver_profile(config, args, 0);
-    return config;
+    (void)args;
+    return PTO2OrchestrationConfig{.expected_arg_count = 3};
 }
 
 __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &args) {

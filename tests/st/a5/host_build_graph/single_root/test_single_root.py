@@ -73,7 +73,14 @@ class TestHbgSingleAicRoot(SceneTestCase):
             capture = json.load(f)
         assert capture["chip_swimlane_level"] == 1
         assert len(capture["aicore_tasks"]) == 1
-        assert len(capture["aicore_resolve_phases"]) == 1
+        assert {phase["phase"] for phase in capture["aicore_scheduler_phases"]} == {
+            "SeedClaim",
+            "Payload",
+            "Kernel",
+            "CompletionPublish",
+            "Drain",
+        }
+        assert "aicore_resolve_phases" not in capture
         assert capture["aicpu_tasks"] == []
         assert "aicpu_scheduler_phases" not in capture
         assert "aicpu_orchestrator_phases" not in capture

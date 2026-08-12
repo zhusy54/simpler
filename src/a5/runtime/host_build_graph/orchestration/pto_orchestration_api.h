@@ -371,13 +371,8 @@ private:
 #define PTO2_ORCHESTRATION_CONFIG_DEFINED
 struct PTO2OrchestrationConfig {
     int32_t expected_arg_count;
-    // -1 disables resolvers of this core type, 0 selects automatically, and a
-    // positive value caps the selected resolver count. Executor width is not
-    // affected. These fields are specific to the A5 host_build_graph scheduler.
-    int32_t aic_dependency_scheduler_limit{-1};
-    int32_t aiv_dependency_scheduler_limit{0};
 };
-static_assert(sizeof(PTO2OrchestrationConfig) == 3 * sizeof(int32_t));
+static_assert(sizeof(PTO2OrchestrationConfig) == sizeof(int32_t));
 #endif
 
 // Convenience layer (CoreTaskArgsWithDeps<N> + matching rt_submit_*_task overloads).

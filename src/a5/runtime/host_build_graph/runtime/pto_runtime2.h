@@ -299,8 +299,6 @@ void set_tensor_data(
 #define PTO2_ORCHESTRATION_CONFIG_DEFINED
 struct PTO2OrchestrationConfig {
     int32_t expected_arg_count;
-    int32_t aic_dependency_scheduler_limit{-1};
-    int32_t aiv_dependency_scheduler_limit{0};
 };
-static_assert(sizeof(PTO2OrchestrationConfig) == 3 * sizeof(int32_t));
+static_assert(sizeof(PTO2OrchestrationConfig) == sizeof(int32_t));
 #endif

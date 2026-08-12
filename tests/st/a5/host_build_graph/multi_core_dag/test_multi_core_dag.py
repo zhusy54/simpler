@@ -17,12 +17,12 @@ from simpler.task_interface import ArgDirection as D
 from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, Tensor, scene_test
 
 
-def _case(name, graph_case, task_count, *, resolver_profile=0):
+def _case(name, graph_case, task_count):
     return {
         "name": name,
         "platforms": ["a5sim", "a5"],
         "config": {"aicpu_thread_num": 2},
-        "params": {"graph_case": graph_case, "task_count": task_count, "resolver_profile": resolver_profile},
+        "params": {"graph_case": graph_case, "task_count": task_count},
         "manual": True,
     }
 
@@ -56,24 +56,13 @@ class TestHbgMultiCoreDag(SceneTestCase):
 
     CASES = [
         *[_case(f"mixed_chain_{count}", 0, count) for count in (1, 2, 63, 64, 65, 256, 1024)],
-        _case(
-            "mixed_fanin32_1024",
-            1,
-            1024,
-            resolver_profile=1,
-        ),
-        _case(
-            "mixed_random_1024",
-            3,
-            1024,
-            resolver_profile=2,
-        ),
+        _case("mixed_fanin32_1024", 1, 1024),
+        _case("mixed_random_1024", 3, 1024),
         *[
             _case(
                 f"mixed_multi_root_{count}",
                 2,
                 count,
-                resolver_profile=3,
             )
             for count in (64, 256, 1024, 4096)
         ],
@@ -85,7 +74,6 @@ class TestHbgMultiCoreDag(SceneTestCase):
             Tensor("task_state", torch.zeros(task_count + 1, dtype=torch.int64)),
             Scalar("graph_case", ctypes.c_int64(params["graph_case"])),
             Scalar("task_count", ctypes.c_int64(task_count)),
-            Scalar("resolver_profile", ctypes.c_int64(params["resolver_profile"])),
         )
 
     def compute_golden(self, args, params):

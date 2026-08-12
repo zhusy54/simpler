@@ -62,49 +62,11 @@ class TestHbgSingleCoreDag(SceneTestCase):
                 "graph_case": graph_case,
                 "task_count": task_count,
                 "core_type": core_type,
-                "resolver_profile": 0,
             },
             "manual": True,
         }
         for core_type in ("aic", "aiv", "mixed")
         for name, (graph_case, task_count) in GRAPH_CASES.items()
-    ] + [
-        {
-            "name": "mixed_multi_root_aic_resolvers",
-            "platforms": ["a5sim", "a5"],
-            "config": {"aicpu_thread_num": 2},
-            "params": {
-                "graph_case": GRAPH_CASES["multi_root_64"][0],
-                "task_count": 64,
-                "core_type": "mixed",
-                "resolver_profile": 1,
-            },
-            "manual": True,
-        },
-        {
-            "name": "mixed_fanout_both_resolver_types",
-            "platforms": ["a5sim", "a5"],
-            "config": {"aicpu_thread_num": 2},
-            "params": {
-                "graph_case": GRAPH_CASES["fanout_63"][0],
-                "task_count": 64,
-                "core_type": "mixed",
-                "resolver_profile": 2,
-            },
-            "manual": True,
-        },
-        {
-            "name": "mixed_fanin_capped_resolvers",
-            "platforms": ["a5sim", "a5"],
-            "config": {"aicpu_thread_num": 2},
-            "params": {
-                "graph_case": GRAPH_CASES["fanin_32x32"][0],
-                "task_count": 64,
-                "core_type": "mixed",
-                "resolver_profile": 3,
-            },
-            "manual": True,
-        },
     ]
 
     def generate_args(self, params):
@@ -112,7 +74,6 @@ class TestHbgSingleCoreDag(SceneTestCase):
             Tensor("task_state", torch.zeros(64, dtype=torch.int64)),
             Scalar("graph_case", ctypes.c_int64(params["graph_case"])),
             Scalar("core_type", ctypes.c_int64({"aic": 0, "aiv": 1, "mixed": 2}[params["core_type"]])),
-            Scalar("resolver_profile", ctypes.c_int64(params["resolver_profile"])),
         )
 
     def compute_golden(self, args, params):

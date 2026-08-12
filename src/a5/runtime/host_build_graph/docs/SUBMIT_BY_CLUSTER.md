@@ -72,18 +72,22 @@ must launch as one cohort:
 - AIV-only: `block_num <= rt_available_aiv_count()`
 - AIC or MIX: `block_num <= rt_available_cluster_count()`
 
-## Dependency and Readiness Flow
+## Dependency and Readiness Flow on the A5 HBG AICore Scheduler
 
 1. Host orchestration allocates a task slot and builds its payload.
 2. TensorMap and explicit dependencies append producer local IDs to
    `fanin_local_ids[]`.
 3. Submit publishes only the finished graph data; it does not push ready tasks.
-4. After H2D, device boot scans every submitted task exactly once.
-5. A task with every fanin complete is routed to its ready queue; otherwise it
-   registers on its first unmet producer's wake list.
-6. Producer completion reclassifies wake-list consumers until they become ready.
+4. The host emits sorted AIC/AIV task-ID streams after validating the graph.
+5. Each active AICore seeds one stream entry, then claims later entries through
+   the type-specific ticket cursor.
+6. The owner keeps up to two private pending tasks and polls their first
+   unresolved monotonic completion flag.
+7. Kernel output publication is followed by a direct per-task `DONE` publish.
 
-Completion flags are monotonic, so a task never needs periodic fanin polling.
+There are no device ReadyQ/CompletionQ operations or wake-list mutations.
+Completion flags are monotonic, so each owner remembers and skips the already
+completed fanin prefix.
 
 ## Dispatch and Completion
 
@@ -99,10 +103,16 @@ Completion flags are monotonic, so a task never needs periodic fanin polling.
 ## Executor Model
 
 The host loads and executes the orchestration shared object synchronously. The
-device has no orchestration thread: every launched AICPU thread participates in
-scheduling its assigned cores after the boot thread attaches the prebuilt graph.
-Cluster ownership is assigned during the AICore handshake and remains stable for
-the run.
+device has no orchestration thread. One AICPU supervisor publishes the active
+worker prefixes and waits for their drained counters; other AICPU threads wait
+for teardown. Persistent AICore workers own ticket claim, dependency polling,
+kernel execution, and completion publication.
+
+The current ticket scheduler accepts only the v1 single-owner shape: one AIC or
+one AIV subtask, `logical_block_num == 1`, with no predicate or sync-start.
+Mixed and multi-block shapes described above remain submission-level contracts
+but are rejected by this execution backend until group ownership and joined
+completion are implemented.
 
 ## Capacity
 

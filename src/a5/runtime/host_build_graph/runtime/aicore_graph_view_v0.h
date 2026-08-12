@@ -56,7 +56,6 @@ enum class AicoreRootStatusV0 : uint64_t {
     INVALID_FANIN_COUNT = 8,
     INVALID_FANIN_ID = 9,
     MIXED_CORE_TYPE = 10,
-    QUEUE_FULL = 11,
 };
 
 struct AicoreReadonlyGraphV0 {

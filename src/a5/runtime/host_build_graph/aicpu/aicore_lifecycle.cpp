@@ -90,9 +90,9 @@ void AicoreLifecycle::handshake_partition(Runtime *runtime, int32_t tidx, int32_
 
     for (int32_t i = 0; i < ready_count; ++i) {
         const ReadyCore &core = ready[i];
-        handshakes[core.worker_id].task = reinterpret_cast<uint64_t>(aicore_sidecar_at_v0<AicoreWorkerContextV0>(
+        handshakes[core.worker_id].task = reinterpret_cast<uint64_t>(aicore_sidecar_at_v1<AicoreWorkerContextV1>(
             runtime->aicore_sidecar_base, runtime->aicore_sidecar_layout.worker_contexts_offset +
-                                              static_cast<uint64_t>(core.worker_id) * sizeof(AicoreWorkerContextV0)
+                                              static_cast<uint64_t>(core.worker_id) * sizeof(AicoreWorkerContextV1)
         ));
     }
     OUT_OF_ORDER_STORE_BARRIER();
@@ -138,15 +138,12 @@ int32_t AicoreLifecycle::shutdown(int32_t thread_idx, Runtime *runtime) {
     for (int32_t i = lo; i < hi; ++i) {
         core_ids[count++] = i;
         if (is_chip_swimlane_enabled()) {
-            auto *worker = aicore_sidecar_at_v0<AicoreWorkerContextV0>(
+            auto *worker = aicore_sidecar_at_v1<AicoreWorkerContextV1>(
                 runtime->aicore_sidecar_base, runtime->aicore_sidecar_layout.worker_contexts_offset +
-                                                  static_cast<uint64_t>(i) * sizeof(AicoreWorkerContextV0)
+                                                  static_cast<uint64_t>(i) * sizeof(AicoreWorkerContextV1)
             );
             cache_invalidate_range(worker, sizeof(*worker));
-            chip_swimlane_aicpu_set_aicore_counts(
-                i, worker->dfx_reserved[AICORE_PROFILE_ATTEMPTED_INDEX_V0],
-                worker->dfx_reserved[AICORE_PROFILE_DROPPED_INDEX_V0]
-            );
+            chip_swimlane_aicpu_set_aicore_counts(i, worker->executed_task_count == 0 ? 0 : 1, 0);
         }
     }
 

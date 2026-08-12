@@ -30,9 +30,6 @@ Runtime::Runtime() {
     memset(workers, 0, sizeof(workers));
     worker_count = 0;
     aicpu_thread_num = 1;
-    aic_dependency_scheduler_limit = -1;
-    aiv_dependency_scheduler_limit = 0;
-    ready_queue_shards = RUNTIME_DEFAULT_READY_QUEUE_SHARDS;
     memset(aicpu_allowed_cpus, 0, sizeof(aicpu_allowed_cpus));
     aicpu_allowed_cpu_count = 0;
     aicpu_launch_count = 0;
@@ -69,7 +66,6 @@ Runtime::Runtime() {
 // Shared-memory / orchestration argument plumbing
 // =============================================================================
 
-void *Runtime::get_gm_sm_ptr() const { return gm_sm_ptr_; }
 void *Runtime::get_gm_heap_ptr() const { return gm_heap_ptr_; }
 const ChipStorageTaskArgs &Runtime::get_orch_args() const { return orch_args_storage_; }
 void Runtime::set_gm_sm_ptr(void *p) { gm_sm_ptr_ = p; }

@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <algorithm>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
@@ -22,6 +23,8 @@
 
 #include "aicore_lifecycle.h"
 #include "aicpu/cache_maintenance.h"
+#include "../common/pto_runtime_status.h"
+#include "pto_shared_memory.h"
 #include "runtime.h"
 #include "spin_hint.h"
 
@@ -55,7 +58,7 @@ struct AicpuExecutor {
     std::atomic<bool> runtime_init_ready_{false};
 
     // AICPU owns only the AICore launch/teardown lifecycle. AICore owns graph
-    // dependency resolution, ready/completion queues, and task execution.
+    // ticket ownership, private pending polling, and task execution.
     AicoreLifecycle aicore_lifecycle_;
 
     // ===== Methods =====
@@ -65,6 +68,14 @@ struct AicpuExecutor {
 };
 
 static AicpuExecutor g_aicpu_executor;
+
+static int32_t read_pto2_runtime_status(Runtime *runtime) {
+    if (runtime == nullptr || runtime->get_gm_sm_ptr() == nullptr) return 0;
+    auto *header = static_cast<PTO2SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
+    int32_t orch_error_code = header->orch_error_code.load(std::memory_order_acquire);
+    int32_t sched_error_code = header->sched_error_code.load(std::memory_order_acquire);
+    return runtime_status_from_error_codes(orch_error_code, sched_error_code);
+}
 
 // ===== AicpuExecutor Method Implementations =====
 
@@ -167,18 +178,16 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     }
     int32_t run_rc = 0;
 
-    // The supervisor discovers topology and publishes the per-run resolver set.
-    // AICore owns graph classification, ReadyQ/CompletionQ processing, task
-    // execution, and completion propagation.
+    // The supervisor discovers topology and publishes the active ticket workers.
     if (runtime->aicore_sidecar_base == nullptr || runtime->host_total_tasks < 0) {
         LOG_ERROR("A5 HBG AICore scheduler requires an initialized graph");
         run_rc = -1;
         runtime_init_ready_.store(true, std::memory_order_release);
     } else if (thread_idx == aicpu_thread_num_ - 1) {
-        auto *run_control = aicore_sidecar_at_v0<AicoreRunControlV0>(
+        auto *run_control = aicore_sidecar_at_v1<AicoreRunControlV1>(
             runtime->aicore_sidecar_base, runtime->aicore_sidecar_layout.run_control_offset
         );
-        auto *contexts = aicore_sidecar_at_v0<AicoreWorkerContextV0>(
+        auto *contexts = aicore_sidecar_at_v1<AicoreWorkerContextV1>(
             runtime->aicore_sidecar_base, runtime->aicore_sidecar_layout.worker_contexts_offset
         );
         while (true) {
@@ -195,99 +204,87 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         for (int32_t i = 0; i < runtime->worker_count; ++i) {
             if (static_cast<CoreType>(contexts[i].core_type) == CoreType::AIC) {
                 contexts[i].type_rank = aic_count++;
-                contexts[i].active = runtime->aicore_sidecar_layout.aic_task_count != 0 ? 1 : 0;
             } else {
                 contexts[i].type_rank = aiv_count++;
-                contexts[i].active = runtime->aicore_sidecar_layout.aiv_task_count != 0 ? 1 : 0;
             }
-            contexts[i].resolver_active = 0;
-            contexts[i].classifier_rank = -1;
+            contexts[i].active = 0;
         }
 
-        auto resolve_limit = [&](int32_t requested, int32_t available) {
-            if (requested < 0 || available == 0 || run_control->expected_task_count == 0) return 0;
-            uint64_t capped_tasks = run_control->expected_task_count;
-            if (capped_tasks > static_cast<uint64_t>(available)) capped_tasks = static_cast<uint64_t>(available);
-            int32_t automatic = static_cast<int32_t>(capped_tasks);
-            if (requested == 0) return automatic;
-            return requested < automatic ? requested : automatic;
-        };
-        int32_t aic_resolvers = resolve_limit(runtime->aic_dependency_scheduler_limit, aic_count);
-        int32_t aiv_resolvers = resolve_limit(runtime->aiv_dependency_scheduler_limit, aiv_count);
-        int32_t resolver_count = aic_resolvers + aiv_resolvers;
-        int32_t classifier_rank = 0;
+        const int32_t active_aic = static_cast<int32_t>(
+            std::min<uint64_t>(static_cast<uint64_t>(aic_count), runtime->aicore_sidecar_layout.aic_task_count)
+        );
+        const int32_t active_aiv = static_cast<int32_t>(
+            std::min<uint64_t>(static_cast<uint64_t>(aiv_count), runtime->aicore_sidecar_layout.aiv_task_count)
+        );
         for (int32_t i = 0; i < runtime->worker_count; ++i) {
-            bool selected = (static_cast<CoreType>(contexts[i].core_type) == CoreType::AIC) ?
-                                contexts[i].type_rank < aic_resolvers :
-                                contexts[i].type_rank < aiv_resolvers;
-            if (selected) {
-                contexts[i].resolver_active = 1;
-                contexts[i].classifier_rank = classifier_rank++;
-            }
+            const int32_t active_count =
+                static_cast<CoreType>(contexts[i].core_type) == CoreType::AIC ? active_aic : active_aiv;
+            contexts[i].active = contexts[i].type_rank < active_count ? 1 : 0;
         }
-        run_control->resolver_count = static_cast<uint64_t>(resolver_count);
-        run_control->aic_resolver_count = static_cast<uint64_t>(aic_resolvers);
-        run_control->aiv_resolver_count = static_cast<uint64_t>(aiv_resolvers);
+        auto *aic_stream = aicore_sidecar_at_v1<AicoreTaskStreamV1>(
+            runtime->aicore_sidecar_base, runtime->aicore_sidecar_layout.aic_stream_offset
+        );
+        auto *aiv_stream = aicore_sidecar_at_v1<AicoreTaskStreamV1>(
+            runtime->aicore_sidecar_base, runtime->aicore_sidecar_layout.aiv_stream_offset
+        );
+        aic_stream->initial_ticket_count = static_cast<uint64_t>(active_aic);
+        aic_stream->next_index = static_cast<uint64_t>(active_aic);
+        aiv_stream->initial_ticket_count = static_cast<uint64_t>(active_aiv);
+        aiv_stream->next_index = static_cast<uint64_t>(active_aiv);
+        run_control->active_worker_count = static_cast<uint64_t>(active_aic) + static_cast<uint64_t>(active_aiv);
+        run_control->aic_active_worker_count = static_cast<uint64_t>(active_aic);
+        run_control->aiv_active_worker_count = static_cast<uint64_t>(active_aiv);
         cache_flush_range(contexts, static_cast<size_t>(runtime->worker_count) * sizeof(*contexts));
+        cache_flush_range(aic_stream, sizeof(*aic_stream));
+        cache_flush_range(aiv_stream, sizeof(*aiv_stream));
 
-        if (run_control->expected_task_count != 0 &&
-            ((runtime->aicore_sidecar_layout.aic_task_count != 0 && aic_count == 0) ||
-             (runtime->aicore_sidecar_layout.aiv_task_count != 0 && aiv_count == 0) || resolver_count == 0)) {
+        if ((runtime->aicore_sidecar_layout.aic_task_count != 0 && active_aic == 0) ||
+            (runtime->aicore_sidecar_layout.aiv_task_count != 0 && active_aiv == 0)) {
             LOG_ERROR(
                 "A5 HBG AICore scheduler: topology cannot execute graph (tasks AIC=%" PRIu64 " AIV=%" PRIu64
-                ", cores AIC=%d AIV=%d, resolvers=%d)",
+                ", cores AIC=%d AIV=%d)",
                 runtime->aicore_sidecar_layout.aic_task_count, runtime->aicore_sidecar_layout.aiv_task_count, aic_count,
-                aiv_count, resolver_count
+                aiv_count
             );
             run_rc = -1;
-        } else if (run_control->expected_task_count != 0) {
-            run_control->startup_phase = static_cast<uint64_t>(AicoreRunPhaseV0::CLASSIFY);
-            cache_flush_range(run_control, sizeof(*run_control));
+        } else if (run_control->active_worker_count != 0) {
+            run_control->startup_phase = static_cast<uint64_t>(AicoreRunPhaseV1::RUN);
+            cache_flush_range(run_control, 128);
             while (true) {
                 cache_invalidate_range(run_control, sizeof(*run_control));
-                if (run_control->classified_count == run_control->resolver_count ||
-                    run_control->classification_error != 0) {
+                if (run_control->drained_worker_count == run_control->active_worker_count ||
+                    run_control->scheduler_error != 0) {
                     break;
                 }
                 SPIN_WAIT_HINT();
             }
-            if (run_control->classification_error == 0) {
-                run_control->startup_phase = static_cast<uint64_t>(AicoreRunPhaseV0::RUN);
-                cache_flush_range(run_control, sizeof(*run_control));
-                while (true) {
-                    cache_invalidate_range(run_control, sizeof(*run_control));
-                    if (run_control->completed_count == run_control->expected_task_count ||
-                        run_control->classification_error != 0) {
-                        break;
-                    }
-                    SPIN_WAIT_HINT();
-                }
-            }
-            if (run_control->classification_error != 0) {
+            if (run_control->scheduler_error != 0) {
                 LOG_ERROR(
                     "A5 HBG AICore scheduler: graph execution failed at task=%" PRIu64 " status=%" PRIu64
                     " core=%" PRIu64 " type=%" PRIu64 " graph_tasks=%" PRIu64 " descriptors=0x%" PRIx64
                     " payloads=0x%" PRIx64 " mask=0x%" PRIx64,
-                    run_control->error_task_id, run_control->classification_error, run_control->reserved[5],
-                    run_control->reserved[6], run_control->reserved[1], run_control->reserved[2],
-                    run_control->reserved[3], run_control->reserved[4]
+                    run_control->error_task_id, run_control->scheduler_error, run_control->error_core_id,
+                    run_control->error_core_type, run_control->error_graph_task_count,
+                    run_control->error_descriptors_address, run_control->error_payloads_address,
+                    run_control->error_task_window_mask
                 );
                 run_rc = -1;
             }
         }
 
         run_control->exit_requested = 1;
-        run_control->startup_phase = static_cast<uint64_t>(AicoreRunPhaseV0::EXIT);
-        cache_flush_range(run_control, sizeof(*run_control));
+        run_control->startup_phase = static_cast<uint64_t>(AicoreRunPhaseV1::EXIT);
+        cache_flush_range(run_control, 128);
         while (true) {
             cache_invalidate_range(run_control, sizeof(*run_control));
             if (run_control->finished_count == static_cast<uint64_t>(runtime->worker_count)) break;
             SPIN_WAIT_HINT();
         }
-        if (run_rc == 0 && run_control->completed_count != run_control->expected_task_count) {
+        if (run_rc == 0 && run_control->executed_task_count + run_control->inline_completed_count !=
+                               run_control->expected_task_count) {
             LOG_ERROR(
-                "A5 HBG AICore scheduler: v0 count mismatch expected=%" PRIu64 " completed=%" PRIu64,
-                run_control->expected_task_count, run_control->completed_count
+                "A5 HBG AICore scheduler: count mismatch expected=%" PRIu64 " executed=%" PRIu64 " inline=%" PRIu64,
+                run_control->expected_task_count, run_control->executed_task_count, run_control->inline_completed_count
             );
             run_rc = -1;
         }
@@ -376,10 +373,17 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
         LOG_ERROR("aicpu_execute: Thread execution failed with rc=%d", rc);
     }
 
+    int32_t runtime_rc = read_pto2_runtime_status(runtime);
+
     // The finalizer publishes cleanup eligibility only after runtime destruction.
     if (g_aicpu_executor.completion_gate_.claim_cleanup()) {
         LOG_INFO("aicpu_execute: All threads finished, cleaning up");
         g_aicpu_executor.deinit(runtime);
+    }
+
+    if (runtime_rc != 0) {
+        LOG_ERROR("aicpu_execute: PTO2 runtime failed with rc=%d", runtime_rc);
+        return runtime_rc;
     }
 
     if (rc != 0) {

@@ -13,7 +13,7 @@
 
 #include <stdint.h>
 
-#include "aicore_execution_sidecar_v0.h"
+#include "aicore_execution_sidecar_v1.h"
 
 inline __aicore__ void aicore_publish_cache_line_v0(__gm__ void *address) {
 #if defined(__CCE_AICORE__)
@@ -159,14 +159,4 @@ inline __aicore__ uint64_t aicore_gm_compare_exchange_v0(
     (void)__atomic_compare_exchange_n(&value, &observed, desired, false, success_order, failure_order);
     return observed;
 #endif
-}
-
-inline __aicore__ void aicore_publish_next_waiter_v0(__gm__ AicoreTaskControlV0 *control, int64_t next_waiter) {
-    control->next_waiter = next_waiter;
-    aicore_publish_cache_line_v0(&control->next_waiter);
-}
-
-inline __aicore__ int64_t aicore_observe_next_waiter_v0(__gm__ AicoreTaskControlV0 *control) {
-    aicore_observe_cache_line_v0(&control->next_waiter);
-    return control->next_waiter;
 }

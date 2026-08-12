@@ -229,6 +229,8 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
           "aicore_tasks": [[core_id, task_token_raw, reg_task_id, start_cycles,
                             end_cycles, receive_to_start_cycles], ...],
           "aicore_resolve_phases": [[core_id, task_token_raw, start_cycles, end_cycles], ...],
+          "aicore_scheduler_phases": [ {worker_id, core_type, task_id, phase,
+                                         start_cycles, end_cycles}, ... ],
           "aicpu_tasks":  [[core_id, reg_task_id, dispatch_cycles, finish_cycles], ...],
           "aicpu_scheduler_phases":     [ [ {kind, start_cycles, end_cycles, ...}, ... ], ... ],
           "aicpu_orchestrator_phases":  [ [ {submit_idx, task_id, start_cycles, end_cycles}, ... ], ... ]
@@ -283,6 +285,7 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
 
     aicore_rows = data.get("aicore_tasks") or []
     aicore_resolve_rows = data.get("aicore_resolve_phases") or []
+    aicore_scheduler_rows = data.get("aicore_scheduler_phases") or []
     aicpu_rows = data.get("aicpu_tasks") or []
     sched_phases_raw = data.get("aicpu_scheduler_phases") or []
     orch_phases_raw = data.get("aicpu_orchestrator_phases") or []
@@ -329,6 +332,9 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
     for _, _, start_c, end_c in aicore_resolve_rows:
         _track(int(start_c))
         _track(int(end_c))
+    for phase in aicore_scheduler_rows:
+        _track(int(phase.get("start_cycles", 0)))
+        _track(int(phase.get("end_cycles", 0)))
     for _, _, d, f in aicpu_rows:
         _track(int(d))
         _track(int(f))
@@ -423,6 +429,43 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
                 }
             )
 
+    aicore_scheduler_phases = []
+    existing_task_ids = {int(task["task_id"]) for task in tasks}
+    for phase in aicore_scheduler_rows:
+        worker_id = int(phase.get("worker_id", -1))
+        task_id = int(phase.get("task_id", -1))
+        start_us = _to_us(int(phase.get("start_cycles", 0)))
+        end_us = _to_us(int(phase.get("end_cycles", 0)))
+        converted = {
+            "core_id": worker_id,
+            "core_type": _core_type(worker_id),
+            "task_id": task_id,
+            "phase": str(phase.get("phase", "unknown")),
+            "start_time_us": start_us,
+            "end_time_us": end_us,
+            "duration_us": end_us - start_us,
+        }
+        aicore_scheduler_phases.append(converted)
+        if converted["phase"] == "Kernel" and task_id >= 0 and task_id not in existing_task_ids:
+            tasks.append(
+                {
+                    "task_id": task_id,
+                    "func_id": -1,
+                    "core_id": worker_id,
+                    "core_type": converted["core_type"],
+                    "ring_id": (task_id >> 32) & 0xFFFFFFFF,
+                    "start_time_us": start_us,
+                    "end_time_us": end_us,
+                    "duration_us": end_us - start_us,
+                    "dispatch_time_us": 0.0,
+                    "finish_time_us": 0.0,
+                    "receive_time_us": start_us,
+                    "local_setup_us": 0.0,
+                }
+            )
+            existing_task_ids.add(task_id)
+    aicore_scheduler_phases.sort(key=lambda phase: (phase["start_time_us"], phase["core_id"]))
+
     tasks.sort(key=lambda t: int(t["task_id"]))
 
     aicore_resolve_phases = []
@@ -491,6 +534,8 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
     }
     if aicore_resolve_phases:
         out["aicore_resolve_phases"] = aicore_resolve_phases
+    if aicore_scheduler_phases:
+        out["aicore_scheduler_phases"] = aicore_scheduler_phases
     if aicpu_scheduler_phases:
         out["aicpu_scheduler_phases"] = aicpu_scheduler_phases
     if aicpu_orchestrator_phases:
@@ -1214,6 +1259,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     deps_block_map=None,
     emit_overhead=False,
     aicore_resolve_phases=None,
+    aicore_scheduler_phases=None,
 ):
     """Generate Chrome Trace Event Format JSON from task data.
 
@@ -1230,6 +1276,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         orchestrator_phases: Optional list of per-task orchestrator phase records (chip_swimlane_level >= 4)
         core_to_thread: Optional list mapping core_id (index) to scheduler thread index (-1 = unassigned)
         aicore_resolve_phases: Optional AICore dependency-resolution spans
+        aicore_scheduler_phases: Optional AICore ticket/pending scheduler spans
 
     Generates processes in the trace:
         - pid=5 "Graph Execution": one end-to-end envelope per Graph task
@@ -1250,6 +1297,8 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         task_core_ids.add(task["core_id"])
     unique_cores = set(task_core_ids)
     for phase in aicore_resolve_phases or []:
+        unique_cores.add(phase["core_id"])
+    for phase in aicore_scheduler_phases or []:
         unique_cores.add(phase["core_id"])
 
     core_to_tid = {}
@@ -1400,6 +1449,52 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 "tid": core_to_tid[phase["core_id"]] + 1,
                 "ts": phase["start_time_us"],
                 "dur": duration_us,
+            }
+        )
+
+    scheduler_core_types = {
+        phase["core_id"]: phase.get("core_type", "unknown") for phase in aicore_scheduler_phases or []
+    }
+    for core_id in sorted(scheduler_core_types):
+        core_type_str = str(scheduler_core_types[core_id]).upper()
+        events.append(
+            {
+                "args": {"name": f"{core_type_str}_{core_id} Scheduler"},
+                "cat": "__metadata",
+                "name": "thread_name",
+                "ph": "M",
+                "pid": 4,
+                "tid": core_to_tid[core_id] + 2,
+            }
+        )
+    scheduler_phase_colors = {
+        "SeedClaim": "thread_state_running",
+        "TicketClaim": "thread_state_runnable",
+        "PendingWait": "thread_state_iowait",
+        "Payload": "cq_build_running",
+        "Kernel": "good",
+        "CompletionPublish": "cq_build_passed",
+        "Drain": "terrible",
+    }
+    for phase in aicore_scheduler_phases or []:
+        task_id = phase["task_id"]
+        task_label = "worker" if task_id == 0xFFFFFFFFFFFFFFFF else format_task_display(task_id)
+        phase_name = phase["phase"]
+        events.append(
+            {
+                "args": {
+                    "event-hint": f"{phase_name} Task:{task_label}, CoreId:{phase['core_id']}",
+                    "taskId": task_id,
+                    "duration-us": phase["duration_us"],
+                },
+                "cat": "aicore_scheduler",
+                "cname": scheduler_phase_colors.get(phase_name, "generic_work"),
+                "name": f"{phase_name}({task_label})",
+                "ph": "X",
+                "pid": 4,
+                "tid": core_to_tid[phase["core_id"]] + 2,
+                "ts": phase["start_time_us"],
+                "dur": phase["duration_us"],
             }
         )
 
@@ -2884,6 +2979,7 @@ def main():
             deps_block_map=deps_block_map,
             emit_overhead=args.overhead,
             aicore_resolve_phases=data.get("aicore_resolve_phases"),
+            aicore_scheduler_phases=data.get("aicore_scheduler_phases"),
         )
         if args.overhead and deps_edges is None:
             print(

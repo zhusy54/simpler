@@ -1040,6 +1040,7 @@ extern "C" __attribute__((weak)) int prewarm_config_impl(
 
 extern "C" __attribute__((weak)) int validate_chip_swimlane_level_impl(int32_t) { return 0; }
 extern "C" __attribute__((weak)) bool strict_chip_swimlane_validation_impl() { return false; }
+extern "C" __attribute__((weak)) void configure_runtime_diagnostics_impl(Runtime *, const CallConfig *) {}
 
 void DeviceRunnerBase::apply_call_config(const CallConfig &config) {
     set_chip_swimlane_enabled(config.enable_chip_swimlane);
@@ -1384,6 +1385,7 @@ int DeviceRunnerBase::resolve_block_dim() {
 }
 
 int DeviceRunnerBase::prepare_launch_shape(Runtime &runtime, const CallConfig &config) {
+    configure_runtime_diagnostics_impl(&runtime, &config);
     if (validate_launch_aicpu_num(config.aicpu_thread_num) != 0) {
         return -1;
     }

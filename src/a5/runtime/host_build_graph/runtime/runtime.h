@@ -21,7 +21,7 @@
  * - Function address mapping (func_id_to_addr_)
  *
  * AICore workers materialize a PTO2DispatchPayload from the uploaded graph,
- * execute it, and publish completion to the AICore dependency resolver.
+ * execute it, and publish its per-task completion flag.
  */
 
 #pragma once
@@ -31,13 +31,14 @@
 #include <stdio.h>   // for fprintf, printf
 #include <string.h>  // for memset
 
+#include <string>
 #include <vector>
 
 #include "common/core_type.h"
 #include "common/chip_swimlane_profiling.h"
 #include "common/platform_config.h"
 #include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
-#include "aicore_execution_sidecar_v0.h"
+#include "aicore_execution_sidecar_v1.h"
 #include "pto2_dispatch_payload.h"
 #include "task_args.h"
 
@@ -50,9 +51,6 @@
 #define RUNTIME_MAX_FUNC_ID 1024
 #define RUNTIME_MAX_ORCH_SO_SIZE (4 * 1024 * 1024)  // 4MB max for orchestration SO
 #define RUNTIME_MAX_ORCH_SYMBOL_NAME 64
-
-// Default number of ready-queue shards.
-constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 1;
 
 // =============================================================================
 // Data Structures
@@ -140,17 +138,14 @@ public:
     Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
     int worker_count;                       // Number of active workers
 
-    // Execution parameters for AICPU lifecycle threads and AICore resolvers.
+    // Execution parameters for AICPU lifecycle threads and AICore workers.
     //
     // aicpu_thread_num is the total AICPU thread count launched on this run.
     // host_build_graph builds the task graph on the host, so there is no
     // on-device orchestrator. The highest-index thread supervises the AICore
-    // resolver-set publication and waits for graph completion; other threads
+    // ticket-worker publication and waits for graph completion; other threads
     // wait until teardown.
     int aicpu_thread_num;
-    int32_t aic_dependency_scheduler_limit;
-    int32_t aiv_dependency_scheduler_limit;
-    int ready_queue_shards;  // Number of ready queue shards (1..MAX_AICPU_THREADS, default MAX-1)
 
     // Filter-style affinity gate input (a2a3 onboard). Host fills these
     // before launch from AICPU OCCUPY, and the device gate keeps threads whose
@@ -174,7 +169,7 @@ public:
     void *aicore_sidecar_base;
     void *aicore_sidecar_allocation;
     uint64_t aicore_sidecar_allocation_size;
-    AicoreExecutionSidecarLayoutV0 aicore_sidecar_layout;
+    AicoreExecutionSidecarLayoutV1 aicore_sidecar_layout;
 
 private:
     // Kernel binary tracking for cleanup
@@ -204,6 +199,8 @@ private:
     int32_t active_callable_id_;
     char device_orch_func_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME];
     char device_orch_config_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME];
+    std::string aicore_scheduler_trace_output_prefix_;
+    bool aicore_scheduler_trace_enabled_{false};
 
 public:
     /**
@@ -224,10 +221,12 @@ public:
     void set_worker_count(int n) { worker_count = n; }
     int get_aicpu_thread_num() const { return aicpu_thread_num; }
     void set_aicpu_thread_num(int n) { aicpu_thread_num = n; }
-    void set_dependency_scheduler_limits(int32_t aic, int32_t aiv) {
-        aic_dependency_scheduler_limit = aic;
-        aiv_dependency_scheduler_limit = aiv;
+    void set_aicore_scheduler_trace(bool enabled, const char *output_prefix) {
+        aicore_scheduler_trace_enabled_ = enabled;
+        aicore_scheduler_trace_output_prefix_ = output_prefix != nullptr ? output_prefix : "";
     }
+    bool aicore_scheduler_trace_enabled() const { return aicore_scheduler_trace_enabled_; }
+    const std::string &aicore_scheduler_trace_output_prefix() const { return aicore_scheduler_trace_output_prefix_; }
     Handshake *get_workers() { return workers; }
     int32_t get_aicpu_allowed_cpu_count() const { return aicpu_allowed_cpu_count; }
     void set_aicpu_allowed_cpu_count(int32_t n) { aicpu_allowed_cpu_count = n; }
@@ -244,7 +243,7 @@ public:
     // Shared-memory / orchestration argument plumbing
     // =========================================================================
 
-    void *get_gm_sm_ptr() const;
+    void *get_gm_sm_ptr() const { return gm_sm_ptr_; }
     void *get_gm_heap_ptr() const;
     const ChipStorageTaskArgs &get_orch_args() const;
     void set_gm_sm_ptr(void *p);

@@ -1,11 +1,11 @@
-# A5 HBG AICore scheduling profiling
+# A5 HBG AICore scheduler profiling
 
 A5 `host_build_graph` supports chip-swimlane levels 0 and 1 only:
 
 | `enable_chip_swimlane` | Behavior |
 | ---------------------- | -------- |
 | `0` | Disabled |
-| `1` | AICore task receive/start/end timestamps and dependency-resolution spans |
+| `1` | AICore kernel records plus ticket/pending/completion scheduler phases |
 | `2`–`4` | Rejected before device launch |
 
 Use an explicit level because the pytest flag without a value selects the
@@ -15,58 +15,40 @@ global default level 4:
 pytest <case> --platform a5sim --enable-chip-swimlane 1
 ```
 
-## Ownership
-
-AICore owns the steady-state path:
-
-1. pop a ready task;
-2. materialize its payload;
-3. reserve a profiling record;
-4. execute the kernel;
-5. commit the record and make its timestamp writes visible;
-6. publish the completion queue entry; and
-7. resolve/wake dependent tasks.
-
-Committing before completion publication guarantees that a successor cannot be
-released before its predecessor's profiling record is complete.
-
-AICPU performs lifecycle work only: initialize profiling buffers, handshake
-workers, wait for the AICore run to finish, publish final counters, flush, and
-deinitialize register windows. It does not dispatch tasks, poll task completion,
-or run dependency scheduling during normal execution.
-
 ## Output
 
-Successful level-1 capture writes `<output_prefix>/chip_swimlane_records.json`
-with the existing schema:
+A successful level-1 run writes
+`<output_prefix>/chip_swimlane_records.json`. In addition to the common
+metadata and `aicore_tasks`, HBG appends:
 
 ```json
 {
-  "chip_swimlane_level": 1,
-  "metadata": {},
-  "aicore_tasks": [],
-  "aicore_resolve_phases": [],
-  "aicpu_tasks": []
+  "aicore_scheduler_phases": [
+    {
+      "worker_id": 0,
+      "core_type": 0,
+      "task_id": 7,
+      "phase": "TicketClaim",
+      "start_cycles": 100,
+      "end_cycles": 110
+    }
+  ]
 }
 ```
 
-`aicore_tasks` contains one execution record per captured task.
-`aicore_resolve_phases` contains the CompletionQ pop plus completion/wake relay
-span for that task on the resolver core. The swimlane converter renders these
-records as `resolve(tN)` bars on per-core `Resolve` lanes. `aicpu_tasks` is
-empty. AICPU scheduler and orchestrator phase arrays are omitted.
+Supported phase names are `SeedClaim`, `TicketClaim`, `PendingWait`,
+`Payload`, `Kernel`, `CompletionPublish`, and `Drain`. The swimlane converter
+renders them on per-worker `Scheduler` lanes. `aicpu_tasks` is empty because
+AICPU does not dispatch steady-state work.
 
-Each core has `PLATFORM_AICORE_BUFFER_SIZE` (1024) slots shared by execution and
-resolve records. Task execution continues correctly after that capacity is
-reached, but every excess profiling attempt is counted as dropped. Host
-reconciliation then fails the profiling result, removes any temporary/final
-JSON, and returns `SIMPLER_PROFILING_VALIDATION_ERROR`. That error is
-diagnostic-only: output tensors are still copied back before the run reports
-failure.
+The common AICore profiling buffer retains one kernel anchor per worker. The
+sidecar trace cell is indexed by task ID and therefore captures every executed
+task without contending for a shared append cursor. Tracing is conditional on
+level 1; normal execution does not write trace cells.
 
 ## Publication guarantees
 
-The host exports to `chip_swimlane_records.json.tmp`, checks stream accounting
-and record timestamps, flushes the file, then atomically renames it to the final
-path. Strict failure removes both paths, so a stale or partial final JSON cannot
-be mistaken for a successful capture.
+The common collector validates counters and atomically publishes its JSON.
+After device state is copied back, HBG inserts the scheduler phase array through
+a temporary file and atomic rename. A missing, malformed, or unwritable trace
+file fails profiling validation instead of leaving a partial result.

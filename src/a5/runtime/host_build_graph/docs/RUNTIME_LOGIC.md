@@ -3,74 +3,71 @@
 ## Execution model
 
 ```text
-host: load orchestration SO and materialize the complete graph
-  → host: relocate/upload graph image and AICore execution sidecar
-  → AICPU init: initialize profiling and handshake AICore workers
-  → AICore: classify roots, resolve dependencies, execute tasks, wake successors
-  → AICPU teardown: wait, flush diagnostics, close register windows
-  → host: validate sidecar and copy output tensors back
+host: build, validate, relocate, and upload the complete graph
+  → host: build sorted AIC/AIV task streams and the execution sidecar
+  → AICPU: handshake workers, discover topology, publish active prefixes and RUN
+  → AICore: seed by type rank, claim tickets, poll private pending fanins,
+            execute kernels, and publish per-task completion flags
+  → AICPU: wait for active workers to drain, publish EXIT, and tear down
+  → host: validate completions/counters and copy output tensors back
 ```
 
-The device has no orchestration thread. AICPU has no steady-state task scheduler.
-One AICPU supervisor publishes the resolver set and run phase, then waits for
-the AICore completion counters; its peers wait for teardown.
+The device has no orchestration thread. AICPU owns launch and teardown only;
+it does not schedule tasks in the steady-state path.
 
 ## Graph image and sidecar
 
-The host graph uses `PTO2TaskDescriptor` and `PTO2TaskPayload` as its read-only
-device view. Fanins are producer IDs, not host pointers. Before upload, task and
-payload references are relocated to their final device addresses.
+The graph is a read-only view of `PTO2TaskDescriptor` and `PTO2TaskPayload`.
+Fanin entries are producer task IDs and must be strictly smaller than the
+consumer task ID.
 
-Per-run mutable state is separate in the aligned AICore sidecar:
+The 128-byte-aligned v1 sidecar contains:
 
-- one task control per task for completion and intrusive wake-list state;
-- AIC/AIV ready queues and a completion queue;
-- run-wide attach/classify/run/exit counters; and
-- one worker context per AICore, including execution/profiling counters and a
-  private dispatch-payload slot.
+- one padded monotonic completion cell per task;
+- sorted AIC and AIV task-ID streams, each with an isolated ticket cursor;
+- split configuration, lifecycle, and first-error run-control cache lines;
+- one private dispatch payload and one debug/statistics context per worker; and
+- per-task scheduler phase cells written only during level-1 capture.
 
-## Dependency resolution
+Inline-completed tasks start as `DONE` and do not enter either typed stream.
 
-Selected resolver cores partition the initial task scan. A task with no unmet
-fanin enters the ready queue for its core type. Otherwise it registers in an
-unmet predecessor's intrusive wake list.
+## Ticket and pending scheduling
 
-After kernel execution, the worker commits profiling (when enabled) and pushes
-the task ID to the completion queue. A resolver then:
+For each core type, AICPU activates
+`min(available cores, executable tasks)` workers. Rank `r` seeds stream entry
+`r`; the shared cursor starts after the seeded prefix. Later ownership uses one
+`atomicAdd(next_index, 1)` per ticket attempt.
 
-1. marks the task complete;
-2. atomically closes and detaches its wake list;
-3. reclassifies each waiter; and
-4. pushes newly ready tasks to the appropriate AIC/AIV queue.
+Each active worker maintains two owner-only pending slots. It scans them in
+round-robin order, remembers the completed fanin prefix, and polls at most the
+first unresolved producer per slot. Ready work is executed before another
+ticket is claimed. When all pending work is blocked, a compiler-preserved local
+exponential backoff reduces repeated GM loads without adding shared traffic.
 
-Level-1 profiling records the full CompletionQ-pop-to-wake interval on the
-resolver core and exports it as an AICore resolve phase.
+After a kernel publishes its output, the worker atomically changes that task's
+completion cell from `NOT_DONE` to `DONE`. There is no ReadyQ, CompletionQ,
+wake list, or resolver role. Cross-type dependencies use the same global
+completion namespace.
 
-Completion is monotonic. Publication barriers order kernel outputs and profiling
-records before successor release.
+A worker publishes its local statistics and increments `drained_worker_count`
+once its typed cursor is exhausted and both pending slots are empty. AICPU then
+publishes EXIT after every active worker has drained.
 
-## AICPU lifecycle boundary
+## Validation and diagnostics
 
-AICPU is limited to:
+Host validation checks:
 
-- profiling-buffer initialization;
-- parallel worker handshake and register-window setup;
-- topology/resolver configuration;
-- waiting for AICore completion/error/exit counters;
-- final profiling-counter publication and buffer flush; and
-- PMU/register teardown.
+- every task completion cell is `DONE`;
+- worker and run-control execution totals match both typed streams;
+- inline plus executable counts match the graph task count;
+- active, drained, and finished worker counts agree; and
+- each typed cursor reached or passed its stream length.
 
-Legacy `SchedulerContext` dispatch, completion polling, and cold-path scheduler
-sources are not part of this runtime target.
+The first scheduler error records task, worker, graph-address, and window
+metadata before publishing the nonzero error code. Worker snapshots expose both
+pending slots and their current producer without adding writes to the polling
+loop.
 
-## Validation
-
-Host validation checks task controls, ready/completion accounting, worker task
-counts, resolver counts, and final run state. A device execution failure skips
-output copy-back. A profiling-only validation failure is distinct: outputs are
-copied back, profiling JSON is withheld, and the profiling error is returned
-after cleanup.
-
-Chip-swimlane behavior is documented in
-[profiling_levels.md](profiling_levels.md). Scalar access during host graph
-construction is documented in [SCALAR_DATA_ACCESS.md](SCALAR_DATA_ACCESS.md).
+Level-1 chip-swimlane capture exports `SeedClaim`, `TicketClaim`,
+`PendingWait`, `Payload`, `Kernel`, `CompletionPublish`, and `Drain` phases.
+See [profiling_levels.md](profiling_levels.md).

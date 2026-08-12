@@ -199,6 +199,73 @@ def test_level_one_aicore_resolve_phases_render_on_resolver_lanes(tmp_path):
     }
 
 
+def test_aicore_ticket_scheduler_phases_synthesize_tasks_and_render(tmp_path):
+    input_path = tmp_path / "chip_swimlane_records.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "chip_swimlane_level": 1,
+                "metadata": {"clock_freq_hz": 1_000_000, "num_cores": 2, "core_types": ["aic", "aiv"]},
+                "aicore_tasks": [[0, 0, 0, 100, 110, 0]],
+                "aicpu_tasks": [],
+                "aicore_scheduler_phases": [
+                    {
+                        "worker_id": 1,
+                        "core_type": 1,
+                        "task_id": 7,
+                        "phase": "PendingWait",
+                        "start_cycles": 105,
+                        "end_cycles": 120,
+                    },
+                    {
+                        "worker_id": 1,
+                        "core_type": 1,
+                        "task_id": 7,
+                        "phase": "Kernel",
+                        "start_cycles": 125,
+                        "end_cycles": 150,
+                    },
+                    {
+                        "worker_id": 1,
+                        "core_type": 1,
+                        "task_id": 0xFFFFFFFFFFFFFFFF,
+                        "phase": "Drain",
+                        "start_cycles": 151,
+                        "end_cycles": 153,
+                    },
+                ],
+            }
+        )
+    )
+
+    parsed = sc.read_perf_data(input_path)
+
+    assert [task["task_id"] for task in parsed["tasks"]] == [0, 7]
+    assert [phase["phase"] for phase in parsed["aicore_scheduler_phases"]] == [
+        "PendingWait",
+        "Kernel",
+        "Drain",
+    ]
+    output_path = tmp_path / "merged_swimlane.json"
+    sc.generate_chrome_trace_json(
+        parsed["tasks"],
+        str(output_path),
+        aicore_scheduler_phases=parsed["aicore_scheduler_phases"],
+    )
+    events = json.loads(output_path.read_text())["traceEvents"]
+    assert any(
+        event.get("ph") == "M"
+        and event.get("tid") == _core_tid(1) + 2
+        and event.get("args", {}).get("name") == "AIV_1 Scheduler"
+        for event in events
+    )
+    assert {event["name"] for event in events if event.get("cat") == "aicore_scheduler"} == {
+        "PendingWait(t7)",
+        "Kernel(t7)",
+        "Drain(worker)",
+    }
+
+
 def test_load_func_names_auto_discovery_and_explicit_precedence(tmp_path):
     input_path = tmp_path / "chip_swimlane_records.json"
     name_map_path = tmp_path / "name_map_case.json"
