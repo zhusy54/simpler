@@ -78,8 +78,17 @@ struct alignas(128) AicoreCompletionInboxV1 {
     uint8_t atomic_line_padding[120];
 };
 
+struct AicoreTaskTicketV1 {
+    uint32_t task_id;
+    uint16_t kernel_id;
+    uint8_t subtask_slot;
+    uint8_t reserved0;
+    int32_t fanin_count;
+    uint32_t reserved1;
+};
+
 struct alignas(128) AicoreTaskStreamV1 {
-    uint64_t task_ids_offset;
+    uint64_t tickets_offset;
     uint64_t task_count;
     uint64_t initial_ticket_count;
     uint8_t metadata_padding[104];
@@ -195,7 +204,15 @@ struct alignas(128) AicoreTaskTraceCellV1 {
     uint64_t kernel_start_cycles;
     uint64_t kernel_end_cycles;
     uint64_t completion_end_cycles;
-    uint64_t reserved[2];
+    uint64_t ready_scan_start_cycles;
+    uint64_t ready_observe_cycles;
+    uint64_t completion_bookkeeping_end_cycles;
+    uint64_t completion_service_start_cycles;
+    uint64_t completion_service_end_cycles;
+    uint64_t previous_trace_commit_end_cycles;
+    uint64_t initialize_end_cycles;
+    uint64_t route_end_cycles;
+    uint64_t reserved[10];
 };
 
 struct AicoreExecutionSidecarLayoutV1 {
@@ -209,9 +226,9 @@ struct AicoreExecutionSidecarLayoutV1 {
     uint64_t task_controls_offset;
     uint64_t completion_inboxes_offset;
     uint64_t aic_stream_offset;
-    uint64_t aic_task_ids_offset;
+    uint64_t aic_tickets_offset;
     uint64_t aiv_stream_offset;
-    uint64_t aiv_task_ids_offset;
+    uint64_t aiv_tickets_offset;
     uint64_t trace_cells_offset;
 };
 
@@ -223,6 +240,7 @@ static_assert(offsetof(AicoreTaskControlV1, next_waiter) == 64, "waiter metadata
 static_assert(offsetof(AicoreTaskControlV1, completion_next) == 80, "completion link offset changed");
 static_assert(sizeof(AicoreCompletionInboxV1) == 128, "completion inbox layout changed");
 static_assert(alignof(AicoreCompletionInboxV1) == 128, "completion inbox alignment changed");
+static_assert(sizeof(AicoreTaskTicketV1) == 16, "task ticket layout changed");
 static_assert(sizeof(AicoreTaskStreamV1) == 256, "task stream layout changed");
 static_assert(offsetof(AicoreTaskStreamV1, next_index) == 128, "ticket cursor must have its own line");
 static_assert(sizeof(AicoreRunControlV1) == 384, "run control layout changed");
@@ -232,7 +250,11 @@ static_assert(sizeof(AicoreWorkerContextV1) == 512, "worker context layout chang
 static_assert(offsetof(AicoreWorkerContextV1, pending_task_id) == 128, "debug snapshot offset changed");
 static_assert(offsetof(AicoreWorkerContextV1, seeded_task_count) == 256, "worker stats offset changed");
 static_assert(offsetof(AicoreWorkerContextV1, drain_start_cycles) == 384, "worker trace offset changed");
-static_assert(sizeof(AicoreTaskTraceCellV1) == 128, "task trace layout changed");
+static_assert(sizeof(AicoreTaskTraceCellV1) == 256, "task trace layout changed");
+static_assert(
+    offsetof(AicoreTaskTraceCellV1, completion_bookkeeping_end_cycles) == 128,
+    "post-completion trace needs its own line"
+);
 
 #if !defined(__CCE_AICORE__)
 #include <type_traits>
@@ -240,6 +262,8 @@ static_assert(std::is_standard_layout_v<AicoreTaskControlV1>);
 static_assert(std::is_trivially_copyable_v<AicoreTaskControlV1>);
 static_assert(std::is_standard_layout_v<AicoreCompletionInboxV1>);
 static_assert(std::is_trivially_copyable_v<AicoreCompletionInboxV1>);
+static_assert(std::is_standard_layout_v<AicoreTaskTicketV1>);
+static_assert(std::is_trivially_copyable_v<AicoreTaskTicketV1>);
 static_assert(std::is_standard_layout_v<AicoreTaskStreamV1>);
 static_assert(std::is_trivially_copyable_v<AicoreTaskStreamV1>);
 static_assert(std::is_standard_layout_v<AicoreRunControlV1>);
@@ -314,13 +338,17 @@ inline bool aicore_sidecar_plan_v1(
         !aicore_sidecar_reserve_v1(
             &cursor, sizeof(AicoreTaskStreamV1), alignof(AicoreTaskStreamV1), &next.aic_stream_offset
         ) ||
-        !aicore_sidecar_checked_mul_v1(aic_task_count, sizeof(uint32_t), &bytes) ||
-        !aicore_sidecar_reserve_v1(&cursor, bytes, alignof(uint32_t), &next.aic_task_ids_offset) ||
+        !aicore_sidecar_checked_mul_v1(aic_task_count, sizeof(AicoreTaskTicketV1), &bytes) ||
+        !aicore_sidecar_reserve_v1(
+            &cursor, bytes, alignof(AicoreTaskTicketV1), &next.aic_tickets_offset
+        ) ||
         !aicore_sidecar_reserve_v1(
             &cursor, sizeof(AicoreTaskStreamV1), alignof(AicoreTaskStreamV1), &next.aiv_stream_offset
         ) ||
-        !aicore_sidecar_checked_mul_v1(aiv_task_count, sizeof(uint32_t), &bytes) ||
-        !aicore_sidecar_reserve_v1(&cursor, bytes, alignof(uint32_t), &next.aiv_task_ids_offset) ||
+        !aicore_sidecar_checked_mul_v1(aiv_task_count, sizeof(AicoreTaskTicketV1), &bytes) ||
+        !aicore_sidecar_reserve_v1(
+            &cursor, bytes, alignof(AicoreTaskTicketV1), &next.aiv_tickets_offset
+        ) ||
         !aicore_sidecar_checked_mul_v1(task_count, sizeof(AicoreTaskTraceCellV1), &bytes) ||
         !aicore_sidecar_reserve_v1(&cursor, bytes, alignof(AicoreTaskTraceCellV1), &next.trace_cells_offset) ||
         !aicore_sidecar_checked_align_v1(cursor, AICORE_SIDECAR_ALIGNMENT_V1, &next.total_size)) {
@@ -354,10 +382,10 @@ inline bool aicore_sidecar_init_v1(void *base, const AicoreExecutionSidecarLayou
     for (uint64_t i = 0; i < AICORE_WORKER_CAPACITY_V1; ++i)
         inboxes[i].head = AICORE_COMPLETION_INBOX_EMPTY_V1;
     auto *aic_stream = aicore_sidecar_at_v1<AicoreTaskStreamV1>(base, layout.aic_stream_offset);
-    aic_stream->task_ids_offset = layout.aic_task_ids_offset;
+    aic_stream->tickets_offset = layout.aic_tickets_offset;
     aic_stream->task_count = layout.aic_task_count;
     auto *aiv_stream = aicore_sidecar_at_v1<AicoreTaskStreamV1>(base, layout.aiv_stream_offset);
-    aiv_stream->task_ids_offset = layout.aiv_task_ids_offset;
+    aiv_stream->tickets_offset = layout.aiv_tickets_offset;
     aiv_stream->task_count = layout.aiv_task_count;
     auto *contexts = aicore_sidecar_at_v1<AicoreWorkerContextV1>(base, layout.worker_contexts_offset);
     for (uint64_t worker = 0; worker < AICORE_WORKER_CAPACITY_V1; ++worker) {

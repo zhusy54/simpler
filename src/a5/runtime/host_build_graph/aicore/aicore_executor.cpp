@@ -128,8 +128,9 @@ publish_worker_stats(__gm__ AicoreWorkerContextV1 *context, const AicoreWorkerSt
 
 __aicore__ __attribute__((always_inline)) void commit_task_trace(
     __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *context, const AicorePendingSlotV1 &pending,
-    uint64_t pending_wait_end, uint64_t payload_start, uint64_t kernel_start, uint64_t kernel_end,
-    uint64_t completion_end
+    uint64_t pending_wait_end, uint64_t ready_scan_start, uint64_t ready_observe, uint64_t payload_start,
+    uint64_t kernel_start, uint64_t kernel_end, uint64_t completion_end, uint64_t completion_bookkeeping_end,
+    uint64_t completion_service_start, uint64_t completion_service_end, uint64_t previous_trace_commit_end
 ) {
     __gm__ AicoreTaskTraceCellV1 *trace_cells =
         aicore_sidecar_at_v1<AicoreTaskTraceCellV1>(sidecar_base, context->trace_cells_offset);
@@ -148,8 +149,32 @@ __aicore__ __attribute__((always_inline)) void commit_task_trace(
     trace->kernel_start_cycles = kernel_start;
     trace->kernel_end_cycles = kernel_end;
     trace->completion_end_cycles = completion_end;
+    trace->ready_scan_start_cycles = ready_scan_start;
+    trace->ready_observe_cycles = ready_observe;
+    trace->completion_bookkeeping_end_cycles = completion_bookkeeping_end;
+    trace->completion_service_start_cycles = completion_service_start;
+    trace->completion_service_end_cycles = completion_service_end;
+    trace->previous_trace_commit_end_cycles = previous_trace_commit_end;
+    aicore_publish_cache_line_v0(&trace->completion_bookkeeping_end_cycles);
+    aicore_publish_cache_line_v0(&trace->pending_wait_start_cycles);
     trace->valid = 1;
     aicore_publish_cache_line_v0(trace);
+}
+
+__aicore__ __attribute__((always_inline)) void record_task_route_end(
+    __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *context, int64_t task_id
+) {
+    __gm__ AicoreTaskTraceCellV1 *trace_cells =
+        aicore_sidecar_at_v1<AicoreTaskTraceCellV1>(sidecar_base, context->trace_cells_offset);
+    trace_cells[task_id].route_end_cycles = get_sys_cnt_aicore();
+}
+
+__aicore__ __attribute__((always_inline)) void record_task_initialize_end(
+    __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *context, int64_t task_id
+) {
+    __gm__ AicoreTaskTraceCellV1 *trace_cells =
+        aicore_sidecar_at_v1<AicoreTaskTraceCellV1>(sidecar_base, context->trace_cells_offset);
+    trace_cells[task_id].initialize_end_cycles = get_sys_cnt_aicore();
 }
 
 }  // namespace
@@ -225,37 +250,38 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         uint64_t victim_cursor =
             resolver_worker ? (worker_context->inbox_index + 1) % resolver_count : 0;
         uint64_t completions_since_service = 0;
+        uint64_t previous_trace_commit_end = 0;
 
         if (executor_worker) {
             uint64_t seed_time = get_sys_cnt_aicore();
-            __gm__ uint32_t *task_ids = aicore_sidecar_at_v1<uint32_t>(sidecar_base, stream->task_ids_offset);
-            int64_t seed_task_id = static_cast<int64_t>(task_ids[worker_context->type_rank]);
-            AicoreRootStatusV0 seed_status = aicore_pending_initialize_v1(
-                graph, seed_task_id, root_core_type, RUNTIME_MAX_FUNC_ID,
-                static_cast<uint64_t>(worker_context->type_rank), AicoreClaimKindV1::SEED, seed_time, seed_time,
-                &pending[0]
+            __gm__ AicoreTaskTicketV1 *tickets =
+                aicore_sidecar_at_v1<AicoreTaskTicketV1>(sidecar_base, stream->tickets_offset);
+            AicoreTaskTicketV1 seed_ticket{};
+            aicore_load_task_ticket_v1(&tickets[worker_context->type_rank], &seed_ticket);
+            int64_t seed_task_id = static_cast<int64_t>(seed_ticket.task_id);
+            aicore_pending_initialize_v1(
+                seed_ticket, static_cast<uint64_t>(worker_context->type_rank), AicoreClaimKindV1::SEED, seed_time,
+                seed_time, &pending[0]
             );
             pending[0].claim_end_cycles = get_sys_cnt_aicore();
-            if (seed_status != AicoreRootStatusV0::OK) {
-                aicore_record_scheduler_error_v1(run_control, seed_task_id, seed_status, &graph, worker_context);
-            } else {
-                AicoreRouteResultV1 route = aicore_route_task_v1(
-                    graph, sidecar_base, worker_context, run_control, seed_task_id, &stats.wake, chip_swimlane_enabled
-                );
-                if (route == AicoreRouteResultV1::ERROR || route == AicoreRouteResultV1::COMPLETED) {
-                    if (route == AicoreRouteResultV1::COMPLETED) {
-                        aicore_record_scheduler_error_v1(
-                            run_control, seed_task_id, AicoreRootStatusV0::INVALID_ARGUMENTS, &graph, worker_context
-                        );
-                    }
-                } else {
-                    if (route == AicoreRouteResultV1::WAITING) {
-                        (void)aicore_pending_state_v1(sidecar_base, worker_context, &pending[0]);
-                        pending[0].pending_wait_start_cycles = get_sys_cnt_aicore();
-                    }
-                    stats.seeded_task_count = 1;
-                    stats.pending_peak = 1;
+            if (chip_swimlane_enabled) record_task_initialize_end(sidecar_base, worker_context, seed_task_id);
+            AicoreRouteResultV1 route = aicore_route_task_v1(
+                graph, sidecar_base, worker_context, run_control, seed_task_id, &stats.wake, chip_swimlane_enabled
+            );
+            if (route == AicoreRouteResultV1::ERROR || route == AicoreRouteResultV1::COMPLETED) {
+                if (route == AicoreRouteResultV1::COMPLETED) {
+                    aicore_record_scheduler_error_v1(
+                        run_control, seed_task_id, AicoreRootStatusV0::INVALID_ARGUMENTS, &graph, worker_context
+                    );
                 }
+            } else {
+                if (route == AicoreRouteResultV1::WAITING) {
+                    (void)aicore_pending_state_v1(sidecar_base, worker_context, &pending[0]);
+                    pending[0].pending_wait_start_cycles = get_sys_cnt_aicore();
+                }
+                if (chip_swimlane_enabled) record_task_route_end(sidecar_base, worker_context, seed_task_id);
+                stats.seeded_task_count = 1;
+                stats.pending_peak = 1;
             }
         }
 
@@ -300,7 +326,8 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             if (ready_slot == -2) break;
             if (ready_slot >= 0) {
                 AicorePendingSlotV1 &task_pending = pending[ready_slot];
-                uint64_t pending_wait_end = task_pending.pending_wait_start_cycles == 0 ? 0 : get_sys_cnt_aicore();
+                uint64_t ready_observe = get_sys_cnt_aicore();
+                uint64_t pending_wait_end = task_pending.pending_wait_start_cycles == 0 ? 0 : ready_observe;
                 if (pending_wait_end != 0) {
                     stats.dependency_wait_cycles += pending_wait_end - task_pending.pending_wait_start_cycles;
                 }
@@ -352,17 +379,13 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                 );
                 uint64_t completion_end = get_sys_cnt_aicore();
                 if (!enqueue_ok) break;
+                AicorePendingSlotV1 completed_trace_pending{};
+                if (chip_swimlane_enabled) completed_trace_pending = task_pending;
                 aicore_task_profiling_commit_v1(
                     profile_record, static_cast<uint64_t>(task_pending.task_id), task_pending.claim_end_cycles,
                     kernel_start, kernel_end
                 );
                 if (profile_record != nullptr) common_profile_recorded = true;
-                if (chip_swimlane_enabled) {
-                    commit_task_trace(
-                        sidecar_base, worker_context, task_pending, pending_wait_end, payload_start, kernel_start,
-                        kernel_end, completion_end
-                    );
-                }
 
                 ++stats.executed_task_count;
                 stats.payload_cycles += kernel_start - payload_start;
@@ -371,16 +394,32 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                 aicore_pending_clear_v1(&task_pending);
                 scan_start = (static_cast<uint32_t>(ready_slot) + 1) % AICORE_PENDING_SLOT_COUNT_V1;
                 backoff_iterations = kInitialBackoffIterations;
-                if (resolver_worker && ++completions_since_service == kCompletionFairnessInterval) {
+                bool service_completion =
+                    resolver_worker && ++completions_since_service == kCompletionFairnessInterval;
+                uint64_t completion_bookkeeping_end = chip_swimlane_enabled ? get_sys_cnt_aicore() : 0;
+                uint64_t completion_service_start = 0;
+                uint64_t completion_service_end = 0;
+                bool service_ok = true;
+                if (service_completion) {
+                    completion_service_start = completion_bookkeeping_end;
                     bool resolved = false;
-                    if (!aicore_service_completion_inboxes_v1(
-                            graph, sidecar_base, worker_context, run_control, resolver_count, &victim_cursor,
-                            &stats.wake, &stats.completion, &resolved, chip_swimlane_enabled
-                        )) {
-                        break;
-                    }
+                    service_ok = aicore_service_completion_inboxes_v1(
+                        graph, sidecar_base, worker_context, run_control, resolver_count, &victim_cursor, &stats.wake,
+                        &stats.completion, &resolved, chip_swimlane_enabled
+                    );
+                    completion_service_end = chip_swimlane_enabled ? get_sys_cnt_aicore() : 0;
                     completions_since_service = 0;
                 }
+                if (chip_swimlane_enabled) {
+                    commit_task_trace(
+                        sidecar_base, worker_context, completed_trace_pending, pending_wait_end, readiness_start,
+                        ready_observe, payload_start, kernel_start, kernel_end, completion_end,
+                        completion_bookkeeping_end, completion_service_start, completion_service_end,
+                        previous_trace_commit_end
+                    );
+                    previous_trace_commit_end = get_sys_cnt_aicore();
+                }
+                if (!service_ok) break;
                 continue;
             }
 
@@ -394,19 +433,16 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             if (free_slot >= 0 && !cursor_exhausted) {
                 uint64_t claim_start = get_sys_cnt_aicore();
                 uint64_t stream_index = 0;
-                int64_t task_id = AICORE_TASK_ID_INVALID_V1;
-                bool valid = aicore_claim_ticket_v1(sidecar_base, stream, &stream_index, &task_id);
+                AicoreTaskTicketV1 ticket{};
+                bool valid = aicore_claim_ticket_v1(sidecar_base, stream, &stream_index, &ticket);
                 uint64_t claim_end = get_sys_cnt_aicore();
                 stats.claim_cycles += claim_end - claim_start;
                 if (valid) {
-                    AicoreRootStatusV0 status = aicore_pending_initialize_v1(
-                        graph, task_id, root_core_type, RUNTIME_MAX_FUNC_ID, stream_index, AicoreClaimKindV1::TICKET,
-                        claim_start, claim_end, &pending[free_slot]
+                    int64_t task_id = static_cast<int64_t>(ticket.task_id);
+                    aicore_pending_initialize_v1(
+                        ticket, stream_index, AicoreClaimKindV1::TICKET, claim_start, claim_end, &pending[free_slot]
                     );
-                    if (status != AicoreRootStatusV0::OK) {
-                        aicore_record_scheduler_error_v1(run_control, task_id, status, &graph, worker_context);
-                        break;
-                    }
+                    if (chip_swimlane_enabled) record_task_initialize_end(sidecar_base, worker_context, task_id);
                     AicoreRouteResultV1 route = aicore_route_task_v1(
                         graph, sidecar_base, worker_context, run_control, task_id, &stats.wake, chip_swimlane_enabled
                     );
@@ -422,6 +458,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                         (void)aicore_pending_state_v1(sidecar_base, worker_context, &pending[free_slot]);
                         pending[free_slot].pending_wait_start_cycles = get_sys_cnt_aicore();
                     }
+                    if (chip_swimlane_enabled) record_task_route_end(sidecar_base, worker_context, task_id);
                     ++stats.ticket_claim_count;
                     uint64_t new_occupancy = occupied + 1;
                     if (new_occupancy > stats.pending_peak) stats.pending_peak = new_occupancy;

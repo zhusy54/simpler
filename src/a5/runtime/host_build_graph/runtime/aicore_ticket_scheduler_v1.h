@@ -142,12 +142,11 @@ inline __aicore__ void aicore_record_scheduler_error_v1(
     aicore_gm_publish_v0(run_control->scheduler_error, static_cast<uint64_t>(status));
 }
 
-inline __host__ __aicore__ AicoreRootStatusV0 aicore_pending_initialize_v1(
+inline __host__ AicoreRootStatusV0 aicore_make_task_ticket_v1(
     const AicoreReadonlyGraphV0 &graph, int64_t task_id, AicoreRootCoreTypeV0 expected_core_type, int32_t max_func_id,
-    uint64_t stream_index, AicoreClaimKindV1 claim_kind, uint64_t claim_start_cycles, uint64_t claim_end_cycles,
-    AicorePendingSlotV1 *slot
+    AicoreTaskTicketV1 *ticket
 ) {
-    if (slot == nullptr) return AicoreRootStatusV0::INVALID_ARGUMENTS;
+    if (ticket == nullptr) return AicoreRootStatusV0::INVALID_ARGUMENTS;
     AicoreTaskInfoV0 task{};
     AicoreRootStatusV0 status = aicore_classify_task_v0(graph, task_id, &task);
     if (status != AicoreRootStatusV0::OK) return status;
@@ -156,13 +155,28 @@ inline __host__ __aicore__ AicoreRootStatusV0 aicore_pending_initialize_v1(
         return AicoreRootStatusV0::UNSUPPORTED_SHAPE;
     }
     __gm__ uint8_t *payload = aicore_graph_payload_v0(graph, task_id);
-    *slot = {
-        task_id,
-        *reinterpret_cast<__gm__ int32_t *>(payload + AICORE_GRAPH_FANIN_COUNT_OFFSET_V0),
-        0,
-        static_cast<int32_t>(AICORE_TASK_ID_INVALID_V1),
+    *ticket = {
+        static_cast<uint32_t>(task_id),
         static_cast<uint16_t>(task.kernel_id),
         static_cast<uint8_t>(task.subtask_slot),
+        0,
+        *reinterpret_cast<__gm__ int32_t *>(payload + AICORE_GRAPH_FANIN_COUNT_OFFSET_V0),
+        0,
+    };
+    return AicoreRootStatusV0::OK;
+}
+
+inline __host__ __aicore__ void aicore_pending_initialize_v1(
+    const AicoreTaskTicketV1 &ticket, uint64_t stream_index, AicoreClaimKindV1 claim_kind,
+    uint64_t claim_start_cycles, uint64_t claim_end_cycles, AicorePendingSlotV1 *slot
+) {
+    *slot = {
+        static_cast<int64_t>(ticket.task_id),
+        ticket.fanin_count,
+        0,
+        static_cast<int32_t>(AICORE_TASK_ID_INVALID_V1),
+        ticket.kernel_id,
+        ticket.subtask_slot,
         0,
         stream_index,
         claim_start_cycles,
@@ -170,7 +184,15 @@ inline __host__ __aicore__ AicoreRootStatusV0 aicore_pending_initialize_v1(
         0,
         claim_kind,
     };
-    return AicoreRootStatusV0::OK;
+}
+
+inline __host__ __aicore__ void aicore_load_task_ticket_v1(
+    __gm__ const AicoreTaskTicketV1 *source, AicoreTaskTicketV1 *ticket
+) {
+    ticket->task_id = source->task_id;
+    ticket->kernel_id = source->kernel_id;
+    ticket->subtask_slot = source->subtask_slot;
+    ticket->fanin_count = source->fanin_count;
 }
 
 inline __aicore__ AicoreRouteResultV1 aicore_route_task_v1(
@@ -265,17 +287,19 @@ inline __aicore__ AicorePendingStateV1 aicore_pending_state_v1(
 }
 
 inline __aicore__ bool aicore_claim_ticket_v1(
-    __gm__ void *sidecar_base, __gm__ AicoreTaskStreamV1 *stream, uint64_t *stream_index, int64_t *task_id
+    __gm__ void *sidecar_base, __gm__ AicoreTaskStreamV1 *stream, uint64_t *stream_index,
+    AicoreTaskTicketV1 *ticket
 ) {
-    if (stream_index == nullptr || task_id == nullptr) return false;
+    if (stream_index == nullptr || ticket == nullptr) return false;
     uint64_t index = aicore_gm_fetch_add_v0(stream->next_index, UINT64_C(1));
     *stream_index = index;
     if (index >= stream->task_count) {
-        *task_id = AICORE_TASK_ID_INVALID_V1;
+        ticket->task_id = UINT32_MAX;
         return false;
     }
-    __gm__ uint32_t *task_ids = aicore_sidecar_at_v1<uint32_t>(sidecar_base, stream->task_ids_offset);
-    *task_id = static_cast<int64_t>(task_ids[index]);
+    __gm__ AicoreTaskTicketV1 *tickets =
+        aicore_sidecar_at_v1<AicoreTaskTicketV1>(sidecar_base, stream->tickets_offset);
+    aicore_load_task_ticket_v1(&tickets[index], ticket);
     return true;
 }
 

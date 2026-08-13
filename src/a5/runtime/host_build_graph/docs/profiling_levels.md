@@ -37,17 +37,41 @@ metadata and `aicore_tasks`, HBG appends:
 ```
 
 Supported phase names are `SeedClaim`, `TicketClaim`, `PendingWait`,
-`Payload`, `Kernel`, `CompletionEnqueue`, `CompletionBatchClaim`,
-`WakeResolve`, `ReadyPublish`, and `Drain`. The swimlane converter
+`Payload`, `Kernel`, `CompletionEnqueue`, `PostCompletion`,
+`CompletionService`, `TraceCommit`, `SchedulerToClaim`, `TaskInitialize`, `TaskRoute`,
+`SchedulerToReadyScan`, `InterTaskSchedule`, `ReadyScan`, `ReadyToPayload`,
+`CompletionBatchClaim`, `WakeResolve`, `ReadyPublish`, and `Drain`. The swimlane converter
 renders them on per-worker `Scheduler` lanes. Each `Kernel` phase also carries
 the resolved function name and serves as the task/dependency-flow anchor; the
 converter does not emit a duplicate `AIC_N` or `AIV_N` lane for those tasks.
-Task classification is cached during claim initialization and is not repeated
-in `Payload`; callable lookup and argument materialization remain in `Payload`.
+Task classification is validated on the host and encoded in each typed-stream
+ticket. Claim initialization copies that metadata into the pending slot;
+callable lookup and argument materialization remain in `Payload`.
 `aicpu_tasks` is empty because AICPU does not dispatch steady-state work.
 
-Only AIV workers emit `CompletionBatchClaim` and `WakeResolve`: completion
-inbox service and dependency resolution are not performed by AIC workers.
+For consecutive tasks on one worker, the interval from the previous task's
+`CompletionEnqueue` end to the current task's `Payload` start is partitioned
+into `PostCompletion`, optional `CompletionService`, `TraceCommit`, scheduler
+work, `ReadyScan`, and `ReadyToPayload`. `PostCompletion` covers the common
+profiling commit, statistics, pending-slot clear, and fairness bookkeeping.
+`CompletionService` is present every fourth completion on AIV workers and
+covers completion inbox service. `TraceCommit` isolates publication of the
+previous task's Level-1 sidecar trace.
+
+When the next task is claimed inside this gap, scheduler work is split into
+`SchedulerToClaim`, `TicketClaim`, `TaskInitialize`, `TaskRoute`, and
+`SchedulerToReadyScan`.
+`TaskInitialize` copies the host-validated ticket into a pending slot;
+`TaskRoute` covers dependency registration and READY/BLOCKED classification.
+Otherwise `InterTaskSchedule` covers the scheduler work between trace
+publication and the final pending-slot scan.
+`ReadyScan` covers that scan through observing READY, and `ReadyToPayload`
+covers local selection through payload materialization start. A task without a
+`PendingWait` phase was ready on its first observed scan.
+
+Only AIV workers emit `CompletionService`, `CompletionBatchClaim`, and
+`WakeResolve`: completion inbox service and dependency resolution are not
+performed by AIC workers.
 
 The common AICore profiling buffer retains one kernel anchor per worker in the
 raw capture. The sidecar trace cell is indexed by task ID and therefore captures

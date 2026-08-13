@@ -34,6 +34,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cinttypes>
 #include <cstddef>
@@ -518,9 +519,15 @@ bool append_aicore_scheduler_trace(
                << ", \"end_cycles\": " << end_cycles << "}";
         first = false;
     };
+    std::vector<std::vector<const AicoreTaskTraceCellV1 *>> worker_traces(
+        static_cast<size_t>(runtime->worker_count)
+    );
     for (uint64_t task_id = 0; task_id < runtime->aicore_sidecar_layout.task_count; ++task_id) {
         const AicoreTaskTraceCellV1 &trace = traces[task_id];
         if (trace.valid == 0) continue;
+        if (trace.worker_id < static_cast<uint64_t>(runtime->worker_count)) {
+            worker_traces[static_cast<size_t>(trace.worker_id)].push_back(&trace);
+        }
         emit(
             trace.worker_id, trace.core_type, trace.task_id,
             trace.claim_kind == static_cast<uint64_t>(AicoreClaimKindV1::SEED) ? "SeedClaim" : "TicketClaim",
@@ -542,6 +549,22 @@ bool append_aicore_scheduler_trace(
             trace.worker_id, trace.core_type, trace.task_id, "CompletionEnqueue", trace.kernel_end_cycles,
             trace.completion_end_cycles
         );
+        emit(
+            trace.worker_id, trace.core_type, trace.task_id, "PostCompletion", trace.completion_end_cycles,
+            trace.completion_bookkeeping_end_cycles
+        );
+        emit(
+            trace.worker_id, trace.core_type, trace.task_id, "CompletionService",
+            trace.completion_service_start_cycles, trace.completion_service_end_cycles
+        );
+        emit(
+            trace.worker_id, trace.core_type, trace.task_id, "ReadyScan", trace.ready_scan_start_cycles,
+            trace.ready_observe_cycles
+        );
+        emit(
+            trace.worker_id, trace.core_type, trace.task_id, "ReadyToPayload", trace.ready_observe_cycles,
+            trace.payload_start_cycles
+        );
         const AicoreTaskControlV1 &control = task_controls[task_id];
         if (control.completion_resolve_start_cycles != 0 &&
             control.resolver_worker_id < static_cast<uint64_t>(runtime->worker_count)) {
@@ -559,6 +582,60 @@ bool append_aicore_scheduler_trace(
             trace.worker_id, trace.core_type, trace.task_id, "ReadyPublish", control.ready_publish_cycles,
             control.ready_publish_cycles
         );
+    }
+    for (auto &worker_trace : worker_traces) {
+        std::sort(
+            worker_trace.begin(), worker_trace.end(),
+            [](const AicoreTaskTraceCellV1 *lhs, const AicoreTaskTraceCellV1 *rhs) {
+                return lhs->kernel_start_cycles < rhs->kernel_start_cycles;
+            }
+        );
+        for (size_t index = 1; index < worker_trace.size(); ++index) {
+            const AicoreTaskTraceCellV1 &previous = *worker_trace[index - 1];
+            const AicoreTaskTraceCellV1 &current = *worker_trace[index];
+            const uint64_t transition_end = previous.completion_service_end_cycles == 0
+                                                ? previous.completion_bookkeeping_end_cycles
+                                                : previous.completion_service_end_cycles;
+            uint64_t scheduler_start = transition_end;
+            if (current.previous_trace_commit_end_cycles >= transition_end &&
+                current.previous_trace_commit_end_cycles <= current.ready_scan_start_cycles) {
+                emit(
+                    current.worker_id, current.core_type, current.task_id, "TraceCommit", transition_end,
+                    current.previous_trace_commit_end_cycles
+                );
+                scheduler_start = current.previous_trace_commit_end_cycles;
+            }
+            const bool claimed_between_tasks =
+                current.claim_kind == static_cast<uint64_t>(AicoreClaimKindV1::TICKET) &&
+                current.claim_start_cycles >= scheduler_start &&
+                current.claim_end_cycles >= current.claim_start_cycles &&
+                current.initialize_end_cycles >= current.claim_end_cycles &&
+                current.route_end_cycles >= current.initialize_end_cycles &&
+                current.ready_scan_start_cycles >= current.route_end_cycles;
+            if (claimed_between_tasks) {
+                emit(
+                    current.worker_id, current.core_type, current.task_id, "SchedulerToClaim", scheduler_start,
+                    current.claim_start_cycles
+                );
+                emit(
+                    current.worker_id, current.core_type, current.task_id, "TaskInitialize", current.claim_end_cycles,
+                    current.initialize_end_cycles
+                );
+                emit(
+                    current.worker_id, current.core_type, current.task_id, "TaskRoute", current.initialize_end_cycles,
+                    current.route_end_cycles
+                );
+                emit(
+                    current.worker_id, current.core_type, current.task_id, "SchedulerToReadyScan",
+                    current.route_end_cycles, current.ready_scan_start_cycles
+                );
+            } else {
+                emit(
+                    current.worker_id, current.core_type, current.task_id, "InterTaskSchedule", scheduler_start,
+                    current.ready_scan_start_cycles
+                );
+            }
+        }
     }
     for (int32_t worker = 0; worker < runtime->worker_count; ++worker) {
         if (contexts[worker].active == 0) continue;
@@ -609,6 +686,7 @@ bool create_aicore_sidecar_v1(
     };
     std::vector<uint8_t> inline_completed_flags(static_cast<size_t>(total_tasks), 0);
     std::vector<int64_t> inline_completed_task_ids;
+    std::vector<AicoreTaskTicketV1> task_tickets(static_cast<size_t>(total_tasks));
     for (int64_t task_id = 0; task_id < total_tasks; ++task_id) {
         PTO2TaskSlotState &slot = host_sm_handle.header->ring.get_slot_state_by_task_id(task_id);
         AicoreTaskInfoV0 task{};
@@ -650,6 +728,15 @@ bool create_aicore_sidecar_v1(
             );
             return false;
         }
+        __gm__ uint8_t *payload = aicore_graph_payload_v0(host_graph, task_id);
+        task_tickets[static_cast<size_t>(task_id)] = {
+            static_cast<uint32_t>(task_id),
+            static_cast<uint16_t>(task.kernel_id),
+            static_cast<uint8_t>(task.subtask_slot),
+            0,
+            *reinterpret_cast<__gm__ int32_t *>(payload + AICORE_GRAPH_FANIN_COUNT_OFFSET_V0),
+            0,
+        };
     }
 
     AicoreTicketStreams streams;
@@ -698,10 +785,14 @@ bool create_aicore_sidecar_v1(
         task_controls[task_id].state = static_cast<int64_t>(AicoreTaskStateV1::DONE);
         task_controls[task_id].wake_list_head = AICORE_WAKE_LIST_CLOSED_V1;
     }
-    auto *aic_ids = aicore_sidecar_at_v1<uint32_t>(host_base, layout.aic_task_ids_offset);
-    std::copy(streams.aic.begin(), streams.aic.end(), aic_ids);
-    auto *aiv_ids = aicore_sidecar_at_v1<uint32_t>(host_base, layout.aiv_task_ids_offset);
-    std::copy(streams.aiv.begin(), streams.aiv.end(), aiv_ids);
+    auto *aic_tickets = aicore_sidecar_at_v1<AicoreTaskTicketV1>(host_base, layout.aic_tickets_offset);
+    std::transform(streams.aic.begin(), streams.aic.end(), aic_tickets, [&](uint32_t task_id) {
+        return task_tickets[task_id];
+    });
+    auto *aiv_tickets = aicore_sidecar_at_v1<AicoreTaskTicketV1>(host_base, layout.aiv_tickets_offset);
+    std::transform(streams.aiv.begin(), streams.aiv.end(), aiv_tickets, [&](uint32_t task_id) {
+        return task_tickets[task_id];
+    });
 
     const pto2_sm_layout::PTO2RingSegmentOffsets device_segments =
         pto2_sm_layout::ring_segment_offsets(task_window_size);

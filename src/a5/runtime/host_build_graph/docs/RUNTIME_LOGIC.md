@@ -27,8 +27,9 @@ The 128-byte-aligned v1 sidecar contains:
 - one padded task control per task with state, wake-list, and intrusive
   completion link;
 - one cache-line-isolated completion inbox per possible worker;
-- dependency-priority-ordered AIC and AIV task-ID streams, each with an
-  isolated ticket cursor;
+- dependency-priority-ordered AIC and AIV task-ticket streams, each with an
+  isolated cursor; every ticket carries the host-validated task ID, kernel ID,
+  subtask slot, and fanin count;
 - split configuration, lifecycle, and first-error run-control cache lines;
 - one private dispatch payload and one debug/statistics context per worker; and
 - per-task scheduler phase cells written only during level-1 capture.
@@ -49,10 +50,11 @@ For each core type, AICPU activates
 `atomicAdd(next_index, 1)` per ticket attempt.
 
 Each active worker maintains two owner-only pending slots. Claim initialization
-classifies the task once and caches its kernel ID and subtask slot. Routing
-scans from the remembered fanin index and links a blocked consumer into the
-first incomplete producer's wake list. The consumer stays in its owner's
-pending slot; there is no ReadyQ and no execution ownership migration.
+copies the host-validated ticket metadata into a slot without re-reading or
+revalidating graph descriptors. Routing scans from the remembered fanin index
+and links a blocked consumer into the first incomplete producer's wake list.
+The consumer stays in its owner's pending slot; there is no ReadyQ and no
+execution ownership migration.
 
 Each worker atomically snapshots the immutable `aiv_active_worker_count` once
 after startup and reuses it for enqueue routing and inbox service. After a
@@ -107,7 +109,10 @@ snapshot on the steady-state path.
 
 Level-1 chip-swimlane capture exports `SeedClaim`, `TicketClaim`,
 `PendingWait`, `Payload`, `Kernel`, `CompletionEnqueue`,
-`CompletionBatchClaim`, `WakeResolve`, `ReadyPublish`, and `Drain` phases.
+`PostCompletion`, `CompletionService`, `TraceCommit`, scheduler-loop detail,
+`ReadyScan`, `ReadyToPayload`, `CompletionBatchClaim`, `WakeResolve`,
+`ReadyPublish`, and `Drain` phases. These phases partition the same-worker
+inter-task scheduling gap from `CompletionEnqueue` end to `Payload` start.
 Drain-time counters include own/steal batches, link publication waits,
 enqueue-to-resolve lag, and READY-to-kernel lag.
 The host STRACE tree also exposes `simpler_run.bind.ticket_stream_plan` for
