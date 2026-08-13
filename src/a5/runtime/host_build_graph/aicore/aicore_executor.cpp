@@ -213,6 +213,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         for (uint32_t slot = 0; slot < AICORE_PENDING_SLOT_COUNT_V1; ++slot)
             aicore_pending_clear_v1(&pending[slot]);
         AicoreWorkerStatsV1 stats{};
+        const uint64_t resolver_count = aicore_gm_load_v0(run_control->aiv_active_worker_count);
         bool common_profile_recorded = false;
         uint32_t scan_start = 0;
         uint32_t backoff_iterations = kInitialBackoffIterations;
@@ -222,7 +223,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         bool cursor_exhausted = !executor_worker;
         bool executor_drained = false;
         uint64_t victim_cursor =
-            resolver_worker ? (worker_context->inbox_index + 1) % run_control->aiv_active_worker_count : 0;
+            resolver_worker ? (worker_context->inbox_index + 1) % resolver_count : 0;
         uint64_t completions_since_service = 0;
 
         if (executor_worker) {
@@ -346,8 +347,8 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                 uint64_t kernel_end = get_sys_cnt_aicore();
                 uint64_t completion_start = get_sys_cnt_aicore();
                 bool enqueue_ok = aicore_enqueue_completion_v1(
-                    graph, sidecar_base, worker_context, run_control, task_pending.task_id, &stats.completion,
-                    chip_swimlane_enabled
+                    graph, sidecar_base, worker_context, run_control, resolver_count, task_pending.task_id,
+                    &stats.completion, chip_swimlane_enabled
                 );
                 uint64_t completion_end = get_sys_cnt_aicore();
                 if (!enqueue_ok) break;
@@ -373,8 +374,8 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                 if (resolver_worker && ++completions_since_service == kCompletionFairnessInterval) {
                     bool resolved = false;
                     if (!aicore_service_completion_inboxes_v1(
-                            graph, sidecar_base, worker_context, run_control, &victim_cursor, &stats.wake,
-                            &stats.completion, &resolved, chip_swimlane_enabled
+                            graph, sidecar_base, worker_context, run_control, resolver_count, &victim_cursor,
+                            &stats.wake, &stats.completion, &resolved, chip_swimlane_enabled
                         )) {
                         break;
                     }
@@ -440,7 +441,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             bool completion_progress = false;
             if (resolver_worker) {
                 if (!aicore_service_completion_inboxes_v1(
-                        graph, sidecar_base, worker_context, run_control, &victim_cursor, &stats.wake,
+                        graph, sidecar_base, worker_context, run_control, resolver_count, &victim_cursor, &stats.wake,
                         &stats.completion, &completion_progress, chip_swimlane_enabled
                     )) {
                     break;

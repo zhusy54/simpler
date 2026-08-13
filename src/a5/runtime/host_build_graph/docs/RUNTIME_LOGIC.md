@@ -54,13 +54,18 @@ scans from the remembered fanin index and links a blocked consumer into the
 first incomplete producer's wake list. The consumer stays in its owner's
 pending slot; there is no ReadyQ and no execution ownership migration.
 
-After a kernel returns, its unique owner stores `DONE` and pushes the task onto
-`task_id % aiv_active_worker_count`. The owner publishes the per-task
-`completion_next` link before a CAS updates the inbox head; if another producer
-changes the head first, the owner relinks and retries. LIFO order is valid
-because completion events have no FIFO semantic; dependency order is enforced
-by task state and wake-list routing. Kernel code owns publication of cacheable
-GM output, matching the `tensormap_and_ringbuffer` execution contract.
+Each worker atomically snapshots the immutable `aiv_active_worker_count` once
+after startup and reuses it for enqueue routing and inbox service. After a
+kernel returns, its unique owner stores `DONE` and pushes the task onto
+`task_id % aiv_active_worker_count` with one atomic exchange of the inbox head.
+The exchange returns the previous head, which the owner stores in the per-task
+`completion_next` link and publishes. An AIV resolver may detach the new head
+before that link is visible; in that case it waits on the initialized
+`UNPUBLISHED` sentinel and observes the link cache line until publication. This
+keeps retry and contention handling out of the producer hot path. LIFO order is
+valid because completion events have no FIFO semantic; dependency order is
+enforced by task state and wake-list routing. Kernel code owns publication of
+cacheable GM output, matching the `tensormap_and_ringbuffer` execution contract.
 
 Before idle backoff, an AIV worker detaches its whole local inbox or rotates
 across one AIV victim inbox. AIC workers never service completion inboxes. The

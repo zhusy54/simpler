@@ -278,7 +278,10 @@ TEST(AicoreTicketSchedulerV1, CompletionInboxBatchesAndStealsWithoutLoss) {
             AicoreRouteResultV1::READY
         );
         ASSERT_TRUE(
-            aicore_enqueue_completion_v1(graph, sidecar.base(), &context, &run_control, task, &completion_stats)
+            aicore_enqueue_completion_v1(
+                graph, sidecar.base(), &context, &run_control, run_control.aiv_active_worker_count, task,
+                &completion_stats
+            )
         );
     }
 
@@ -286,7 +289,8 @@ TEST(AicoreTicketSchedulerV1, CompletionInboxBatchesAndStealsWithoutLoss) {
     while (run_control.resolved_task_count != static_cast<uint64_t>(kTaskCount)) {
         bool progress = false;
         ASSERT_TRUE(aicore_service_completion_inboxes_v1(
-            graph, sidecar.base(), &context, &run_control, &victim_cursor, &wake_stats, &completion_stats, &progress
+            graph, sidecar.base(), &context, &run_control, run_control.aiv_active_worker_count, &victim_cursor,
+            &wake_stats, &completion_stats, &progress
         ));
         ASSERT_TRUE(progress);
     }
@@ -334,7 +338,8 @@ TEST(AicoreTicketSchedulerV1, ConcurrentExecutorsPushOneInboxExactlyOnce) {
                     AicoreRouteResultV1::READY
                 );
                 EXPECT_TRUE(aicore_enqueue_completion_v1(
-                    graph, sidecar.base(), &contexts[thread], &run_control, task, &completion_stats[thread]
+                    graph, sidecar.base(), &contexts[thread], &run_control, run_control.aiv_active_worker_count, task,
+                    &completion_stats[thread]
                 ));
             }
         });
@@ -345,8 +350,8 @@ TEST(AicoreTicketSchedulerV1, ConcurrentExecutorsPushOneInboxExactlyOnce) {
     uint64_t victim_cursor = 0;
     bool progress = false;
     ASSERT_TRUE(aicore_service_completion_inboxes_v1(
-        graph, sidecar.base(), &contexts[0], &run_control, &victim_cursor, &wake_stats[0], &completion_stats[0],
-        &progress
+        graph, sidecar.base(), &contexts[0], &run_control, run_control.aiv_active_worker_count, &victim_cursor,
+        &wake_stats[0], &completion_stats[0], &progress
     ));
     EXPECT_TRUE(progress);
     EXPECT_EQ(run_control.resolved_task_count, static_cast<uint64_t>(kTaskCount));
@@ -355,6 +360,58 @@ TEST(AicoreTicketSchedulerV1, ConcurrentExecutorsPushOneInboxExactlyOnce) {
         EXPECT_EQ(controls[task].state, static_cast<int64_t>(AicoreTaskStateV1::DONE));
         EXPECT_EQ(controls[task].wake_list_head, AICORE_WAKE_LIST_CLOSED_V1);
     }
+}
+
+TEST(AicoreTicketSchedulerV1, ResolverWaitsForDetachedCompletionLinkPublication) {
+    GraphBuffer graph_storage(1);
+    graph_storage.executable(0, AicoreRootCoreTypeV0::AIC);
+    AicoreReadonlyGraphV0 graph = graph_storage.graph();
+    AicoreExecutionSidecarLayoutV1 layout{};
+    ASSERT_TRUE(aicore_sidecar_plan_v1(1, 1, 0, &layout));
+    SidecarBuffer sidecar(layout);
+    AicoreWorkerContextV1 context{};
+    context.task_controls_offset = layout.task_controls_offset;
+    context.completion_inboxes_offset = layout.completion_inboxes_offset;
+    context.core_type = static_cast<int32_t>(AicoreRootCoreTypeV0::AIV);
+    context.inbox_index = 0;
+    AicoreRunControlV1 run_control{};
+    run_control.active_worker_count = 1;
+    run_control.aiv_active_worker_count = 1;
+    AicoreWakeStatsV1 wake_stats{};
+    AicoreCompletionStatsV1 completion_stats{};
+    ASSERT_EQ(
+        aicore_route_task_v1(graph, sidecar.base(), &context, &run_control, 0, &wake_stats),
+        AicoreRouteResultV1::READY
+    );
+
+    auto *controls = aicore_sidecar_at_v1<AicoreTaskControlV1>(sidecar.base(), layout.task_controls_offset);
+    auto *inboxes = aicore_sidecar_at_v1<AicoreCompletionInboxV1>(sidecar.base(), layout.completion_inboxes_offset);
+    aicore_gm_store_v0(controls[0].state, static_cast<int64_t>(AicoreTaskStateV1::DONE));
+    ASSERT_EQ(aicore_gm_exchange_v0(inboxes[0].head, 0), AICORE_COMPLETION_INBOX_EMPTY_V1);
+    ASSERT_EQ(controls[0].completion_next, AICORE_COMPLETION_LINK_UNPUBLISHED_V1);
+
+    std::atomic<bool> publisher_ready{false};
+    std::thread publisher([&] {
+        publisher_ready.store(true, std::memory_order_release);
+        while (aicore_gm_load_v0(inboxes[0].head) != AICORE_COMPLETION_INBOX_EMPTY_V1) {}
+        aicore_gm_store_v0(controls[0].completion_next, AICORE_COMPLETION_INBOX_EMPTY_V1);
+        aicore_publish_cache_line_v0(&controls[0].next_waiter);
+    });
+    while (!publisher_ready.load(std::memory_order_acquire)) {}
+
+    uint64_t victim_cursor = 0;
+    bool progress = false;
+    bool service_ok = aicore_service_completion_inboxes_v1(
+        graph, sidecar.base(), &context, &run_control, run_control.aiv_active_worker_count, &victim_cursor, &wake_stats,
+        &completion_stats, &progress
+    );
+    publisher.join();
+
+    ASSERT_TRUE(service_ok);
+    EXPECT_TRUE(progress);
+    EXPECT_EQ(run_control.resolved_task_count, 1u);
+    EXPECT_EQ(completion_stats.resolve_count, 1u);
+    EXPECT_EQ(controls[0].wake_list_head, AICORE_WAKE_LIST_CLOSED_V1);
 }
 
 TEST(AicoreTicketSchedulerV1, AicWorkerCannotResolveCompletionInbox) {
@@ -380,12 +437,15 @@ TEST(AicoreTicketSchedulerV1, AicWorkerCannotResolveCompletionInbox) {
         aicore_route_task_v1(graph, sidecar.base(), &aic_context, &run_control, 0, &wake_stats),
         AicoreRouteResultV1::READY
     );
-    ASSERT_TRUE(aicore_enqueue_completion_v1(graph, sidecar.base(), &aic_context, &run_control, 0, &completion_stats));
+    ASSERT_TRUE(aicore_enqueue_completion_v1(
+        graph, sidecar.base(), &aic_context, &run_control, run_control.aiv_active_worker_count, 0, &completion_stats
+    ));
 
     uint64_t victim_cursor = 0;
     bool progress = true;
     ASSERT_TRUE(aicore_service_completion_inboxes_v1(
-        graph, sidecar.base(), &aic_context, &run_control, &victim_cursor, &wake_stats, &completion_stats, &progress
+        graph, sidecar.base(), &aic_context, &run_control, run_control.aiv_active_worker_count, &victim_cursor,
+        &wake_stats, &completion_stats, &progress
     ));
     EXPECT_FALSE(progress);
     EXPECT_EQ(run_control.resolved_task_count, 0u);
@@ -393,7 +453,8 @@ TEST(AicoreTicketSchedulerV1, AicWorkerCannotResolveCompletionInbox) {
     EXPECT_EQ(inboxes[0].head, 0);
 
     ASSERT_TRUE(aicore_service_completion_inboxes_v1(
-        graph, sidecar.base(), &aiv_context, &run_control, &victim_cursor, &wake_stats, &completion_stats, &progress
+        graph, sidecar.base(), &aiv_context, &run_control, run_control.aiv_active_worker_count, &victim_cursor,
+        &wake_stats, &completion_stats, &progress
     ));
     EXPECT_TRUE(progress);
     EXPECT_EQ(run_control.resolved_task_count, 1u);
