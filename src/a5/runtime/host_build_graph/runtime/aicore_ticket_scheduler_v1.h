@@ -337,11 +337,10 @@ inline __aicore__ bool aicore_enqueue_completion_v1(
         return false;
     }
     if (trace_enabled) control->completion_enqueue_cycles = aicore_scheduler_cycles_v1();
-    aicore_gm_store_v0(control->completion_next, AICORE_COMPLETION_LINK_UNPUBLISHED_V1);
     uint64_t inbox_index = static_cast<uint64_t>(task_id) % active_workers;
     __gm__ AicoreCompletionInboxV1 *inbox = aicore_completion_inbox_at_v1(sidecar_base, context, inbox_index);
     int64_t previous = aicore_gm_exchange_v0(inbox->head, task_id);
-    aicore_gm_store_v0(control->completion_next, previous);
+    control->completion_next = previous;
     aicore_publish_cache_line_v0(&control->next_waiter);
     if (stats != nullptr) ++stats->enqueue_count;
     return true;
