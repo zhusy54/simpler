@@ -29,9 +29,9 @@ Detect-then-run:
 3. **If both hold, invoke directly** through `task-submit` (per the Rule
    below) — no "shall I run it?" prompt. Run it and report the results.
 
-Only fall back to asking the user when the precheck fails (the box's silicon
-does not match the requested arch) or `task-submit` is absent — i.e. when the
-box genuinely cannot run the work as requested.
+Only fall back to asking the user when the precheck fails or `task-submit` is
+absent. If the user explicitly accepts the wrong-architecture risk, rerun the
+gate with `--force`; never infer this override.
 
 ## Rule
 
@@ -115,6 +115,10 @@ task-submit --device auto --device-num 1 \
 
 Sim variants (`a2a3sim`, `a5sim`) pass the precheck unconditionally — they
 are silicon-agnostic. The precheck is purely about onboard invocations.
+
+If detection is unavailable and the user explicitly authorizes bypassing it,
+run `check.sh <arch> --force` and retain its warning with the result. This
+override does not permit bypassing `task-submit` isolation.
 
 ## Device logs: redirect them out of the shared default
 
@@ -201,9 +205,9 @@ directly.
   the outlier, not CI.
 - ❌ Claiming "X% reproduction rate" from unlocked runs without listing
   `task-submit --list` at the time of the run.
-- ❌ Bypassing `onboard-arch-precheck` — the `--platform` mismatch failure
-  modes are silent (look like real bugs) and burn hours of investigation
-  time. Always run the gate.
+- ❌ Silently bypassing `onboard-arch-precheck` — the `--platform` mismatch
+  failure modes look like real bugs. Always run the gate; use `--force` only
+  after explicit user authorization and report the warning with the result.
 - ❌ Fishing your run's device log out of the shared `~/ascend/log/debug/`
   by pid/timestamp guesswork. Set `ASCEND_PROCESS_LOG_PATH` to a per-run
   dir up front (see "Device logs" above) so the log is isolated and known.

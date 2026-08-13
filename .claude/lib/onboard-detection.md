@@ -16,7 +16,7 @@ change, update them **here** only.
 
 ## A. Precheck + platform (onboard / hardware)
 
-Onboard runs must gate on real silicon **before** locking a device — a
+Onboard runs normally gate on real silicon **before** locking a device — a
 wrong-arch `--platform` produces 507018 / 507899 cascades that look like real
 bugs. Both detecting the platform and refusing a mismatch are handled by the
 `onboard-arch-precheck` skill, so do not re-implement chip parsing here.
@@ -30,6 +30,11 @@ bugs. Both detecting the platform and refusing a mismatch are handled by the
    ```bash
    .claude/skills/onboard-arch-precheck/check.sh "$ARCH" || exit 1
    ```
+
+   If detection is unavailable and the user explicitly accepts the
+   wrong-architecture risk, use
+   `.claude/skills/onboard-arch-precheck/check.sh "$ARCH" --force`. Record the
+   warning in the result; never infer the override.
 
 3. The gate caches the *detected* arch at
    `${TMPDIR:-/tmp}/onboard-arch-precheck-<uid>.cache`

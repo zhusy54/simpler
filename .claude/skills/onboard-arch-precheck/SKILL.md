@@ -1,6 +1,6 @@
 ---
 name: onboard-arch-precheck
-description: Detect the host's actual Ascend silicon and refuse mismatched `--platform` onboard hardware test invocations BEFORE any device is locked. MUST invoke this skill before running pytest or task-submit commands that use `--platform a2a3` or `--platform a5` (onboard only — sim variants pass through). Use when invoking onboard hardware tests, repro'ing flaky-test reports, or wrapping pytest in task-submit. Skip for `--platform a2a3sim` / `--platform a5sim` (silicon-agnostic).
+description: Detect the host's actual Ascend silicon and refuse mismatched `--platform` onboard hardware test invocations BEFORE any device is locked. Invoke this skill before running pytest or task-submit commands that use `--platform a2a3` or `--platform a5` (onboard only — sim variants pass through). An explicit user-authorized `--force` override is available when detection is unavailable and the user accepts the architecture risk. Skip for `--platform a2a3sim` / `--platform a5sim` (silicon-agnostic).
 ---
 
 # Onboard Arch Precheck
@@ -70,9 +70,20 @@ pytest ... --platform "$ARCH" ...
 task-submit --device auto --device-num 1 --run "pytest ... --platform $ARCH ..."
 ```
 
+When detection is unavailable and the user explicitly accepts the
+wrong-architecture risk, use the override and retain its warning with the
+test result:
+
+```bash
+.claude/skills/onboard-arch-precheck/check.sh a5 --force
+```
+
+Never infer this override from context. It does not relax `task-submit`
+isolation.
+
 `check.sh` exits:
 
-- `0` — silicon matches the requested arch, or the arch is a sim variant (pass through)
+- `0` — silicon matches, the arch is a sim variant, or an explicit `--force` override was used
 - `2` — silicon mismatch, with an explanation of the detected arch and the 507018 / 507899 failure modes printed to stderr
 - `1` — unable to detect silicon (npu-smi missing, unrecognized chip, etc.)
 

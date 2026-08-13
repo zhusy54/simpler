@@ -9,8 +9,8 @@
 # -----------------------------------------------------------------------------------------------------------
 # onboard-arch-precheck: gate onboard --platform invocations against actual Ascend silicon.
 #
-# Usage:   check.sh <requested_platform>
-# Exits:   0 = match, or sim variant (pass through)
+# Usage:   check.sh <requested_platform> [--force]
+# Exits:   0 = match, sim variant, or explicit user-authorized override
 #          1 = unable to detect (npu-smi missing, CANN ini missing, unknown SoC, etc.)
 #          2 = silicon mismatch
 #
@@ -22,6 +22,7 @@
 set -u
 
 REQUESTED="${1:-}"
+FORCE="${2:-}"
 CACHE="${TMPDIR:-/tmp}/onboard-arch-precheck-$(id -u).cache"
 TTL=3600   # 1 hour
 
@@ -30,6 +31,11 @@ if [ -z "$REQUESTED" ]; then
 onboard-arch-precheck: missing platform argument.
 Usage: $0 <platform>   (one of: a2a3, a2a3sim, a5, a5sim)
 EOF
+    exit 1
+fi
+
+if [ -n "$FORCE" ] && [ "$FORCE" != "--force" ]; then
+    echo "onboard-arch-precheck: unknown option '$FORCE' — expected --force" >&2
     exit 1
 fi
 
@@ -42,6 +48,11 @@ case "$REQUESTED" in
         exit 1
         ;;
 esac
+
+if [ "$FORCE" = "--force" ]; then
+    echo "onboard-arch-precheck: WARNING: explicit override; silicon was not verified for --platform $REQUESTED" >&2
+    exit 0
+fi
 
 # detect_silicon prints "arch|soc_name|short_soc_version" on stdout.
 # Uses npu-smi to identify the chip + the CANN platform_config ini to map
