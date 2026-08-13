@@ -49,7 +49,9 @@ For each core type, AICPU activates
 Each active worker maintains two owner-only pending slots. It scans them in
 round-robin order, remembers the completed fanin prefix, and polls at most the
 first unresolved producer per slot. Ready work is executed before another
-ticket is claimed. When all pending work is blocked, a compiler-preserved local
+ticket is claimed. Claim initialization classifies the task once and caches its
+kernel ID and subtask slot in the pending slot; ready execution reuses that
+classification. When all pending work is blocked, a compiler-preserved local
 exponential backoff reduces repeated GM loads without adding shared traffic.
 
 After a kernel publishes its output, the worker atomically changes that task's

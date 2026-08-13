@@ -38,8 +38,10 @@ metadata and `aicore_tasks`, HBG appends:
 
 Supported phase names are `SeedClaim`, `TicketClaim`, `PendingWait`,
 `Payload`, `Kernel`, `CompletionPublish`, and `Drain`. The swimlane converter
-renders them on per-worker `Scheduler` lanes. `aicpu_tasks` is empty because
-AICPU does not dispatch steady-state work.
+renders them on per-worker `Scheduler` lanes. Task classification is cached
+during claim initialization and is not repeated in `Payload`; callable lookup
+and argument materialization remain in `Payload`. `aicpu_tasks` is empty
+because AICPU does not dispatch steady-state work.
 
 The common AICore profiling buffer retains one kernel anchor per worker. The
 sidecar trace cell is indexed by task ID and therefore captures every executed

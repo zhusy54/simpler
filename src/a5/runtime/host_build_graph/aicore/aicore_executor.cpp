@@ -26,6 +26,8 @@ constexpr uint32_t kInitialBackoffIterations = 8;
 constexpr uint32_t kMaximumBackoffIterations = 1024;
 constexpr uint32_t kSchedulerErrorPollInterval = 64;
 
+static_assert(RUNTIME_MAX_FUNC_ID <= static_cast<int32_t>(UINT16_MAX) + 1, "pending kernel id cache is too narrow");
+
 struct AicoreWorkerStatsV1 {
     uint64_t seeded_task_count{0};
     uint64_t ticket_claim_count{0};
@@ -183,6 +185,8 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
 
     aicore_observe_cache_line_v0(worker_context);
     if (worker_context->active != 0 && aicore_gm_load_v0(run_control->exit_requested) == 0) {
+        const AicoreRootCoreTypeV0 root_core_type =
+            core_type == CoreType::AIC ? AicoreRootCoreTypeV0::AIC : AicoreRootCoreTypeV0::AIV;
         __gm__ AicoreTaskStreamV1 *stream = aicore_sidecar_at_v1<AicoreTaskStreamV1>(
             sidecar_base,
             core_type == CoreType::AIC ? worker_context->aic_stream_offset : worker_context->aiv_stream_offset
@@ -204,8 +208,8 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         __gm__ uint32_t *task_ids = aicore_sidecar_at_v1<uint32_t>(sidecar_base, stream->task_ids_offset);
         int64_t seed_task_id = static_cast<int64_t>(task_ids[worker_context->type_rank]);
         AicoreRootStatusV0 seed_status = aicore_pending_initialize_v1(
-            graph, seed_task_id, static_cast<uint64_t>(worker_context->type_rank), AicoreClaimKindV1::SEED, seed_time,
-            seed_time, &pending[0]
+            graph, seed_task_id, root_core_type, RUNTIME_MAX_FUNC_ID, static_cast<uint64_t>(worker_context->type_rank),
+            AicoreClaimKindV1::SEED, seed_time, seed_time, &pending[0]
         );
         pending[0].claim_end_cycles = get_sys_cnt_aicore();
         if (seed_status != AicoreRootStatusV0::OK) {
@@ -265,17 +269,12 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                 }
                 uint64_t payload_start = get_sys_cnt_aicore();
                 aicore_observe_data_cache_v0(aicore_graph_descriptor_v0(graph, task_pending.task_id));
-                AicoreTaskInfoV0 task{};
-                AicoreRootStatusV0 status = aicore_classify_task_v0(graph, task_pending.task_id, &task);
-                if (status != AicoreRootStatusV0::OK || task.kernel_id >= RUNTIME_MAX_FUNC_ID ||
-                    static_cast<uint64_t>(task.core_type) != static_cast<uint64_t>(core_type)) {
-                    aicore_record_scheduler_error_v1(
-                        run_control, task_pending.task_id,
-                        status == AicoreRootStatusV0::OK ? AicoreRootStatusV0::UNSUPPORTED_SHAPE : status, &graph,
-                        worker_context
-                    );
-                    break;
-                }
+                AicoreTaskInfoV0 task{
+                    task_pending.task_id,
+                    static_cast<int32_t>(task_pending.kernel_id),
+                    static_cast<int32_t>(task_pending.subtask_slot),
+                    root_core_type,
+                };
 
                 dcci(&runtime->func_id_to_addr_[task.kernel_id], SINGLE_CACHE_LINE);
                 uint64_t callable_address = runtime->func_id_to_addr_[task.kernel_id];
@@ -284,7 +283,8 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                 }
                 __gm__ PTO2DispatchPayload *dispatch_payload =
                     aicore_sidecar_at_v1<PTO2DispatchPayload>(sidecar_base, worker_context->dispatch_payload_offset);
-                status = aicore_materialize_task_payload_v0(graph, task, callable_address, dispatch_payload);
+                AicoreRootStatusV0 status =
+                    aicore_materialize_task_payload_v0(graph, task, callable_address, dispatch_payload);
                 if (status != AicoreRootStatusV0::OK) {
                     aicore_record_scheduler_error_v1(run_control, task_pending.task_id, status, &graph, worker_context);
                     break;
@@ -338,8 +338,8 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                 stats.claim_cycles += claim_end - claim_start;
                 if (valid) {
                     AicoreRootStatusV0 status = aicore_pending_initialize_v1(
-                        graph, task_id, stream_index, AicoreClaimKindV1::TICKET, claim_start, claim_end,
-                        &pending[free_slot]
+                        graph, task_id, root_core_type, RUNTIME_MAX_FUNC_ID, stream_index, AicoreClaimKindV1::TICKET,
+                        claim_start, claim_end, &pending[free_slot]
                     );
                     if (status != AicoreRootStatusV0::OK) {
                         aicore_record_scheduler_error_v1(run_control, task_id, status, &graph, worker_context);

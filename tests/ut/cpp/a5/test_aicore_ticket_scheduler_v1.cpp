@@ -34,6 +34,7 @@ namespace {
 
 static_assert(sizeof(PTO2TaskDescriptor) == AICORE_GRAPH_TASK_DESCRIPTOR_STRIDE_V0);
 static_assert(sizeof(PTO2TaskPayload) == AICORE_GRAPH_TASK_PAYLOAD_STRIDE_V0);
+static_assert(sizeof(AicorePendingSlotV1) == 64);
 static_assert(offsetof(PTO2TaskDescriptor, kernel_id) == AICORE_GRAPH_KERNEL_IDS_OFFSET_V0);
 static_assert(offsetof(PTO2TaskPayload, fanin_count) == AICORE_GRAPH_FANIN_COUNT_OFFSET_V0);
 static_assert(offsetof(CoreCallable, resolved_addr_) == AICORE_CORE_CALLABLE_RESOLVED_ADDR_OFFSET_V0);
@@ -68,9 +69,15 @@ public:
     }
 
     void executable(size_t task_id, AicoreRootCoreTypeV0 core_type, std::vector<int32_t> fanins = {}) {
+        executable(task_id, core_type == AicoreRootCoreTypeV0::AIC ? 0 : 1, 1, std::move(fanins));
+    }
+
+    void executable(size_t task_id, int32_t subtask_slot, int32_t kernel_id, std::vector<int32_t> fanins = {}) {
         ASSERT_LT(task_id, inline_completed_.size());
+        ASSERT_GE(subtask_slot, 0);
+        ASSERT_LT(subtask_slot, 3);
         ASSERT_LE(fanins.size(), static_cast<size_t>(AICORE_GRAPH_MAX_FANIN_V0));
-        descriptors_[task_id].kernel_id[core_type == AicoreRootCoreTypeV0::AIC ? 0 : 1] = 1;
+        descriptors_[task_id].kernel_id[subtask_slot] = kernel_id;
         payloads_[task_id].fanin_count = static_cast<int32_t>(fanins.size());
         std::copy(fanins.begin(), fanins.end(), payloads_[task_id].fanin_local_ids);
     }
@@ -81,6 +88,11 @@ public:
         inline_completed_[task_id] = 1;
         payloads_[task_id].fanin_count = static_cast<int32_t>(fanins.size());
         std::copy(fanins.begin(), fanins.end(), payloads_[task_id].fanin_local_ids);
+    }
+
+    void invalidate_stored_task_id(size_t task_id) {
+        ASSERT_LT(task_id, inline_completed_.size());
+        descriptors_[task_id].task_id = PTO2TaskId::make(0, static_cast<int64_t>(task_id + 1));
     }
 
     AicoreReadonlyGraphV0 graph() {
@@ -222,7 +234,10 @@ TEST(AicoreTicketSchedulerV1, ReadinessRemembersCompletedFaninPrefix) {
     completion[0].completion = static_cast<int64_t>(AicoreTaskCompletionV1::DONE);
     AicorePendingSlotV1 pending{};
     ASSERT_EQ(
-        aicore_pending_initialize_v1(graph, 2, 2, AicoreClaimKindV1::TICKET, 10, 11, &pending), AicoreRootStatusV0::OK
+        aicore_pending_initialize_v1(
+            graph, 2, AicoreRootCoreTypeV0::AIC, 1024, 2, AicoreClaimKindV1::TICKET, 10, 11, &pending
+        ),
+        AicoreRootStatusV0::OK
     );
 
     uint64_t loads = 0;
@@ -241,6 +256,74 @@ TEST(AicoreTicketSchedulerV1, ReadinessRemembersCompletedFaninPrefix) {
         aicore_pending_readiness_v1(graph, storage.base(), &context, &pending, &loads), AicorePendingStateV1::READY
     );
     EXPECT_EQ(loads, 4u);
+}
+
+TEST(AicoreTicketSchedulerV1, PendingCachesTaskClassification) {
+    GraphBuffer storage(3);
+    storage.executable(0, 0, 17);
+    storage.executable(1, 1, 18);
+    storage.executable(2, 2, 19);
+    AicoreReadonlyGraphV0 graph = storage.graph();
+
+    const struct {
+        int64_t task_id;
+        AicoreRootCoreTypeV0 core_type;
+        uint16_t kernel_id;
+        uint8_t subtask_slot;
+    } cases[] = {
+        {0, AicoreRootCoreTypeV0::AIC, 17, 0},
+        {1, AicoreRootCoreTypeV0::AIV, 18, 1},
+        {2, AicoreRootCoreTypeV0::AIV, 19, 2},
+    };
+    for (const auto &test_case : cases) {
+        AicorePendingSlotV1 pending{};
+        ASSERT_EQ(
+            aicore_pending_initialize_v1(
+                graph, test_case.task_id, test_case.core_type, 1024, 7, AicoreClaimKindV1::TICKET, 10, 11, &pending
+            ),
+            AicoreRootStatusV0::OK
+        );
+        EXPECT_EQ(pending.task_id, test_case.task_id);
+        EXPECT_EQ(pending.kernel_id, test_case.kernel_id);
+        EXPECT_EQ(pending.subtask_slot, test_case.subtask_slot);
+    }
+}
+
+TEST(AicoreTicketSchedulerV1, PendingRejectsClassificationThatWorkerCannotExecute) {
+    GraphBuffer storage(3);
+    storage.executable(0, 0, 1);
+    storage.executable(1, 1, 1024);
+    storage.executable(2, 0, 1);
+    storage.invalidate_stored_task_id(2);
+    AicoreReadonlyGraphV0 graph = storage.graph();
+    AicorePendingSlotV1 pending{};
+
+    EXPECT_EQ(
+        aicore_pending_initialize_v1(
+            graph, 0, AicoreRootCoreTypeV0::AIV, 1024, 0, AicoreClaimKindV1::SEED, 0, 0, &pending
+        ),
+        AicoreRootStatusV0::UNSUPPORTED_SHAPE
+    );
+    EXPECT_EQ(
+        aicore_pending_initialize_v1(
+            graph, 1, AicoreRootCoreTypeV0::AIV, 1024, 1, AicoreClaimKindV1::TICKET, 0, 0, &pending
+        ),
+        AicoreRootStatusV0::UNSUPPORTED_SHAPE
+    );
+    EXPECT_EQ(
+        aicore_pending_initialize_v1(
+            graph, 2, AicoreRootCoreTypeV0::AIC, 1024, 2, AicoreClaimKindV1::TICKET, 0, 0, &pending
+        ),
+        AicoreRootStatusV0::INVALID_TASK_ID
+    );
+}
+
+TEST(AicoreTicketSchedulerV1, PendingClearInvalidatesCachedClassification) {
+    AicorePendingSlotV1 pending{};
+    aicore_pending_clear_v1(&pending);
+    EXPECT_EQ(pending.task_id, AICORE_TASK_ID_INVALID_V1);
+    EXPECT_EQ(pending.kernel_id, UINT16_MAX);
+    EXPECT_EQ(pending.subtask_slot, UINT8_MAX);
 }
 
 TEST(AicoreTicketStreamPlanner, EmptyGraphProducesEmptyStreams) {

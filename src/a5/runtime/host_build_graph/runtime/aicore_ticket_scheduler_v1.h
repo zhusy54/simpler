@@ -27,7 +27,9 @@ struct AicorePendingSlotV1 {
     int32_t fanin_count;
     int32_t next_fanin_index;
     int32_t waiting_producer;
-    int32_t reserved;
+    uint16_t kernel_id;
+    uint8_t subtask_slot;
+    uint8_t reserved;
     uint64_t stream_index;
     uint64_t claim_start_cycles;
     uint64_t claim_end_cycles;
@@ -35,10 +37,22 @@ struct AicorePendingSlotV1 {
     AicoreClaimKindV1 claim_kind;
 };
 
+static_assert(sizeof(AicorePendingSlotV1) == 64, "pending slot layout changed");
+
 inline __host__ __aicore__ void aicore_pending_clear_v1(AicorePendingSlotV1 *slot) {
     if (slot == nullptr) return;
     *slot = {
-        AICORE_TASK_ID_INVALID_V1, 0, 0, static_cast<int32_t>(AICORE_TASK_ID_INVALID_V1), 0, 0, 0, 0, 0,
+        AICORE_TASK_ID_INVALID_V1,
+        0,
+        0,
+        static_cast<int32_t>(AICORE_TASK_ID_INVALID_V1),
+        UINT16_MAX,
+        UINT8_MAX,
+        0,
+        0,
+        0,
+        0,
+        0,
         AicoreClaimKindV1::SEED,
     };
 }
@@ -71,19 +85,26 @@ inline __aicore__ void aicore_record_scheduler_error_v1(
 }
 
 inline __host__ __aicore__ AicoreRootStatusV0 aicore_pending_initialize_v1(
-    const AicoreReadonlyGraphV0 &graph, int64_t task_id, uint64_t stream_index, AicoreClaimKindV1 claim_kind,
-    uint64_t claim_start_cycles, uint64_t claim_end_cycles, AicorePendingSlotV1 *slot
+    const AicoreReadonlyGraphV0 &graph, int64_t task_id, AicoreRootCoreTypeV0 expected_core_type, int32_t max_func_id,
+    uint64_t stream_index, AicoreClaimKindV1 claim_kind, uint64_t claim_start_cycles, uint64_t claim_end_cycles,
+    AicorePendingSlotV1 *slot
 ) {
     if (slot == nullptr) return AicoreRootStatusV0::INVALID_ARGUMENTS;
     AicoreTaskInfoV0 task{};
     AicoreRootStatusV0 status = aicore_classify_task_v0(graph, task_id, &task);
     if (status != AicoreRootStatusV0::OK) return status;
+    if (task.core_type != expected_core_type || task.kernel_id >= max_func_id ||
+        task.kernel_id > static_cast<int32_t>(UINT16_MAX)) {
+        return AicoreRootStatusV0::UNSUPPORTED_SHAPE;
+    }
     __gm__ uint8_t *payload = aicore_graph_payload_v0(graph, task_id);
     *slot = {
         task_id,
         *reinterpret_cast<__gm__ int32_t *>(payload + AICORE_GRAPH_FANIN_COUNT_OFFSET_V0),
         0,
         static_cast<int32_t>(AICORE_TASK_ID_INVALID_V1),
+        static_cast<uint16_t>(task.kernel_id),
+        static_cast<uint8_t>(task.subtask_slot),
         0,
         stream_index,
         claim_start_cycles,
