@@ -44,6 +44,9 @@ during claim initialization and is not repeated in `Payload`; callable lookup
 and argument materialization remain in `Payload`. `aicpu_tasks` is empty
 because AICPU does not dispatch steady-state work.
 
+Only AIV workers emit `CompletionBatchClaim` and `WakeResolve`: completion
+inbox service and dependency resolution are not performed by AIC workers.
+
 The common AICore profiling buffer retains one kernel anchor per worker. The
 sidecar trace cell is indexed by task ID and therefore captures every executed
 task without contending for a shared append cursor. Tracing is conditional on

@@ -543,13 +543,12 @@ bool append_aicore_scheduler_trace(
             trace.completion_end_cycles
         );
         const AicoreTaskControlV1 &control = task_controls[task_id];
-        if (control.completion_resolve_start_cycles != 0 && control.resolver_worker_id <
-                                                               static_cast<uint64_t>(runtime->worker_count)) {
+        if (control.completion_resolve_start_cycles != 0 &&
+            control.resolver_worker_id < static_cast<uint64_t>(runtime->worker_count)) {
             const AicoreWorkerContextV1 &resolver = contexts[control.resolver_worker_id];
             emit(
                 control.resolver_worker_id, static_cast<uint64_t>(resolver.core_type), trace.task_id,
-                "CompletionBatchClaim", control.completion_resolve_start_cycles,
-                control.completion_resolve_start_cycles
+                "CompletionBatchClaim", control.completion_resolve_start_cycles, control.completion_resolve_start_cycles
             );
             emit(
                 control.resolver_worker_id, static_cast<uint64_t>(resolver.core_type), trace.task_id, "WakeResolve",
@@ -1350,8 +1349,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
                 completion_link_waits += contexts[i].completion_link_wait_count;
                 completion_link_wait_max = std::max(completion_link_wait_max, contexts[i].completion_link_wait_max);
                 completion_lag_cycles += contexts[i].completion_lag_cycles;
-                completion_lag_max_cycles =
-                    std::max(completion_lag_max_cycles, contexts[i].completion_lag_max_cycles);
+                completion_lag_max_cycles = std::max(completion_lag_max_cycles, contexts[i].completion_lag_max_cycles);
                 ready_to_kernel_cycles += contexts[i].ready_to_kernel_cycles;
                 ready_to_kernel_max_cycles =
                     std::max(ready_to_kernel_max_cycles, contexts[i].ready_to_kernel_max_cycles);
@@ -1364,11 +1362,11 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
                 completion_cycles += contexts[i].completion_enqueue_cycles;
             }
             bool completion_inboxes_empty = true;
-            for (uint64_t inbox = 0; inbox < control->active_worker_count; ++inbox) {
+            for (uint64_t inbox = 0; inbox < control->aiv_active_worker_count; ++inbox) {
                 if (completion_inboxes[inbox].head != AICORE_COMPLETION_INBOX_EMPTY_V1) {
                     LOG_ERROR(
-                        "A5 HBG AICore scheduler: completion inbox=%" PRIu64 " not empty head=%" PRId64,
-                        inbox, completion_inboxes[inbox].head
+                        "A5 HBG AICore scheduler: completion inbox=%" PRIu64 " not empty head=%" PRId64, inbox,
+                        completion_inboxes[inbox].head
                     );
                     completion_inboxes_empty = false;
                     break;
@@ -1408,9 +1406,9 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
                 LOG_ERROR(
                     "A5 HBG AICore scheduler: invalid final state expected=%" PRIu64 " executed=%" PRIu64
                     " executable=%" PRIu64 " inline=%" PRIu64 " active=%" PRIu64 " drained=%" PRIu64
-                    " executor_drained=%" PRIu64 " finished=%" PRIu64 " resolved=%" PRIu64
-                    " wake_registers=%" PRIu64 " wake_migrations=%" PRIu64 " wake_closes=%" PRIu64
-                    " enqueues=%" PRIu64 " resolver_tasks=%" PRIu64 " error=%" PRIu64,
+                    " executor_drained=%" PRIu64 " finished=%" PRIu64 " resolved=%" PRIu64 " wake_registers=%" PRIu64
+                    " wake_migrations=%" PRIu64 " wake_closes=%" PRIu64 " enqueues=%" PRIu64 " resolver_tasks=%" PRIu64
+                    " error=%" PRIu64,
                     control->expected_task_count, worker_executed, executable_task_count,
                     control->inline_completed_count, active_workers, control->drained_worker_count,
                     control->executor_drained_worker_count, control->finished_count, control->resolved_task_count,
@@ -1437,19 +1435,18 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
                 );
                 LOG_INFO(
                     "A5 HBG AICore scheduler COUNTERS: seeded=%" PRIu64 " ticket_claims=%" PRIu64
-                    " exhaustions=%" PRIu64 " state_polls=%" PRIu64 " fanin_loads=%" PRIu64
-                    " wake_registers=%" PRIu64 " wake_cas_retries=%" PRIu64 " wake_closed_retries=%" PRIu64
-                    " wake_migrations=%" PRIu64 " wake_closes=%" PRIu64 " completion_enqueues=%" PRIu64
-                    " completion_batches=%" PRIu64 " completion_resolves=%" PRIu64 " completion_steals=%" PRIu64
-                    " completion_link_waits=%" PRIu64 " completion_link_wait_max=%" PRIu64
-                    " completion_lag_cycles=%" PRIu64 " completion_lag_max=%" PRIu64
-                    " ready_to_kernel_cycles=%" PRIu64 " ready_to_kernel_max=%" PRIu64
+                    " exhaustions=%" PRIu64 " state_polls=%" PRIu64 " fanin_loads=%" PRIu64 " wake_registers=%" PRIu64
+                    " wake_cas_retries=%" PRIu64 " wake_closed_retries=%" PRIu64 " wake_migrations=%" PRIu64
+                    " wake_closes=%" PRIu64 " completion_enqueues=%" PRIu64 " completion_batches=%" PRIu64
+                    " completion_resolves=%" PRIu64 " completion_steals=%" PRIu64 " completion_link_waits=%" PRIu64
+                    " completion_link_wait_max=%" PRIu64 " completion_lag_cycles=%" PRIu64
+                    " completion_lag_max=%" PRIu64 " ready_to_kernel_cycles=%" PRIu64 " ready_to_kernel_max=%" PRIu64
                     " idle_iterations=%" PRIu64,
                     seeded, ticket_claims, ticket_exhaustions, state_polls, fanin_loads, wake_registers,
                     wake_cas_retries, wake_closed_retries, wake_migrations, wake_closes, completion_enqueues,
                     completion_batches, completion_resolves, completion_steals, completion_link_waits,
-                    completion_link_wait_max, completion_lag_cycles, completion_lag_max_cycles,
-                    ready_to_kernel_cycles, ready_to_kernel_max_cycles, idle_iterations
+                    completion_link_wait_max, completion_lag_cycles, completion_lag_max_cycles, ready_to_kernel_cycles,
+                    ready_to_kernel_max_cycles, idle_iterations
                 );
             }
             if (!append_aicore_scheduler_trace(runtime, traces, task_controls, contexts)) rc = -1;

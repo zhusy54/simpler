@@ -97,8 +97,7 @@ inline __host__ __aicore__ void aicore_pending_clear_v1(AicorePendingSlotV1 *slo
 inline __host__ __aicore__ __gm__ AicoreTaskControlV1 *
 aicore_task_control_at_v1(__gm__ void *sidecar_base, __gm__ const AicoreWorkerContextV1 *context, int64_t task_id) {
     return aicore_sidecar_at_v1<AicoreTaskControlV1>(
-        sidecar_base,
-        context->task_controls_offset + static_cast<uint64_t>(task_id) * sizeof(AicoreTaskControlV1)
+        sidecar_base, context->task_controls_offset + static_cast<uint64_t>(task_id) * sizeof(AicoreTaskControlV1)
     );
 }
 
@@ -212,8 +211,7 @@ inline __aicore__ AicoreRouteResultV1 aicore_route_task_v1(
             return AicoreRouteResultV1::ERROR;
         }
         if (stats != nullptr) ++stats->fanin_state_load_count;
-        __gm__ AicoreTaskControlV1 *producer_control =
-            aicore_task_control_at_v1(sidecar_base, context, producer);
+        __gm__ AicoreTaskControlV1 *producer_control = aicore_task_control_at_v1(sidecar_base, context, producer);
         if (aicore_gm_load_v0(producer_control->state) == static_cast<int64_t>(AicoreTaskStateV1::DONE)) {
             ++next_fanin;
             continue;
@@ -296,9 +294,7 @@ inline __aicore__ bool aicore_complete_and_wake_v1(
 
     while (waiter >= 0) {
         if (static_cast<uint64_t>(waiter) >= graph.task_count) {
-            aicore_record_scheduler_error_v1(
-                run_control, waiter, AicoreRootStatusV0::INVALID_TASK_ID, &graph, context
-            );
+            aicore_record_scheduler_error_v1(run_control, waiter, AicoreRootStatusV0::INVALID_TASK_ID, &graph, context);
             return false;
         }
         __gm__ AicoreTaskControlV1 *waiter_control = aicore_task_control_at_v1(sidecar_base, context, waiter);
@@ -313,18 +309,16 @@ inline __aicore__ bool aicore_complete_and_wake_v1(
     return true;
 }
 
-
 inline __aicore__ bool aicore_enqueue_completion_v1(
     const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *context,
-    __gm__ AicoreRunControlV1 *run_control, int64_t task_id, AicoreCompletionStatsV1 *stats,
-    bool trace_enabled = false
+    __gm__ AicoreRunControlV1 *run_control, int64_t task_id, AicoreCompletionStatsV1 *stats, bool trace_enabled = false
 ) {
     if (task_id < 0 || static_cast<uint64_t>(task_id) >= graph.task_count) {
         aicore_record_scheduler_error_v1(run_control, task_id, AicoreRootStatusV0::INVALID_TASK_ID, &graph, context);
         return false;
     }
-    const uint64_t active_workers = aicore_gm_load_v0(run_control->active_worker_count);
-    if (active_workers == 0) {
+    const uint64_t resolver_count = aicore_gm_load_v0(run_control->aiv_active_worker_count);
+    if (resolver_count == 0) {
         aicore_record_scheduler_error_v1(run_control, task_id, AicoreRootStatusV0::INVALID_ARGUMENTS, &graph, context);
         return false;
     }
@@ -337,7 +331,7 @@ inline __aicore__ bool aicore_enqueue_completion_v1(
         return false;
     }
     if (trace_enabled) control->completion_enqueue_cycles = aicore_scheduler_cycles_v1();
-    uint64_t inbox_index = static_cast<uint64_t>(task_id) % active_workers;
+    uint64_t inbox_index = static_cast<uint64_t>(task_id) % resolver_count;
     __gm__ AicoreCompletionInboxV1 *inbox = aicore_completion_inbox_at_v1(sidecar_base, context, inbox_index);
     int64_t previous = aicore_gm_exchange_v0(inbox->head, task_id);
     control->completion_next = previous;
@@ -382,9 +376,7 @@ inline __aicore__ bool aicore_resolve_completion_v1(
     if (wake_stats != nullptr) ++wake_stats->wake_close_count;
     while (waiter >= 0) {
         if (static_cast<uint64_t>(waiter) >= graph.task_count) {
-            aicore_record_scheduler_error_v1(
-                run_control, waiter, AicoreRootStatusV0::INVALID_TASK_ID, &graph, context
-            );
+            aicore_record_scheduler_error_v1(run_control, waiter, AicoreRootStatusV0::INVALID_TASK_ID, &graph, context);
             return false;
         }
         __gm__ AicoreTaskControlV1 *waiter_control = aicore_task_control_at_v1(sidecar_base, context, waiter);
@@ -409,20 +401,21 @@ inline __aicore__ bool aicore_service_completion_inboxes_v1(
     AicoreCompletionStatsV1 *completion_stats, bool *made_progress, bool trace_enabled = false
 ) {
     if (made_progress != nullptr) *made_progress = false;
-    const uint64_t active_workers = aicore_gm_load_v0(run_control->active_worker_count);
-    if (active_workers == 0 || victim_cursor == nullptr) return true;
+    if (context->core_type != static_cast<int32_t>(AicoreRootCoreTypeV0::AIV)) return true;
+    const uint64_t resolver_count = aicore_gm_load_v0(run_control->aiv_active_worker_count);
+    if (resolver_count == 0 || victim_cursor == nullptr || context->inbox_index >= resolver_count) return true;
     uint64_t inbox_index = context->inbox_index;
     __gm__ AicoreCompletionInboxV1 *inbox = aicore_completion_inbox_at_v1(sidecar_base, context, inbox_index);
     int64_t task_id = AICORE_COMPLETION_INBOX_EMPTY_V1;
     if (aicore_gm_load_v0(inbox->head) != AICORE_COMPLETION_INBOX_EMPTY_V1) {
         task_id = aicore_gm_exchange_v0(inbox->head, AICORE_COMPLETION_INBOX_EMPTY_V1);
     }
-    if (task_id == AICORE_COMPLETION_INBOX_EMPTY_V1 && active_workers > 1) {
-        uint64_t victim = *victim_cursor % active_workers;
-        *victim_cursor = (victim + 1) % active_workers;
+    if (task_id == AICORE_COMPLETION_INBOX_EMPTY_V1 && resolver_count > 1) {
+        uint64_t victim = *victim_cursor % resolver_count;
+        *victim_cursor = (victim + 1) % resolver_count;
         if (victim == inbox_index) {
             victim = *victim_cursor;
-            *victim_cursor = (victim + 1) % active_workers;
+            *victim_cursor = (victim + 1) % resolver_count;
         }
         inbox = aicore_completion_inbox_at_v1(sidecar_base, context, victim);
         if (aicore_gm_load_v0(inbox->head) != AICORE_COMPLETION_INBOX_EMPTY_V1) {

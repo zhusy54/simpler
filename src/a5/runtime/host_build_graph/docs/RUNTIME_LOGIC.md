@@ -55,22 +55,24 @@ first incomplete producer's wake list. The consumer stays in its owner's
 pending slot; there is no ReadyQ and no execution ownership migration.
 
 After a kernel publishes its output, its owner changes `READY` to `DONE` and
-pushes the task onto `task_id % active_worker_count` using one `atomicExch`.
+pushes the task onto `task_id % aiv_active_worker_count` using one `atomicExch`.
 The per-task `completion_next` link is published after the exchange, so a
 resolver treats `UNPUBLISHED` as a short protocol window rather than the end of
 the list. LIFO order is valid because completion events have no FIFO semantic;
 dependency order is enforced by task state and wake-list routing.
 
-Before idle backoff, a worker detaches its whole local inbox or rotates across
-one victim inbox. It closes each completed producer's wake list and reroutes
-all waiters. Registration and close are race-safe: a registration CAS that wins
+Before idle backoff, an AIV worker detaches its whole local inbox or rotates
+across one AIV victim inbox. AIC workers never service completion inboxes. The
+AIV resolver closes each completed producer's wake list and reroutes all
+waiters. Registration and close are race-safe: a registration CAS that wins
 before close is in the detached wake chain; a CAS that observes `CLOSED`
 rescans and sees the producer as `DONE`. Every fourth executed kernel also
 provides a low-priority resolver service point so sustained ticket traffic
 cannot starve completions.
 
-Cursor exhaustion plus empty pending slots marks `EXECUTOR_DRAINED`, but that
-worker continues resolving. Final `drained_worker_count` is published only
+For a graph with no AIV tasks, one AIV worker is activated as a resolver-only
+worker and skips seed/ticket execution. Cursor exhaustion plus empty pending
+slots marks `EXECUTOR_DRAINED`, but an AIV worker continues resolving. Final `drained_worker_count` is published only
 after every executor drained and the batch-updated resolved count equals the
 executable task count. There is no peer-core wake primitive, so an idle worker
 still performs bounded GM inbox checks followed by the existing local

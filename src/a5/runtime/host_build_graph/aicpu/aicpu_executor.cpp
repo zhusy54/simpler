@@ -213,15 +213,19 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         const int32_t active_aic = static_cast<int32_t>(
             std::min<uint64_t>(static_cast<uint64_t>(aic_count), runtime->aicore_sidecar_layout.aic_task_count)
         );
-        const int32_t active_aiv = static_cast<int32_t>(
+        const int32_t active_aiv_executors = static_cast<int32_t>(
             std::min<uint64_t>(static_cast<uint64_t>(aiv_count), runtime->aicore_sidecar_layout.aiv_task_count)
         );
-        uint64_t inbox_index = 0;
+        const uint64_t executable_task_count =
+            runtime->aicore_sidecar_layout.aic_task_count + runtime->aicore_sidecar_layout.aiv_task_count;
+        const int32_t active_aiv =
+            aiv_count == 0 ? 0 : std::max(active_aiv_executors, executable_task_count != 0 ? 1 : 0);
         for (int32_t i = 0; i < runtime->worker_count; ++i) {
-            const int32_t active_count =
-                static_cast<CoreType>(contexts[i].core_type) == CoreType::AIC ? active_aic : active_aiv;
+            const bool is_aiv = static_cast<CoreType>(contexts[i].core_type) == CoreType::AIV;
+            const int32_t active_count = is_aiv ? active_aiv : active_aic;
             contexts[i].active = contexts[i].type_rank < active_count ? 1 : 0;
-            if (contexts[i].active != 0) contexts[i].inbox_index = inbox_index++;
+            contexts[i].inbox_index =
+                is_aiv && contexts[i].active != 0 ? static_cast<uint64_t>(contexts[i].type_rank) : UINT64_MAX;
         }
         auto *aic_stream = aicore_sidecar_at_v1<AicoreTaskStreamV1>(
             runtime->aicore_sidecar_base, runtime->aicore_sidecar_layout.aic_stream_offset
@@ -231,8 +235,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         );
         aic_stream->initial_ticket_count = static_cast<uint64_t>(active_aic);
         aic_stream->next_index = static_cast<uint64_t>(active_aic);
-        aiv_stream->initial_ticket_count = static_cast<uint64_t>(active_aiv);
-        aiv_stream->next_index = static_cast<uint64_t>(active_aiv);
+        aiv_stream->initial_ticket_count = static_cast<uint64_t>(active_aiv_executors);
+        aiv_stream->next_index = static_cast<uint64_t>(active_aiv_executors);
         run_control->active_worker_count = static_cast<uint64_t>(active_aic) + static_cast<uint64_t>(active_aiv);
         run_control->aic_active_worker_count = static_cast<uint64_t>(active_aic);
         run_control->aiv_active_worker_count = static_cast<uint64_t>(active_aiv);
@@ -241,7 +245,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         cache_flush_range(aiv_stream, sizeof(*aiv_stream));
 
         if ((runtime->aicore_sidecar_layout.aic_task_count != 0 && active_aic == 0) ||
-            (runtime->aicore_sidecar_layout.aiv_task_count != 0 && active_aiv == 0)) {
+            (runtime->aicore_sidecar_layout.aiv_task_count != 0 && active_aiv_executors == 0) ||
+            (executable_task_count != 0 && active_aiv == 0)) {
             LOG_ERROR(
                 "A5 HBG AICore scheduler: topology cannot execute graph (tasks AIC=%" PRIu64 " AIV=%" PRIu64
                 ", cores AIC=%d AIV=%d)",
