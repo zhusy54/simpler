@@ -26,6 +26,7 @@
 #include "aicore_ticket_stream_planner.h"
 #include "aicore_ticket_model_v1.h"
 #include "aicore_ticket_scheduler_v1.h"
+#include "aicore_worker_debug_policy_v1.h"
 #include "callable.h"
 #include "pto_runtime2_types.h"
 
@@ -152,6 +153,15 @@ TEST(AicoreSidecarV1, RejectsInvalidCountsAndOverflow) {
     EXPECT_FALSE(aicore_sidecar_checked_add_v1(UINT64_MAX, 1, &value));
     EXPECT_FALSE(aicore_sidecar_checked_mul_v1(UINT64_MAX, 2, &value));
     EXPECT_FALSE(aicore_sidecar_checked_align_v1(UINT64_MAX, 128, &value));
+}
+
+TEST(AicoreWorkerDebugPolicyV1, PublishesOnlyDiagnosticTransitions) {
+    EXPECT_FALSE(aicore_worker_debug_requires_publish_v1(AicoreWorkerDebugEventV1::SEED_INITIALIZED));
+    EXPECT_FALSE(aicore_worker_debug_requires_publish_v1(AicoreWorkerDebugEventV1::TICKET_CLAIMED));
+    EXPECT_FALSE(aicore_worker_debug_requires_publish_v1(AicoreWorkerDebugEventV1::TASK_COMPLETED));
+    EXPECT_TRUE(aicore_worker_debug_requires_publish_v1(AicoreWorkerDebugEventV1::WAITING_PRODUCER_CHANGED));
+    EXPECT_TRUE(aicore_worker_debug_requires_publish_v1(AicoreWorkerDebugEventV1::CURSOR_EXHAUSTED));
+    EXPECT_TRUE(aicore_worker_debug_requires_publish_v1(AicoreWorkerDebugEventV1::DRAINING));
 }
 
 TEST(AicoreTicketSchedulerV1, TicketClaimsAreUniqueAndExhaustOncePerWorker) {

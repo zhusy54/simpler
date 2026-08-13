@@ -74,9 +74,11 @@ Host validation checks:
 - each typed cursor reached or passed its stream length.
 
 The first scheduler error records task, worker, graph-address, and window
-metadata before publishing the nonzero error code. Worker snapshots expose both
-pending slots and their current producer without adding writes to the polling
-loop.
+metadata before publishing the nonzero error code. Worker snapshots are
+diagnostic breadcrumbs rather than a live mirror: they are published when a
+blocked slot changes producer, the typed cursor is exhausted, and the worker
+drains. Seed, successful ticket claim, and task completion do not publish a
+snapshot on the steady-state path.
 
 Level-1 chip-swimlane capture exports `SeedClaim`, `TicketClaim`,
 `PendingWait`, `Payload`, `Kernel`, `CompletionPublish`, and `Drain` phases.

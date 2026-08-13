@@ -13,6 +13,7 @@
 #include "aicore/aicore_profiling_state.h"
 #include "aicore_task_profiling_v1.h"
 #include "aicore_ticket_scheduler_v1.h"
+#include "aicore_worker_debug_policy_v1.h"
 #include "common/platform_config.h"
 #include "pto2_dispatch_payload.h"
 #include "runtime.h"
@@ -71,8 +72,9 @@ __aicore__ __attribute__((always_inline)) void publish_worker_config(__gm__ Aico
 
 __aicore__ __attribute__((always_inline)) void publish_worker_debug(
     __gm__ AicoreWorkerContextV1 *context, const AicorePendingSlotV1 pending[AICORE_PENDING_SLOT_COUNT_V1],
-    bool cursor_exhausted, uint64_t lifecycle_state
+    bool cursor_exhausted, uint64_t lifecycle_state, AicoreWorkerDebugEventV1 event
 ) {
+    if (!aicore_worker_debug_requires_publish_v1(event)) return;
     for (uint32_t slot = 0; slot < AICORE_PENDING_SLOT_COUNT_V1; ++slot) {
         context->pending_task_id[slot] = pending[slot].task_id;
         context->pending_next_fanin[slot] = pending[slot].next_fanin_index;
@@ -211,7 +213,6 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         } else {
             stats.seeded_task_count = 1;
             stats.pending_peak = 1;
-            publish_worker_debug(worker_context, pending, cursor_exhausted, 1);
         }
 
         while (true) {
@@ -248,7 +249,10 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                         pending[slot].pending_wait_start_cycles = readiness_start;
                     }
                     if (previous_waiting != pending[slot].waiting_producer) {
-                        publish_worker_debug(worker_context, pending, cursor_exhausted, 1);
+                        publish_worker_debug(
+                            worker_context, pending, cursor_exhausted, 1,
+                            AicoreWorkerDebugEventV1::WAITING_PRODUCER_CHANGED
+                        );
                     }
                 }
             }
@@ -314,7 +318,6 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                 stats.completion_publish_cycles += completion_end - completion_start;
                 aicore_pending_clear_v1(&task_pending);
                 scan_start = (static_cast<uint32_t>(ready_slot) + 1) % AICORE_PENDING_SLOT_COUNT_V1;
-                publish_worker_debug(worker_context, pending, cursor_exhausted, 1);
                 backoff_iterations = kInitialBackoffIterations;
                 continue;
             }
@@ -345,13 +348,14 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                     ++stats.ticket_claim_count;
                     uint64_t new_occupancy = occupied + 1;
                     if (new_occupancy > stats.pending_peak) stats.pending_peak = new_occupancy;
-                    publish_worker_debug(worker_context, pending, cursor_exhausted, 1);
                     backoff_iterations = kInitialBackoffIterations;
                     continue;
                 }
                 cursor_exhausted = true;
                 ++stats.ticket_exhaustion_count;
-                publish_worker_debug(worker_context, pending, cursor_exhausted, 1);
+                publish_worker_debug(
+                    worker_context, pending, cursor_exhausted, 1, AicoreWorkerDebugEventV1::CURSOR_EXHAUSTED
+                );
             }
 
             bool pending_empty = true;
@@ -360,7 +364,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             if (cursor_exhausted && pending_empty) {
                 if (aicore_gm_load_v0(run_control->scheduler_error) != 0) break;
                 uint64_t drain_start = get_sys_cnt_aicore();
-                publish_worker_debug(worker_context, pending, cursor_exhausted, 2);
+                publish_worker_debug(worker_context, pending, cursor_exhausted, 2, AicoreWorkerDebugEventV1::DRAINING);
                 stats.drain_start_cycles = drain_start;
                 stats.drain_end_cycles = get_sys_cnt_aicore();
                 stats.drain_cycles = stats.drain_end_cycles - drain_start;
