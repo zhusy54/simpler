@@ -4,7 +4,8 @@
 
 ```text
 host: build, validate, relocate, and upload the complete graph
-  → host: build sorted AIC/AIV task streams and the execution sidecar
+  → host: order AIC/AIV task streams by remaining critical-path length
+          and build the execution sidecar
   → AICPU: handshake workers, discover topology, publish active prefixes and RUN
   → AICore: seed by type rank, claim tickets, poll private pending fanins,
             execute kernels, and publish per-task completion flags
@@ -24,12 +25,19 @@ consumer task ID.
 The 128-byte-aligned v1 sidecar contains:
 
 - one padded monotonic completion cell per task;
-- sorted AIC and AIV task-ID streams, each with an isolated ticket cursor;
+- dependency-priority-ordered AIC and AIV task-ID streams, each with an
+  isolated ticket cursor;
 - split configuration, lifecycle, and first-error run-control cache lines;
 - one private dispatch payload and one debug/statistics context per worker; and
 - per-task scheduler phase cells written only during level-1 capture.
 
 Inline-completed tasks start as `DONE` and do not enter either typed stream.
+
+The host computes `bottom_level(task)` as the longest remaining edge distance
+to any sink. Each typed stream is ordered by
+`(bottom_level descending, task_id ascending)`. Because every graph edge has a
+strictly decreasing bottom level, every producer has higher stream priority
+than its consumer even when the resulting task IDs are non-monotonic.
 
 ## Ticket and pending scheduling
 
@@ -57,6 +65,8 @@ publishes EXIT after every active worker has drained.
 
 Host validation checks:
 
+- every graph edge has strictly decreasing bottom-level priority;
+- both typed streams are complete, unique, core-type-correct, and priority ordered;
 - every task completion cell is `DONE`;
 - worker and run-control execution totals match both typed streams;
 - inline plus executable counts match the graph task count;
@@ -70,4 +80,6 @@ loop.
 
 Level-1 chip-swimlane capture exports `SeedClaim`, `TicketClaim`,
 `PendingWait`, `Payload`, `Kernel`, `CompletionPublish`, and `Drain` phases.
+The host STRACE tree also exposes `simpler_run.bind.ticket_stream_plan` for
+the stream-planning cost.
 See [profiling_levels.md](profiling_levels.md).

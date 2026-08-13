@@ -20,14 +20,15 @@
 class AicoreTicketModelV1 {
 public:
     AicoreTicketModelV1(
-        std::vector<std::vector<int64_t>> fanins, std::vector<int64_t> aic_tasks, std::vector<int64_t> aiv_tasks,
-        size_t aic_workers, size_t aiv_workers, size_t pending_slots = 2
+        std::vector<std::vector<int64_t>> fanins, std::vector<uint32_t> bottom_level, std::vector<int64_t> aic_tasks,
+        std::vector<int64_t> aiv_tasks, size_t aic_workers, size_t aiv_workers, size_t pending_slots = 2
     ) :
         fanins_(std::move(fanins)),
+        bottom_level_(std::move(bottom_level)),
         completed_(fanins_.size(), false),
         execution_count_(fanins_.size(), 0),
         pending_slots_(pending_slots) {
-        valid_ = pending_slots_ != 0;
+        valid_ = pending_slots_ != 0 && bottom_level_.size() == fanins_.size();
         validate_graph();
         streams_.reserve(2);
         add_workers(std::move(aic_tasks), aic_workers);
@@ -90,6 +91,11 @@ private:
 
     bool valid_task(int64_t task_id) const { return task_id >= 0 && static_cast<size_t>(task_id) < fanins_.size(); }
 
+    bool priority_before(int64_t lhs, int64_t rhs) const {
+        if (bottom_level_[lhs] != bottom_level_[rhs]) return bottom_level_[lhs] > bottom_level_[rhs];
+        return lhs < rhs;
+    }
+
     void validate_graph() {
         stream_task_.assign(fanins_.size(), false);
         for (size_t task_id = 0; task_id < fanins_.size(); ++task_id) {
@@ -97,19 +103,31 @@ private:
             std::sort(fanin.begin(), fanin.end());
             if (std::adjacent_find(fanin.begin(), fanin.end()) != fanin.end()) valid_ = false;
             for (int64_t producer : fanin) {
-                if (producer < 0 || producer >= static_cast<int64_t>(task_id)) valid_ = false;
+                if (producer < 0 || producer >= static_cast<int64_t>(task_id)) {
+                    valid_ = false;
+                } else if (bottom_level_.size() == fanins_.size() &&
+                           bottom_level_[producer] <= bottom_level_[task_id]) {
+                    valid_ = false;
+                }
             }
         }
     }
 
     void add_workers(std::vector<int64_t> tasks, size_t worker_count) {
-        if (!std::is_sorted(tasks.begin(), tasks.end())) valid_ = false;
+        bool valid_stream = true;
         for (int64_t task_id : tasks) {
             if (!valid_task(task_id) || stream_task_[task_id]) {
                 valid_ = false;
+                valid_stream = false;
             } else {
                 stream_task_[task_id] = true;
             }
+        }
+        if (valid_stream && bottom_level_.size() == fanins_.size() &&
+            !std::is_sorted(tasks.begin(), tasks.end(), [&](int64_t lhs, int64_t rhs) {
+                return priority_before(lhs, rhs);
+            })) {
+            valid_ = false;
         }
         streams_.push_back({std::move(tasks), 0, 0});
         Stream &stream = streams_.back();
@@ -169,6 +187,7 @@ private:
     }
 
     std::vector<std::vector<int64_t>> fanins_;
+    std::vector<uint32_t> bottom_level_;
     std::vector<bool> completed_;
     std::vector<bool> stream_task_;
     std::vector<int> execution_count_;

@@ -67,7 +67,9 @@
 #include "common/platform_config.h"
 #include "common/chip_swimlane_policy.h"
 #include "common/unified_log.h"
+#include "common/strace.h"
 #include "utils/device_arena.h"
+#include "aicore_ticket_stream_planner.h"
 #include "prepare_callable_common.h"
 
 extern "C" const PipelineContract *get_pipeline_contract(void) {
@@ -586,20 +588,21 @@ bool create_aicore_sidecar_v1(
         static_cast<uint64_t>(total_tasks),
         task_window_size - 1,
     };
-    std::vector<uint32_t> aic_task_ids;
-    std::vector<uint32_t> aiv_task_ids;
+    std::vector<uint8_t> inline_completed_flags(static_cast<size_t>(total_tasks), 0);
     std::vector<int64_t> inline_completed_task_ids;
     for (int64_t task_id = 0; task_id < total_tasks; ++task_id) {
         PTO2TaskSlotState &slot = host_sm_handle.header->ring.get_slot_state_by_task_id(task_id);
         AicoreTaskInfoV0 task{};
         AicoreRootStatusV0 status = aicore_classify_task_v0(host_graph, task_id, &task);
         if (status != AicoreRootStatusV0::OK) {
-            bool inline_completed = status == AicoreRootStatusV0::UNSUPPORTED_SHAPE && slot.active_mask.raw() == 0 &&
-                                    slot.logical_block_num == 1 && slot.total_required_subtasks == 0 &&
-                                    slot.task_state.load(std::memory_order_acquire) == PTO2_TASK_COMPLETED &&
-                                    slot.task_attrs.allow_early_resolve() && !slot.task_attrs.requires_sync_start() &&
-                                    !slot.task_attrs.has_predicate();
-            if (inline_completed) {
+            bool inline_completed_task = status == AicoreRootStatusV0::UNSUPPORTED_SHAPE &&
+                                         slot.active_mask.raw() == 0 && slot.logical_block_num == 1 &&
+                                         slot.total_required_subtasks == 0 &&
+                                         slot.task_state.load(std::memory_order_acquire) == PTO2_TASK_COMPLETED &&
+                                         slot.task_attrs.allow_early_resolve() &&
+                                         !slot.task_attrs.requires_sync_start() && !slot.task_attrs.has_predicate();
+            if (inline_completed_task) {
+                inline_completed_flags[static_cast<size_t>(task_id)] = 1;
                 inline_completed_task_ids.push_back(task_id);
                 continue;
             }
@@ -628,23 +631,24 @@ bool create_aicore_sidecar_v1(
             );
             return false;
         }
-        if (task.core_type == AicoreRootCoreTypeV0::AIC) {
-            aic_task_ids.push_back(static_cast<uint32_t>(task_id));
-        } else {
-            aiv_task_ids.push_back(static_cast<uint32_t>(task_id));
-        }
     }
 
-    const uint64_t executable_task_count = aic_task_ids.size() + aiv_task_ids.size();
+    AicoreTicketStreams streams;
+    {
+        STRACE("simpler_run.bind.ticket_stream_plan");
+        if (!build_aicore_ticket_streams(host_graph, inline_completed_flags, &streams)) {
+            LOG_ERROR("A5 HBG AICore scheduler: failed to build dependency-ordered typed streams");
+            return false;
+        }
+    }
+    const uint64_t executable_task_count = streams.aic.size() + streams.aiv.size();
     if (executable_task_count + inline_completed_task_ids.size() != static_cast<uint64_t>(total_tasks)) {
         LOG_ERROR("A5 HBG AICore scheduler: typed streams do not cover the graph");
         return false;
     }
 
     AicoreExecutionSidecarLayoutV1 layout{};
-    if (!aicore_sidecar_plan_v1(
-            static_cast<uint64_t>(total_tasks), aic_task_ids.size(), aiv_task_ids.size(), &layout
-        ) ||
+    if (!aicore_sidecar_plan_v1(static_cast<uint64_t>(total_tasks), streams.aic.size(), streams.aiv.size(), &layout) ||
         layout.total_size > std::numeric_limits<uint64_t>::max() - (AICORE_SIDECAR_ALIGNMENT_V1 - 1)) {
         LOG_ERROR("A5 HBG AICore scheduler: sidecar layout overflow");
         return false;
@@ -676,9 +680,9 @@ bool create_aicore_sidecar_v1(
         completion_cells[task_id].completion = static_cast<int64_t>(AicoreTaskCompletionV1::DONE);
     }
     auto *aic_ids = aicore_sidecar_at_v1<uint32_t>(host_base, layout.aic_task_ids_offset);
-    std::copy(aic_task_ids.begin(), aic_task_ids.end(), aic_ids);
+    std::copy(streams.aic.begin(), streams.aic.end(), aic_ids);
     auto *aiv_ids = aicore_sidecar_at_v1<uint32_t>(host_base, layout.aiv_task_ids_offset);
-    std::copy(aiv_task_ids.begin(), aiv_task_ids.end(), aiv_ids);
+    std::copy(streams.aiv.begin(), streams.aiv.end(), aiv_ids);
 
     const pto2_sm_layout::PTO2RingSegmentOffsets device_segments =
         pto2_sm_layout::ring_segment_offsets(task_window_size);
