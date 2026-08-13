@@ -248,8 +248,8 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
 
     Returns a dict shaped for `generate_chrome_trace_json`,
     `print_task_statistics`, and `sched_overhead_analysis`: `tasks`,
-    `aicpu_scheduler_phases`, `aicpu_orchestrator_phases`,
-    `core_to_thread`.
+    `aicore_scheduler_phases`, `aicpu_scheduler_phases`,
+    `aicpu_orchestrator_phases`, `core_to_thread`.
 
     The join logic that used to live in `export_swimlane_json` (host C++):
 
@@ -262,7 +262,9 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
       - join `aicpu_tasks` by `(core_id, reg_task_id)`; unmatched rows are
         dropped and counted
       - AICORE_TIMING (level=1): aicpu_tasks is empty by construction, so
-        synthesize one task per aicore record (dispatch/finish = 0)
+        synthesize one task per aicore record (dispatch/finish = 0); when
+        AICore scheduler Kernel phases are present, they replace the sparse
+        common-buffer anchors as the authoritative task stream
       - sort joined `tasks` by `task_id` (= task_token_raw)
       - convert phase records from `*_cycles` → `*_time_us`
 
@@ -430,7 +432,7 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
             )
 
     aicore_scheduler_phases = []
-    existing_task_ids = {int(task["task_id"]) for task in tasks}
+    scheduler_tasks = []
     for phase in aicore_scheduler_rows:
         worker_id = int(phase.get("worker_id", -1))
         task_id = int(phase.get("task_id", -1))
@@ -446,8 +448,8 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
             "duration_us": end_us - start_us,
         }
         aicore_scheduler_phases.append(converted)
-        if converted["phase"] == "Kernel" and task_id >= 0 and task_id not in existing_task_ids:
-            tasks.append(
+        if converted["phase"] == "Kernel" and task_id >= 0:
+            scheduler_tasks.append(
                 {
                     "task_id": task_id,
                     "func_id": -1,
@@ -463,7 +465,8 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
                     "local_setup_us": 0.0,
                 }
             )
-            existing_task_ids.add(task_id)
+    if level == 1 and scheduler_tasks:
+        tasks = scheduler_tasks
     aicore_scheduler_phases.sort(key=lambda phase: (phase["start_time_us"], phase["core_id"]))
 
     tasks.sort(key=lambda t: int(t["task_id"]))
@@ -1284,7 +1287,8 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         - pid=1 "AICPU Orchestrator": orchestrator phase bars (chip_swimlane_level >= 4)
         - pid=2 "AICPU Scheduler": scheduler phase bars (chip_swimlane_level >= 3)
         - pid=3 "Scheduler View": dispatch_time_us to finish_time_us (AICPU perspective)
-        - pid=4 "Worker View": per-subtask kernel execution on physical cores
+        - pid=4 "Worker View": physical-core execution, with AICore scheduler
+          phases replacing duplicate standalone task lanes when present
     """
     if verbose:
         print("Generating Chrome Trace JSON...")
@@ -1337,9 +1341,19 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     #   pid=4  Worker View         (physical AIC/AIV execution rows)
     # sort_index intentionally equals pid so JSON ordering is self-evident.
     task_map: dict[int, list] = defaultdict(list)
+    task_by_core: dict[tuple[int, int], list] = defaultdict(list)
     for t in tasks:
         task_map[t["task_id"]].append(t)
+        task_by_core[(t["task_id"], t["core_id"])].append(t)
     spmd_task_ids = _identify_spmd_task_ids(task_map, deps_block_map)
+    scheduler_kernel_keys = {
+        (phase["task_id"], phase["core_id"]) for phase in aicore_scheduler_phases or [] if phase["phase"] == "Kernel"
+    }
+    task_to_event_id: dict[tuple[int, int], int] = {}
+    task_to_aicpu_event_id: dict[tuple[int, int], int] = {}
+    task_to_aicpu_tid: dict[tuple[int, int], int] = {}
+    scheduler_task_tid: dict[tuple[int, int], int] = {}
+    event_id = 0
 
     if graph_instances:
         events.append(
@@ -1401,8 +1415,11 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         )
 
     # Metadata events: Thread names (one per core)
+    worker_task_core_ids = {
+        task["core_id"] for task in tasks if (task["task_id"], task["core_id"]) not in scheduler_kernel_keys
+    }
     for core_id, tid in core_to_tid.items():
-        if core_id not in task_core_ids:
+        if core_id not in worker_task_core_ids:
             continue
         # Find first task with this core_id to get core_type
         core_type = None
@@ -1481,31 +1498,57 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         task_id = phase["task_id"]
         task_label = "worker" if task_id == 0xFFFFFFFFFFFFFFFF else format_task_display(task_id)
         phase_name = phase["phase"]
-        events.append(
-            {
-                "args": {
-                    "event-hint": f"{phase_name} Task:{task_label}, CoreId:{phase['core_id']}",
-                    "taskId": task_id,
-                    "duration-us": phase["duration_us"],
-                },
-                "cat": "aicore_scheduler",
-                "cname": scheduler_phase_colors.get(phase_name, "generic_work"),
-                "name": f"{phase_name}({task_label})",
-                "ph": "X",
-                "pid": 4,
-                "tid": core_to_tid[phase["core_id"]] + 2,
-                "ts": phase["start_time_us"],
-                "dur": phase["duration_us"],
-            }
-        )
+        phase_args = {
+            "event-hint": f"{phase_name} Task:{task_label}, CoreId:{phase['core_id']}",
+            "taskId": task_id,
+            "duration-us": phase["duration_us"],
+        }
+        event_name = f"{phase_name}({task_label})"
+        phase_event = {
+            "args": phase_args,
+            "cat": "aicore_scheduler",
+            "cname": scheduler_phase_colors.get(phase_name, "generic_work"),
+            "name": event_name,
+            "ph": "X",
+            "pid": 4,
+            "tid": core_to_tid[phase["core_id"]] + 2,
+            "ts": phase["start_time_us"],
+            "dur": phase["duration_us"],
+        }
+        if phase_name == "Kernel":
+            key = (task_id, phase["core_id"])
+            task = next(
+                (
+                    row
+                    for row in task_by_core.get(key, [])
+                    if row["start_time_us"] == phase["start_time_us"] and row["end_time_us"] == phase["end_time_us"]
+                ),
+                None,
+            )
+            if task is not None:
+                func_id = task["func_id"]
+                task_name = _task_display_name(
+                    func_id,
+                    func_id_to_name,
+                    task_label,
+                    spmd=task_id in spmd_task_ids,
+                )
+                phase_args.update(
+                    {
+                        "event-hint": f"Task:{task_label}, FuncId:{func_id}, CoreId:{phase['core_id']}",
+                        "funcId": func_id,
+                        "kernel-duration-us": phase["duration_us"],
+                    }
+                )
+                phase_event["name"] = f"Kernel: {task_name}"
+            phase_event["id"] = event_id
+            task_to_event_id[key] = event_id
+            scheduler_task_tid[key] = phase_event["tid"]
+            event_id += 1
+        events.append(phase_event)
 
     # Duration events (Complete events "X")
-    # Build task_id -> event_id mapping for flow events
-    task_to_event_id: dict[tuple[int, int], int] = {}
-    task_to_aicpu_event_id: dict[tuple[int, int], int] = {}
-    task_to_aicpu_tid: dict[tuple[int, int], int] = {}
     aicpu_worker_anchor_map: dict[int, list[dict]] = defaultdict(list)
-    event_id = 0
 
     AICPU_TID_BASE = 19000  # noqa: N806
     scheduler_thread_indices = {int(thread_idx) for thread_idx in (core_to_thread or []) if int(thread_idx) >= 0}
@@ -1537,7 +1580,8 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         event_id_key = row.get("event_id")
         if "trace_tid" in row:
             return row["trace_tid"], event_id_key
-        return core_to_tid[row["core_id"]], task_to_event_id.get((row["task_id"], row["core_id"]))
+        key = (row["task_id"], row["core_id"])
+        return scheduler_task_tid.get(key, core_to_tid[row["core_id"]]), task_to_event_id.get(key)
 
     # Invert deps (pred -> [succ]) into a fanin map (succ -> [pred]) so each task
     # bar can show both its consumers (fanout) and producers (fanin) with counts.
@@ -1548,6 +1592,9 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 fanin_map[succ].append(pred)
 
     for task in tasks:
+        key = (task["task_id"], task["core_id"])
+        if key in scheduler_task_tid:
+            continue
         tid = core_to_tid[task["core_id"]]
         local_setup_us = task.get("local_setup_us", 0.0) or 0.0
         ts = _task_slice_start_us(task)

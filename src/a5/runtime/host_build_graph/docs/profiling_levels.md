@@ -39,18 +39,22 @@ metadata and `aicore_tasks`, HBG appends:
 Supported phase names are `SeedClaim`, `TicketClaim`, `PendingWait`,
 `Payload`, `Kernel`, `CompletionEnqueue`, `CompletionBatchClaim`,
 `WakeResolve`, `ReadyPublish`, and `Drain`. The swimlane converter
-renders them on per-worker `Scheduler` lanes. Task classification is cached
-during claim initialization and is not repeated in `Payload`; callable lookup
-and argument materialization remain in `Payload`. `aicpu_tasks` is empty
-because AICPU does not dispatch steady-state work.
+renders them on per-worker `Scheduler` lanes. Each `Kernel` phase also carries
+the resolved function name and serves as the task/dependency-flow anchor; the
+converter does not emit a duplicate `AIC_N` or `AIV_N` lane for those tasks.
+Task classification is cached during claim initialization and is not repeated
+in `Payload`; callable lookup and argument materialization remain in `Payload`.
+`aicpu_tasks` is empty because AICPU does not dispatch steady-state work.
 
 Only AIV workers emit `CompletionBatchClaim` and `WakeResolve`: completion
 inbox service and dependency resolution are not performed by AIC workers.
 
-The common AICore profiling buffer retains one kernel anchor per worker. The
-sidecar trace cell is indexed by task ID and therefore captures every executed
-task without contending for a shared append cursor. Tracing is conditional on
-level 1; normal execution does not write trace cells.
+The common AICore profiling buffer retains one kernel anchor per worker in the
+raw capture. The sidecar trace cell is indexed by task ID and therefore captures
+every executed task without contending for a shared append cursor. When the
+sidecar contains `Kernel` phases, the converter treats them as the authoritative
+task timing source and discards the sparse common anchors. Tracing is
+conditional on level 1; normal execution does not write trace cells.
 
 Worker statistics are published only at resolver drain. They include completion
 enqueue, batch, resolve and steal counts; unpublished-link wait total/max;

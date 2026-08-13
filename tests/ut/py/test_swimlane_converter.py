@@ -199,7 +199,7 @@ def test_level_one_aicore_resolve_phases_render_on_resolver_lanes(tmp_path):
     }
 
 
-def test_aicore_ticket_scheduler_phases_synthesize_tasks_and_render(tmp_path):
+def test_aicore_ticket_scheduler_phases_replace_common_anchors_and_render_once(tmp_path):
     input_path = tmp_path / "chip_swimlane_records.json"
     input_path.write_text(
         json.dumps(
@@ -240,7 +240,9 @@ def test_aicore_ticket_scheduler_phases_synthesize_tasks_and_render(tmp_path):
 
     parsed = sc.read_perf_data(input_path)
 
-    assert [task["task_id"] for task in parsed["tasks"]] == [0, 7]
+    assert [task["task_id"] for task in parsed["tasks"]] == [7]
+    assert parsed["tasks"][0]["start_time_us"] == 25.0
+    assert parsed["tasks"][0]["end_time_us"] == 50.0
     assert [phase["phase"] for phase in parsed["aicore_scheduler_phases"]] == [
         "PendingWait",
         "Kernel",
@@ -259,9 +261,14 @@ def test_aicore_ticket_scheduler_phases_synthesize_tasks_and_render(tmp_path):
         and event.get("args", {}).get("name") == "AIV_1 Scheduler"
         for event in events
     )
+    assert not any(
+        event.get("ph") == "M" and event.get("pid") == 4 and event.get("args", {}).get("name") in {"AIC_0", "AIV_1"}
+        for event in events
+    )
+    assert not any(event.get("cat") == "event" and event.get("name") == "task(t7)" for event in events)
     assert {event["name"] for event in events if event.get("cat") == "aicore_scheduler"} == {
         "PendingWait(t7)",
-        "Kernel(t7)",
+        "Kernel: task(t7)",
         "Drain(worker)",
     }
 
@@ -318,9 +325,15 @@ def test_level_one_scheduler_tasks_join_dependency_graph_and_kernel_names(tmp_pa
     )
 
     events = json.loads(output_path.read_text())["traceEvents"]
-    assert any(event.get("name") == "producer(t1)" for event in events)
-    assert any(event.get("name") == "consumer(t2)" for event in events)
+    assert any(event.get("name") == "Kernel: producer(t1)" for event in events)
+    assert any(event.get("name") == "Kernel: consumer(t2)" for event in events)
     assert _count_dependency_flow_starts(output_path, pid=4) == 1
+    worker_flow = _first_worker_dependency_flow(output_path)
+    assert [event["tid"] for event in worker_flow] == [_core_tid(0) + 2, _core_tid(1) + 2]
+    assert not any(
+        event.get("ph") == "M" and event.get("pid") == 4 and event.get("args", {}).get("name") in {"AIC_0", "AIV_1"}
+        for event in events
+    )
 
 
 def test_load_func_names_auto_discovery_and_explicit_precedence(tmp_path):
