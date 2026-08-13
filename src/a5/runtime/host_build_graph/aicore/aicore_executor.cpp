@@ -344,7 +344,6 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                 }
                 execute_task(dispatch_payload);
                 uint64_t kernel_end = get_sys_cnt_aicore();
-                aicore_publish_data_cache_v0(dispatch_payload);
                 uint64_t completion_start = get_sys_cnt_aicore();
                 bool enqueue_ok = aicore_enqueue_completion_v1(
                     graph, sidecar_base, worker_context, run_control, task_pending.task_id, &stats.completion,

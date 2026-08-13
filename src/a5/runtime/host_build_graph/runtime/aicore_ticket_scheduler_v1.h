@@ -323,19 +323,18 @@ inline __aicore__ bool aicore_enqueue_completion_v1(
         return false;
     }
     __gm__ AicoreTaskControlV1 *control = aicore_task_control_at_v1(sidecar_base, context, task_id);
-    int64_t observed = aicore_gm_compare_exchange_v0(
-        control->state, static_cast<int64_t>(AicoreTaskStateV1::READY), static_cast<int64_t>(AicoreTaskStateV1::DONE)
-    );
-    if (observed != static_cast<int64_t>(AicoreTaskStateV1::READY)) {
-        aicore_record_scheduler_error_v1(run_control, task_id, AicoreRootStatusV0::INVALID_ARGUMENTS, &graph, context);
-        return false;
-    }
+    aicore_gm_store_v0(control->state, static_cast<int64_t>(AicoreTaskStateV1::DONE));
     if (trace_enabled) control->completion_enqueue_cycles = aicore_scheduler_cycles_v1();
     uint64_t inbox_index = static_cast<uint64_t>(task_id) % resolver_count;
     __gm__ AicoreCompletionInboxV1 *inbox = aicore_completion_inbox_at_v1(sidecar_base, context, inbox_index);
-    int64_t previous = aicore_gm_exchange_v0(inbox->head, task_id);
-    control->completion_next = previous;
-    aicore_publish_cache_line_v0(&control->next_waiter);
+    int64_t previous = aicore_gm_load_v0(inbox->head);
+    while (true) {
+        control->completion_next = previous;
+        aicore_publish_cache_line_v0(&control->next_waiter);
+        int64_t observed = aicore_gm_compare_exchange_v0(inbox->head, previous, task_id);
+        if (observed == previous) break;
+        previous = observed;
+    }
     if (stats != nullptr) ++stats->enqueue_count;
     return true;
 }

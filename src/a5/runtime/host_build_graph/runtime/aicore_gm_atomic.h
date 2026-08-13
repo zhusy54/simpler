@@ -35,16 +35,6 @@ inline __aicore__ void aicore_observe_cache_line_v0(__gm__ void *address) {
 #endif
 }
 
-inline __aicore__ void aicore_publish_data_cache_v0(__gm__ void *address) {
-#if defined(__CCE_AICORE__)
-    dcci(address, ENTIRE_DATA_CACHE, CACHELINE_OUT);
-    dsb((mem_dsb_t)0);
-#else
-    (void)address;
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
-#endif
-}
-
 inline __aicore__ void aicore_observe_data_cache_v0(__gm__ void *address) {
 #if defined(__CCE_AICORE__)
     dcci(address, ENTIRE_DATA_CACHE);

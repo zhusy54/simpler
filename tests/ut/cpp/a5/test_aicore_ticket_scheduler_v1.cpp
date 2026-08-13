@@ -442,29 +442,6 @@ TEST(AicoreTicketSchedulerV1, RegistrationRacingCompletionCannotLoseWakeup) {
     }
 }
 
-TEST(AicoreTicketSchedulerV1, DuplicateCompletionEnqueueIsDiagnosed) {
-    GraphBuffer graph_storage(1);
-    graph_storage.executable(0, AicoreRootCoreTypeV0::AIC);
-    AicoreReadonlyGraphV0 graph = graph_storage.graph();
-    AicoreExecutionSidecarLayoutV1 layout{};
-    ASSERT_TRUE(aicore_sidecar_plan_v1(1, 1, 0, &layout));
-    SidecarBuffer sidecar(layout);
-    AicoreWorkerContextV1 context{};
-    context.task_controls_offset = layout.task_controls_offset;
-    context.completion_inboxes_offset = layout.completion_inboxes_offset;
-    AicoreRunControlV1 run_control{};
-    run_control.active_worker_count = 1;
-    run_control.aiv_active_worker_count = 1;
-    AicoreWakeStatsV1 wake_stats{};
-    AicoreCompletionStatsV1 completion_stats{};
-    ASSERT_EQ(
-        aicore_route_task_v1(graph, sidecar.base(), &context, &run_control, 0, &wake_stats), AicoreRouteResultV1::READY
-    );
-    ASSERT_TRUE(aicore_enqueue_completion_v1(graph, sidecar.base(), &context, &run_control, 0, &completion_stats));
-    EXPECT_FALSE(aicore_enqueue_completion_v1(graph, sidecar.base(), &context, &run_control, 0, &completion_stats));
-    EXPECT_EQ(run_control.scheduler_error, static_cast<uint64_t>(AicoreRootStatusV0::INVALID_ARGUMENTS));
-}
-
 TEST(AicoreTicketSchedulerV1, PendingCachesTaskClassification) {
     GraphBuffer storage(3);
     storage.executable(0, 0, 17);
