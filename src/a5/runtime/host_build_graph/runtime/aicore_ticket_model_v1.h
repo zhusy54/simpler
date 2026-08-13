@@ -25,7 +25,10 @@ public:
     ) :
         fanins_(std::move(fanins)),
         bottom_level_(std::move(bottom_level)),
-        completed_(fanins_.size(), false),
+        state_(fanins_.size(), TaskState::BLOCKED),
+        next_fanin_(fanins_.size(), 0),
+        wake_lists_(fanins_.size()),
+        wake_closed_(fanins_.size(), false),
         execution_count_(fanins_.size(), 0),
         pending_slots_(pending_slots) {
         valid_ = pending_slots_ != 0 && bottom_level_.size() == fanins_.size();
@@ -40,7 +43,8 @@ public:
             valid_ = false;
             return;
         }
-        completed_[task_id] = true;
+        state_[task_id] = TaskState::DONE;
+        wake_closed_[task_id] = true;
     }
 
     bool run() {
@@ -62,18 +66,24 @@ public:
                 return false;
             }
         }
-        return std::all_of(completed_.begin(), completed_.end(), [](bool value) {
-            return value;
+        return std::all_of(state_.begin(), state_.end(), [](TaskState state) {
+            return state == TaskState::DONE;
         });
     }
 
     bool valid() const { return valid_; }
     const std::vector<int> &execution_count() const { return execution_count_; }
+    size_t wake_register_count() const { return wake_register_count_; }
+    size_t wake_migrate_count() const { return wake_migrate_count_; }
 
 private:
+    enum class TaskState {
+        BLOCKED,
+        READY,
+        DONE,
+    };
     struct Pending {
         int64_t task_id{-1};
-        size_t next_fanin{0};
     };
     struct Stream {
         std::vector<int64_t> tasks;
@@ -140,26 +150,44 @@ private:
     }
 
     void seed_workers() {
-        for (Worker &worker : workers_)
+        for (Worker &worker : workers_) {
             worker.pending[0].task_id = worker.stream->tasks[worker.rank];
+            route(worker.pending[0].task_id);
+        }
     }
 
-    bool ready(Pending &pending) {
-        while (pending.next_fanin < fanins_[pending.task_id].size()) {
-            int64_t producer = fanins_[pending.task_id][pending.next_fanin];
-            if (!completed_[producer]) return false;
-            ++pending.next_fanin;
+    void route(int64_t task_id) {
+        while (next_fanin_[task_id] < fanins_[task_id].size()) {
+            int64_t producer = fanins_[task_id][next_fanin_[task_id]];
+            if (state_[producer] == TaskState::DONE) {
+                ++next_fanin_[task_id];
+                continue;
+            }
+            if (wake_closed_[producer]) continue;
+            wake_lists_[producer].push_back(task_id);
+            ++wake_register_count_;
+            return;
         }
-        return true;
+        state_[task_id] = TaskState::READY;
+    }
+
+    void complete(int64_t task_id) {
+        state_[task_id] = TaskState::DONE;
+        wake_closed_[task_id] = true;
+        std::vector<int64_t> waiters = std::move(wake_lists_[task_id]);
+        for (int64_t waiter : waiters) {
+            ++wake_migrate_count_;
+            route(waiter);
+        }
     }
 
     bool advance(Worker &worker) {
         for (size_t offset = 0; offset < worker.pending.size(); ++offset) {
             size_t slot = (worker.scan_start + offset) % worker.pending.size();
             Pending &pending = worker.pending[slot];
-            if (pending.task_id >= 0 && ready(pending)) {
+            if (pending.task_id >= 0 && state_[pending.task_id] == TaskState::READY) {
                 ++execution_count_[pending.task_id];
-                completed_[pending.task_id] = true;
+                complete(pending.task_id);
                 pending = {};
                 worker.scan_start = (slot + 1) % worker.pending.size();
                 return true;
@@ -172,6 +200,7 @@ private:
             size_t index = worker.stream->cursor++;
             if (index < worker.stream->tasks.size()) {
                 free->task_id = worker.stream->tasks[index];
+                route(free->task_id);
                 return true;
             }
             worker.exhausted = true;
@@ -188,11 +217,16 @@ private:
 
     std::vector<std::vector<int64_t>> fanins_;
     std::vector<uint32_t> bottom_level_;
-    std::vector<bool> completed_;
+    std::vector<TaskState> state_;
+    std::vector<size_t> next_fanin_;
+    std::vector<std::vector<int64_t>> wake_lists_;
+    std::vector<bool> wake_closed_;
     std::vector<bool> stream_task_;
     std::vector<int> execution_count_;
     std::vector<Stream> streams_;
     std::vector<Worker> workers_;
     size_t pending_slots_{2};
+    size_t wake_register_count_{0};
+    size_t wake_migrate_count_{0};
     bool valid_{true};
 };

@@ -37,7 +37,8 @@ metadata and `aicore_tasks`, HBG appends:
 ```
 
 Supported phase names are `SeedClaim`, `TicketClaim`, `PendingWait`,
-`Payload`, `Kernel`, `CompletionPublish`, and `Drain`. The swimlane converter
+`Payload`, `Kernel`, `CompletionEnqueue`, `CompletionBatchClaim`,
+`WakeResolve`, `ReadyPublish`, and `Drain`. The swimlane converter
 renders them on per-worker `Scheduler` lanes. Task classification is cached
 during claim initialization and is not repeated in `Payload`; callable lookup
 and argument materialization remain in `Payload`. `aicpu_tasks` is empty
@@ -47,6 +48,12 @@ The common AICore profiling buffer retains one kernel anchor per worker. The
 sidecar trace cell is indexed by task ID and therefore captures every executed
 task without contending for a shared append cursor. Tracing is conditional on
 level 1; normal execution does not write trace cells.
+
+Worker statistics are published only at resolver drain. They include completion
+enqueue, batch, resolve and steal counts; unpublished-link wait total/max;
+enqueue-to-resolve lag total/max; READY-to-kernel lag total/max; and the
+existing wake registration/migration counters. With profiling disabled, the
+per-task timing fields are not written.
 
 ## Publication guarantees
 

@@ -486,9 +486,11 @@ void release_aicore_sidecar(Runtime *runtime, const HostApi *api) {
 }
 
 bool append_aicore_scheduler_trace(
-    const Runtime *runtime, const AicoreTaskTraceCellV1 *traces, const AicoreWorkerContextV1 *contexts
+    const Runtime *runtime, const AicoreTaskTraceCellV1 *traces, const AicoreTaskControlV1 *task_controls,
+    const AicoreWorkerContextV1 *contexts
 ) {
-    if (runtime == nullptr || traces == nullptr || contexts == nullptr || !runtime->aicore_scheduler_trace_enabled()) {
+    if (runtime == nullptr || traces == nullptr || task_controls == nullptr || contexts == nullptr ||
+        !runtime->aicore_scheduler_trace_enabled()) {
         return true;
     }
     const std::filesystem::path path =
@@ -537,8 +539,26 @@ bool append_aicore_scheduler_trace(
             trace.kernel_end_cycles
         );
         emit(
-            trace.worker_id, trace.core_type, trace.task_id, "CompletionPublish", trace.kernel_end_cycles,
+            trace.worker_id, trace.core_type, trace.task_id, "CompletionEnqueue", trace.kernel_end_cycles,
             trace.completion_end_cycles
+        );
+        const AicoreTaskControlV1 &control = task_controls[task_id];
+        if (control.completion_resolve_start_cycles != 0 && control.resolver_worker_id <
+                                                               static_cast<uint64_t>(runtime->worker_count)) {
+            const AicoreWorkerContextV1 &resolver = contexts[control.resolver_worker_id];
+            emit(
+                control.resolver_worker_id, static_cast<uint64_t>(resolver.core_type), trace.task_id,
+                "CompletionBatchClaim", control.completion_resolve_start_cycles,
+                control.completion_resolve_start_cycles
+            );
+            emit(
+                control.resolver_worker_id, static_cast<uint64_t>(resolver.core_type), trace.task_id, "WakeResolve",
+                control.completion_resolve_start_cycles, control.completion_resolve_end_cycles
+            );
+        }
+        emit(
+            trace.worker_id, trace.core_type, trace.task_id, "ReadyPublish", control.ready_publish_cycles,
+            control.ready_publish_cycles
         );
     }
     for (int32_t worker = 0; worker < runtime->worker_count; ++worker) {
@@ -674,10 +694,10 @@ bool create_aicore_sidecar_v1(
         return false;
     }
 
-    auto *completion_cells =
-        aicore_sidecar_at_v1<AicoreTaskCompletionCellV1>(host_base, layout.completion_cells_offset);
+    auto *task_controls = aicore_sidecar_at_v1<AicoreTaskControlV1>(host_base, layout.task_controls_offset);
     for (int64_t task_id : inline_completed_task_ids) {
-        completion_cells[task_id].completion = static_cast<int64_t>(AicoreTaskCompletionV1::DONE);
+        task_controls[task_id].state = static_cast<int64_t>(AicoreTaskStateV1::DONE);
+        task_controls[task_id].wake_list_head = AICORE_WAKE_LIST_CLOSED_V1;
     }
     auto *aic_ids = aicore_sidecar_at_v1<uint32_t>(host_base, layout.aic_task_ids_offset);
     std::copy(streams.aic.begin(), streams.aic.end(), aic_ids);
@@ -704,7 +724,8 @@ bool create_aicore_sidecar_v1(
         context.type_rank = context.core_type == static_cast<int32_t>(CoreType::AIC) ? aic_rank++ : aiv_rank++;
         context.active = 0;
         context.run_control_offset = layout.run_control_offset;
-        context.completion_cells_offset = layout.completion_cells_offset;
+        context.task_controls_offset = layout.task_controls_offset;
+        context.completion_inboxes_offset = layout.completion_inboxes_offset;
         context.aic_stream_offset = layout.aic_stream_offset;
         context.aiv_stream_offset = layout.aiv_stream_offset;
         context.graph_descriptors_address = device_sm_address + device_segments.descriptors;
@@ -1269,8 +1290,11 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
             const auto *contexts = aicore_sidecar_at_v1<AicoreWorkerContextV1>(
                 host_sidecar, runtime->aicore_sidecar_layout.worker_contexts_offset
             );
-            const auto *completion = aicore_sidecar_at_v1<AicoreTaskCompletionCellV1>(
-                host_sidecar, runtime->aicore_sidecar_layout.completion_cells_offset
+            const auto *task_controls = aicore_sidecar_at_v1<AicoreTaskControlV1>(
+                host_sidecar, runtime->aicore_sidecar_layout.task_controls_offset
+            );
+            const auto *completion_inboxes = aicore_sidecar_at_v1<AicoreCompletionInboxV1>(
+                host_sidecar, runtime->aicore_sidecar_layout.completion_inboxes_offset
             );
             const auto *traces = aicore_sidecar_at_v1<AicoreTaskTraceCellV1>(
                 host_sidecar, runtime->aicore_sidecar_layout.trace_cells_offset
@@ -1280,9 +1304,23 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
             uint64_t seeded = 0;
             uint64_t ticket_claims = 0;
             uint64_t ticket_exhaustions = 0;
-            uint64_t pending_scans = 0;
+            uint64_t state_polls = 0;
             uint64_t fanin_loads = 0;
-            uint64_t fanin_waits = 0;
+            uint64_t wake_registers = 0;
+            uint64_t wake_cas_retries = 0;
+            uint64_t wake_closed_retries = 0;
+            uint64_t wake_migrations = 0;
+            uint64_t wake_closes = 0;
+            uint64_t completion_enqueues = 0;
+            uint64_t completion_batches = 0;
+            uint64_t completion_resolves = 0;
+            uint64_t completion_steals = 0;
+            uint64_t completion_link_waits = 0;
+            uint64_t completion_link_wait_max = 0;
+            uint64_t completion_lag_cycles = 0;
+            uint64_t completion_lag_max_cycles = 0;
+            uint64_t ready_to_kernel_cycles = 0;
+            uint64_t ready_to_kernel_max_cycles = 0;
             uint64_t idle_iterations = 0;
             uint64_t backoff_cycles = 0;
             uint64_t claim_cycles = 0;
@@ -1298,25 +1336,53 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
                 seeded += contexts[i].seeded_task_count;
                 ticket_claims += contexts[i].ticket_claim_count;
                 ticket_exhaustions += contexts[i].ticket_exhaustion_count;
-                pending_scans += contexts[i].pending_scan_count;
-                fanin_loads += contexts[i].fanin_flag_load_count;
-                fanin_waits += contexts[i].fanin_wait_count;
+                state_polls += contexts[i].task_state_poll_count;
+                fanin_loads += contexts[i].fanin_state_load_count;
+                wake_registers += contexts[i].wake_register_count;
+                wake_cas_retries += contexts[i].wake_cas_retry_count;
+                wake_closed_retries += contexts[i].wake_closed_retry_count;
+                wake_migrations += contexts[i].wake_migrate_count;
+                wake_closes += contexts[i].wake_close_count;
+                completion_enqueues += contexts[i].completion_enqueue_count;
+                completion_batches += contexts[i].completion_batch_count;
+                completion_resolves += contexts[i].completion_resolve_count;
+                completion_steals += contexts[i].completion_steal_count;
+                completion_link_waits += contexts[i].completion_link_wait_count;
+                completion_link_wait_max = std::max(completion_link_wait_max, contexts[i].completion_link_wait_max);
+                completion_lag_cycles += contexts[i].completion_lag_cycles;
+                completion_lag_max_cycles =
+                    std::max(completion_lag_max_cycles, contexts[i].completion_lag_max_cycles);
+                ready_to_kernel_cycles += contexts[i].ready_to_kernel_cycles;
+                ready_to_kernel_max_cycles =
+                    std::max(ready_to_kernel_max_cycles, contexts[i].ready_to_kernel_max_cycles);
                 idle_iterations += contexts[i].idle_iteration_count;
                 backoff_cycles += contexts[i].backoff_cycles;
                 claim_cycles += contexts[i].claim_cycles;
                 dependency_wait_cycles += contexts[i].dependency_wait_cycles;
                 payload_cycles += contexts[i].payload_cycles;
                 kernel_cycles += contexts[i].kernel_cycles;
-                completion_cycles += contexts[i].completion_publish_cycles;
+                completion_cycles += contexts[i].completion_enqueue_cycles;
             }
-            bool completion_valid = true;
-            for (int32_t task_id = 0; task_id < runtime->host_total_tasks; ++task_id) {
-                if (completion[task_id].completion != static_cast<int64_t>(AicoreTaskCompletionV1::DONE)) {
+            bool completion_inboxes_empty = true;
+            for (uint64_t inbox = 0; inbox < control->active_worker_count; ++inbox) {
+                if (completion_inboxes[inbox].head != AICORE_COMPLETION_INBOX_EMPTY_V1) {
                     LOG_ERROR(
-                        "A5 HBG AICore scheduler: incomplete task id=%d completion=%" PRId64, task_id,
-                        completion[task_id].completion
+                        "A5 HBG AICore scheduler: completion inbox=%" PRIu64 " not empty head=%" PRId64,
+                        inbox, completion_inboxes[inbox].head
                     );
-                    completion_valid = false;
+                    completion_inboxes_empty = false;
+                    break;
+                }
+            }
+            bool task_controls_valid = true;
+            for (int32_t task_id = 0; task_id < runtime->host_total_tasks; ++task_id) {
+                if (task_controls[task_id].state != static_cast<int64_t>(AicoreTaskStateV1::DONE) ||
+                    task_controls[task_id].wake_list_head != AICORE_WAKE_LIST_CLOSED_V1) {
+                    LOG_ERROR(
+                        "A5 HBG AICore scheduler: invalid task control id=%d state=%" PRId64 " wake_head=%" PRId64,
+                        task_id, task_controls[task_id].state, task_controls[task_id].wake_list_head
+                    );
+                    task_controls_valid = false;
                     break;
                 }
             }
@@ -1331,17 +1397,25 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
                 worker_executed != executable_task_count || control->executed_task_count != executable_task_count ||
                 worker_executed + control->inline_completed_count != control->expected_task_count ||
                 active_workers != control->active_worker_count ||
+                control->executor_drained_worker_count != control->active_worker_count ||
                 control->drained_worker_count != control->active_worker_count ||
+                control->resolved_task_count != executable_task_count ||
                 control->finished_count != static_cast<uint64_t>(runtime->worker_count) ||
+                wake_closes != executable_task_count || wake_registers != wake_migrations ||
+                completion_enqueues != executable_task_count || completion_resolves != executable_task_count ||
                 aic_stream->next_index < aic_stream->task_count || aiv_stream->next_index < aiv_stream->task_count ||
-                !completion_valid) {
+                !task_controls_valid || !completion_inboxes_empty) {
                 LOG_ERROR(
                     "A5 HBG AICore scheduler: invalid final state expected=%" PRIu64 " executed=%" PRIu64
                     " executable=%" PRIu64 " inline=%" PRIu64 " active=%" PRIu64 " drained=%" PRIu64
-                    " finished=%" PRIu64 " error=%" PRIu64,
+                    " executor_drained=%" PRIu64 " finished=%" PRIu64 " resolved=%" PRIu64
+                    " wake_registers=%" PRIu64 " wake_migrations=%" PRIu64 " wake_closes=%" PRIu64
+                    " enqueues=%" PRIu64 " resolver_tasks=%" PRIu64 " error=%" PRIu64,
                     control->expected_task_count, worker_executed, executable_task_count,
                     control->inline_completed_count, active_workers, control->drained_worker_count,
-                    control->finished_count, control->scheduler_error
+                    control->executor_drained_worker_count, control->finished_count, control->resolved_task_count,
+                    wake_registers, wake_migrations, wake_closes, completion_enqueues, completion_resolves,
+                    control->scheduler_error
                 );
                 if (control->scheduler_error != 0) {
                     LOG_ERROR(
@@ -1363,12 +1437,22 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
                 );
                 LOG_INFO(
                     "A5 HBG AICore scheduler COUNTERS: seeded=%" PRIu64 " ticket_claims=%" PRIu64
-                    " exhaustions=%" PRIu64 " pending_scans=%" PRIu64 " fanin_loads=%" PRIu64 " fanin_waits=%" PRIu64
+                    " exhaustions=%" PRIu64 " state_polls=%" PRIu64 " fanin_loads=%" PRIu64
+                    " wake_registers=%" PRIu64 " wake_cas_retries=%" PRIu64 " wake_closed_retries=%" PRIu64
+                    " wake_migrations=%" PRIu64 " wake_closes=%" PRIu64 " completion_enqueues=%" PRIu64
+                    " completion_batches=%" PRIu64 " completion_resolves=%" PRIu64 " completion_steals=%" PRIu64
+                    " completion_link_waits=%" PRIu64 " completion_link_wait_max=%" PRIu64
+                    " completion_lag_cycles=%" PRIu64 " completion_lag_max=%" PRIu64
+                    " ready_to_kernel_cycles=%" PRIu64 " ready_to_kernel_max=%" PRIu64
                     " idle_iterations=%" PRIu64,
-                    seeded, ticket_claims, ticket_exhaustions, pending_scans, fanin_loads, fanin_waits, idle_iterations
+                    seeded, ticket_claims, ticket_exhaustions, state_polls, fanin_loads, wake_registers,
+                    wake_cas_retries, wake_closed_retries, wake_migrations, wake_closes, completion_enqueues,
+                    completion_batches, completion_resolves, completion_steals, completion_link_waits,
+                    completion_link_wait_max, completion_lag_cycles, completion_lag_max_cycles,
+                    ready_to_kernel_cycles, ready_to_kernel_max_cycles, idle_iterations
                 );
             }
-            if (!append_aicore_scheduler_trace(runtime, traces, contexts)) rc = -1;
+            if (!append_aicore_scheduler_trace(runtime, traces, task_controls, contexts)) rc = -1;
         }
     }
 

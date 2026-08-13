@@ -216,10 +216,12 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         const int32_t active_aiv = static_cast<int32_t>(
             std::min<uint64_t>(static_cast<uint64_t>(aiv_count), runtime->aicore_sidecar_layout.aiv_task_count)
         );
+        uint64_t inbox_index = 0;
         for (int32_t i = 0; i < runtime->worker_count; ++i) {
             const int32_t active_count =
                 static_cast<CoreType>(contexts[i].core_type) == CoreType::AIC ? active_aic : active_aiv;
             contexts[i].active = contexts[i].type_rank < active_count ? 1 : 0;
+            if (contexts[i].active != 0) contexts[i].inbox_index = inbox_index++;
         }
         auto *aic_stream = aicore_sidecar_at_v1<AicoreTaskStreamV1>(
             runtime->aicore_sidecar_base, runtime->aicore_sidecar_layout.aic_stream_offset

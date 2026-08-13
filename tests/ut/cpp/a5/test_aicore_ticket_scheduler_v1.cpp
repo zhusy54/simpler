@@ -132,29 +132,35 @@ void sort_by_priority(std::vector<int64_t> *tasks, const std::vector<uint32_t> &
     });
 }
 
-TEST(AicoreSidecarV1, PlansOnlyTypedStreamsCompletionCellsAndTrace) {
+TEST(AicoreSidecarV1, PlansOnlyTypedStreamsTaskControlsAndTrace) {
     AicoreExecutionSidecarLayoutV1 layout{};
     ASSERT_TRUE(aicore_sidecar_plan_v1(5, 3, 2, &layout));
     EXPECT_EQ(layout.task_count, 5u);
     EXPECT_EQ(layout.aic_task_count, 3u);
     EXPECT_EQ(layout.aiv_task_count, 2u);
     EXPECT_EQ(layout.total_size % AICORE_SIDECAR_ALIGNMENT_V1, 0u);
-    EXPECT_EQ(layout.completion_cells_offset % alignof(AicoreTaskCompletionCellV1), 0u);
+    EXPECT_EQ(layout.task_controls_offset % alignof(AicoreTaskControlV1), 0u);
+    EXPECT_EQ(layout.completion_inboxes_offset % alignof(AicoreCompletionInboxV1), 0u);
     EXPECT_EQ(layout.aic_stream_offset % alignof(AicoreTaskStreamV1), 0u);
     EXPECT_EQ(layout.aiv_stream_offset % alignof(AicoreTaskStreamV1), 0u);
     EXPECT_EQ(layout.trace_cells_offset % alignof(AicoreTaskTraceCellV1), 0u);
 
     SidecarBuffer storage(layout);
-    auto *completion = aicore_sidecar_at_v1<AicoreTaskCompletionCellV1>(storage.base(), layout.completion_cells_offset);
+    auto *controls = aicore_sidecar_at_v1<AicoreTaskControlV1>(storage.base(), layout.task_controls_offset);
     for (uint64_t task = 0; task < layout.task_count; ++task) {
-        EXPECT_EQ(completion[task].completion, static_cast<int64_t>(AicoreTaskCompletionV1::NOT_DONE));
+        EXPECT_EQ(controls[task].state, static_cast<int64_t>(AicoreTaskStateV1::BLOCKED));
+        EXPECT_EQ(controls[task].wake_list_head, AICORE_WAKE_LIST_OPEN_V1);
         if (task != 0) {
             EXPECT_EQ(
-                reinterpret_cast<uintptr_t>(&completion[task]) - reinterpret_cast<uintptr_t>(&completion[task - 1]),
+                reinterpret_cast<uintptr_t>(&controls[task]) - reinterpret_cast<uintptr_t>(&controls[task - 1]),
                 128u
             );
         }
     }
+    auto *inboxes =
+        aicore_sidecar_at_v1<AicoreCompletionInboxV1>(storage.base(), layout.completion_inboxes_offset);
+    for (uint64_t inbox = 0; inbox < AICORE_WORKER_CAPACITY_V1; ++inbox)
+        EXPECT_EQ(inboxes[inbox].head, AICORE_COMPLETION_INBOX_EMPTY_V1);
 }
 
 TEST(AicoreSidecarV1, RejectsInvalidCountsAndOverflow) {
@@ -212,7 +218,7 @@ TEST(AicoreTicketSchedulerV1, TicketClaimsAreUniqueAndExhaustOncePerWorker) {
         EXPECT_EQ(count.load(), 1);
 }
 
-TEST(AicoreTicketSchedulerV1, ReadinessRemembersCompletedFaninPrefix) {
+TEST(AicoreTicketSchedulerV1, WakeMigrationRemembersCompletedFaninPrefix) {
     alignas(64) PTO2TaskDescriptor descriptors[3]{};
     alignas(64) PTO2TaskPayload payloads[3]{};
     for (int64_t task = 0; task < 3; ++task) {
@@ -229,33 +235,190 @@ TEST(AicoreTicketSchedulerV1, ReadinessRemembersCompletedFaninPrefix) {
     ASSERT_TRUE(aicore_sidecar_plan_v1(3, 3, 0, &layout));
     SidecarBuffer storage(layout);
     AicoreWorkerContextV1 context{};
-    context.completion_cells_offset = layout.completion_cells_offset;
-    auto *completion = aicore_sidecar_at_v1<AicoreTaskCompletionCellV1>(storage.base(), layout.completion_cells_offset);
-    completion[0].completion = static_cast<int64_t>(AicoreTaskCompletionV1::DONE);
-    AicorePendingSlotV1 pending{};
-    ASSERT_EQ(
-        aicore_pending_initialize_v1(
-            graph, 2, AicoreRootCoreTypeV0::AIC, 1024, 2, AicoreClaimKindV1::TICKET, 10, 11, &pending
-        ),
-        AicoreRootStatusV0::OK
+    context.task_controls_offset = layout.task_controls_offset;
+    AicoreRunControlV1 run_control{};
+    AicoreWakeStatsV1 stats{};
+    auto *controls = aicore_sidecar_at_v1<AicoreTaskControlV1>(storage.base(), layout.task_controls_offset);
+    EXPECT_EQ(
+        aicore_route_task_v1(graph, storage.base(), &context, &run_control, 2, &stats),
+        AicoreRouteResultV1::WAITING
     );
+    EXPECT_EQ(controls[0].wake_list_head, 2);
+    ASSERT_TRUE(aicore_complete_and_wake_v1(graph, storage.base(), &context, &run_control, 0, &stats));
+    EXPECT_EQ(controls[2].state, static_cast<int64_t>(AicoreTaskStateV1::BLOCKED));
+    EXPECT_EQ(controls[2].next_fanin_index, 1);
+    EXPECT_EQ(controls[2].waiting_producer, 1);
+    EXPECT_EQ(controls[1].wake_list_head, 2);
+    ASSERT_TRUE(aicore_complete_and_wake_v1(graph, storage.base(), &context, &run_control, 1, &stats));
+    EXPECT_EQ(controls[2].state, static_cast<int64_t>(AicoreTaskStateV1::READY));
+    EXPECT_EQ(controls[2].next_fanin_index, 2);
+    EXPECT_EQ(stats.wake_register_count, 2u);
+    EXPECT_EQ(stats.wake_migrate_count, 2u);
+}
 
-    uint64_t loads = 0;
-    EXPECT_EQ(
-        aicore_pending_readiness_v1(graph, storage.base(), &context, &pending, &loads), AicorePendingStateV1::BLOCKED
+TEST(AicoreTicketSchedulerV1, CompletionInboxBatchesAndStealsWithoutLoss) {
+    constexpr int64_t kTaskCount = 16;
+    GraphBuffer graph_storage(kTaskCount);
+    for (int64_t task = 0; task < kTaskCount; ++task)
+        graph_storage.executable(static_cast<size_t>(task), AicoreRootCoreTypeV0::AIC);
+    AicoreReadonlyGraphV0 graph = graph_storage.graph();
+    AicoreExecutionSidecarLayoutV1 layout{};
+    ASSERT_TRUE(aicore_sidecar_plan_v1(kTaskCount, kTaskCount, 0, &layout));
+    SidecarBuffer sidecar(layout);
+    AicoreWorkerContextV1 context{};
+    context.task_controls_offset = layout.task_controls_offset;
+    context.completion_inboxes_offset = layout.completion_inboxes_offset;
+    context.inbox_index = 0;
+    AicoreRunControlV1 run_control{};
+    run_control.active_worker_count = 2;
+    AicoreWakeStatsV1 wake_stats{};
+    AicoreCompletionStatsV1 completion_stats{};
+    for (int64_t task = 0; task < kTaskCount; ++task) {
+        ASSERT_EQ(
+            aicore_route_task_v1(graph, sidecar.base(), &context, &run_control, task, &wake_stats),
+            AicoreRouteResultV1::READY
+        );
+        ASSERT_TRUE(aicore_enqueue_completion_v1(
+            graph, sidecar.base(), &context, &run_control, task, &completion_stats
+        ));
+    }
+
+    uint64_t victim_cursor = 1;
+    while (run_control.resolved_task_count != static_cast<uint64_t>(kTaskCount)) {
+        bool progress = false;
+        ASSERT_TRUE(aicore_service_completion_inboxes_v1(
+            graph, sidecar.base(), &context, &run_control, &victim_cursor, &wake_stats, &completion_stats, &progress
+        ));
+        ASSERT_TRUE(progress);
+    }
+    EXPECT_EQ(completion_stats.enqueue_count, static_cast<uint64_t>(kTaskCount));
+    EXPECT_EQ(completion_stats.resolve_count, static_cast<uint64_t>(kTaskCount));
+    EXPECT_EQ(completion_stats.batch_count, 2u);
+    EXPECT_EQ(completion_stats.steal_count, 1u);
+    EXPECT_EQ(wake_stats.wake_close_count, static_cast<uint64_t>(kTaskCount));
+    auto *controls = aicore_sidecar_at_v1<AicoreTaskControlV1>(sidecar.base(), layout.task_controls_offset);
+    for (int64_t task = 0; task < kTaskCount; ++task) {
+        EXPECT_EQ(controls[task].state, static_cast<int64_t>(AicoreTaskStateV1::DONE));
+        EXPECT_EQ(controls[task].wake_list_head, AICORE_WAKE_LIST_CLOSED_V1);
+    }
+}
+
+TEST(AicoreTicketSchedulerV1, ConcurrentExecutorsPushOneInboxExactlyOnce) {
+    constexpr int64_t kTaskCount = 64;
+    constexpr int64_t kThreadCount = 8;
+    GraphBuffer graph_storage(kTaskCount);
+    for (int64_t task = 0; task < kTaskCount; ++task)
+        graph_storage.executable(static_cast<size_t>(task), AicoreRootCoreTypeV0::AIC);
+    AicoreReadonlyGraphV0 graph = graph_storage.graph();
+    AicoreExecutionSidecarLayoutV1 layout{};
+    ASSERT_TRUE(aicore_sidecar_plan_v1(kTaskCount, kTaskCount, 0, &layout));
+    SidecarBuffer sidecar(layout);
+    AicoreRunControlV1 run_control{};
+    run_control.active_worker_count = 1;
+    std::vector<AicoreWorkerContextV1> contexts(kThreadCount);
+    std::vector<AicoreWakeStatsV1> wake_stats(kThreadCount);
+    std::vector<AicoreCompletionStatsV1> completion_stats(kThreadCount);
+    for (int64_t thread = 0; thread < kThreadCount; ++thread) {
+        contexts[thread].task_controls_offset = layout.task_controls_offset;
+        contexts[thread].completion_inboxes_offset = layout.completion_inboxes_offset;
+    }
+    std::vector<std::thread> producers;
+    for (int64_t thread = 0; thread < kThreadCount; ++thread) {
+        producers.emplace_back([&, thread] {
+            for (int64_t task = thread; task < kTaskCount; task += kThreadCount) {
+                EXPECT_EQ(
+                    aicore_route_task_v1(
+                        graph, sidecar.base(), &contexts[thread], &run_control, task, &wake_stats[thread]
+                    ),
+                    AicoreRouteResultV1::READY
+                );
+                EXPECT_TRUE(aicore_enqueue_completion_v1(
+                    graph, sidecar.base(), &contexts[thread], &run_control, task, &completion_stats[thread]
+                ));
+            }
+        });
+    }
+    for (std::thread &producer : producers)
+        producer.join();
+
+    uint64_t victim_cursor = 0;
+    bool progress = false;
+    ASSERT_TRUE(aicore_service_completion_inboxes_v1(
+        graph, sidecar.base(), &contexts[0], &run_control, &victim_cursor, &wake_stats[0], &completion_stats[0],
+        &progress
+    ));
+    EXPECT_TRUE(progress);
+    EXPECT_EQ(run_control.resolved_task_count, static_cast<uint64_t>(kTaskCount));
+    auto *controls = aicore_sidecar_at_v1<AicoreTaskControlV1>(sidecar.base(), layout.task_controls_offset);
+    for (int64_t task = 0; task < kTaskCount; ++task) {
+        EXPECT_EQ(controls[task].state, static_cast<int64_t>(AicoreTaskStateV1::DONE));
+        EXPECT_EQ(controls[task].wake_list_head, AICORE_WAKE_LIST_CLOSED_V1);
+    }
+}
+
+TEST(AicoreTicketSchedulerV1, RegistrationRacingCompletionCannotLoseWakeup) {
+    for (int iteration = 0; iteration < 128; ++iteration) {
+        GraphBuffer graph_storage(2);
+        graph_storage.executable(0, AicoreRootCoreTypeV0::AIC);
+        graph_storage.executable(1, AicoreRootCoreTypeV0::AIV, {0});
+        AicoreReadonlyGraphV0 graph = graph_storage.graph();
+        AicoreExecutionSidecarLayoutV1 layout{};
+        ASSERT_TRUE(aicore_sidecar_plan_v1(2, 1, 1, &layout));
+        SidecarBuffer sidecar(layout);
+        AicoreWorkerContextV1 route_context{};
+        AicoreWorkerContextV1 complete_context{};
+        route_context.task_controls_offset = layout.task_controls_offset;
+        complete_context.task_controls_offset = layout.task_controls_offset;
+        AicoreRunControlV1 run_control{};
+        AicoreWakeStatsV1 route_stats{};
+        AicoreWakeStatsV1 complete_stats{};
+        ASSERT_EQ(
+            aicore_route_task_v1(graph, sidecar.base(), &complete_context, &run_control, 0, &complete_stats),
+            AicoreRouteResultV1::READY
+        );
+        std::atomic<bool> start{false};
+        std::thread route([&] {
+            while (!start.load(std::memory_order_acquire)) {}
+            AicoreRouteResultV1 result =
+                aicore_route_task_v1(graph, sidecar.base(), &route_context, &run_control, 1, &route_stats);
+            EXPECT_TRUE(result == AicoreRouteResultV1::WAITING || result == AicoreRouteResultV1::READY);
+        });
+        std::thread complete([&] {
+            while (!start.load(std::memory_order_acquire)) {}
+            EXPECT_TRUE(aicore_complete_and_wake_v1(
+                graph, sidecar.base(), &complete_context, &run_control, 0, &complete_stats
+            ));
+        });
+        start.store(true, std::memory_order_release);
+        route.join();
+        complete.join();
+        auto *controls = aicore_sidecar_at_v1<AicoreTaskControlV1>(sidecar.base(), layout.task_controls_offset);
+        EXPECT_EQ(controls[0].wake_list_head, AICORE_WAKE_LIST_CLOSED_V1);
+        EXPECT_EQ(controls[1].state, static_cast<int64_t>(AicoreTaskStateV1::READY));
+    }
+}
+
+TEST(AicoreTicketSchedulerV1, DuplicateCompletionEnqueueIsDiagnosed) {
+    GraphBuffer graph_storage(1);
+    graph_storage.executable(0, AicoreRootCoreTypeV0::AIC);
+    AicoreReadonlyGraphV0 graph = graph_storage.graph();
+    AicoreExecutionSidecarLayoutV1 layout{};
+    ASSERT_TRUE(aicore_sidecar_plan_v1(1, 1, 0, &layout));
+    SidecarBuffer sidecar(layout);
+    AicoreWorkerContextV1 context{};
+    context.task_controls_offset = layout.task_controls_offset;
+    context.completion_inboxes_offset = layout.completion_inboxes_offset;
+    AicoreRunControlV1 run_control{};
+    run_control.active_worker_count = 1;
+    AicoreWakeStatsV1 wake_stats{};
+    AicoreCompletionStatsV1 completion_stats{};
+    ASSERT_EQ(
+        aicore_route_task_v1(graph, sidecar.base(), &context, &run_control, 0, &wake_stats),
+        AicoreRouteResultV1::READY
     );
-    EXPECT_EQ(pending.next_fanin_index, 1);
-    EXPECT_EQ(pending.waiting_producer, 1);
-    EXPECT_EQ(loads, 2u);
-    EXPECT_EQ(
-        aicore_pending_readiness_v1(graph, storage.base(), &context, &pending, &loads), AicorePendingStateV1::BLOCKED
-    );
-    EXPECT_EQ(loads, 3u);
-    completion[1].completion = static_cast<int64_t>(AicoreTaskCompletionV1::DONE);
-    EXPECT_EQ(
-        aicore_pending_readiness_v1(graph, storage.base(), &context, &pending, &loads), AicorePendingStateV1::READY
-    );
-    EXPECT_EQ(loads, 4u);
+    ASSERT_TRUE(aicore_enqueue_completion_v1(graph, sidecar.base(), &context, &run_control, 0, &completion_stats));
+    EXPECT_FALSE(aicore_enqueue_completion_v1(graph, sidecar.base(), &context, &run_control, 0, &completion_stats));
+    EXPECT_EQ(run_control.scheduler_error, static_cast<uint64_t>(AicoreRootStatusV0::INVALID_ARGUMENTS));
 }
 
 TEST(AicoreTicketSchedulerV1, PendingCachesTaskClassification) {
@@ -450,6 +613,8 @@ TEST(AicoreTicketModelV1, CrossTypeDagCompletesExactlyOnceWithTwoPendingSlots) {
     ASSERT_TRUE(model.valid());
     ASSERT_TRUE(model.run());
     EXPECT_EQ(model.execution_count(), (std::vector<int>{1, 1, 1, 1, 1, 1}));
+    EXPECT_GT(model.wake_register_count(), 0u);
+    EXPECT_EQ(model.wake_register_count(), model.wake_migrate_count());
 }
 
 TEST(AicoreTicketModelV1, InlineCompletedTasksAreNotClaimed) {
