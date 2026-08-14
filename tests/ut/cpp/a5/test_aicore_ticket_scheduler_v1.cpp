@@ -37,6 +37,8 @@ static_assert(sizeof(PTO2TaskPayload) == AICORE_GRAPH_TASK_PAYLOAD_STRIDE_V0);
 static_assert(sizeof(AicorePendingSlotV1) == 64);
 static_assert(sizeof(AicoreTaskControlV1) == 128);
 static_assert(sizeof(AicoreTaskTicketV1) == 16);
+static_assert(alignof(AicoreTaskTicketV1) == 16);
+static_assert(sizeof(AicoreTaskClaimBindingV1) == 64);
 static_assert(offsetof(PTO2TaskDescriptor, kernel_id) == AICORE_GRAPH_KERNEL_IDS_OFFSET_V0);
 static_assert(offsetof(PTO2TaskPayload, fanin_count) == AICORE_GRAPH_FANIN_COUNT_OFFSET_V0);
 static_assert(offsetof(CoreCallable, resolved_addr_) == AICORE_CORE_CALLABLE_RESOLVED_ADDR_OFFSET_V0);
@@ -134,6 +136,38 @@ void sort_by_priority(std::vector<int64_t> *tasks, const std::vector<uint32_t> &
     });
 }
 
+uint64_t fake_callable_address() {
+    alignas(64) static uint8_t callable[256]{};
+    *reinterpret_cast<uint64_t *>(callable + AICORE_CORE_CALLABLE_RESOLVED_ADDR_OFFSET_V0) = UINT64_C(0x12340000);
+    return reinterpret_cast<uint64_t>(callable);
+}
+
+void publish_ready_candidate(
+    const AicoreReadonlyGraphV0 &graph, void *sidecar, AicoreWorkerContextV1 *context,
+    AicoreRunControlV1 *run_control, int64_t task_id, AicoreWakeStatsV1 *stats
+) {
+    ASSERT_EQ(
+        aicore_route_task_v1(graph, sidecar, context, run_control, task_id, stats),
+        AicoreRouteResultV1::READY_TO_PUBLISH
+    );
+    auto *control = aicore_task_control_at_v1(sidecar, context, task_id);
+    aicore_gm_store_v0(control->state, static_cast<int64_t>(AicoreTaskStateV1::READY));
+}
+
+AicoreTaskClaimBindingV1 publish_test_binding(
+    void *sidecar, const AicoreExecutionSidecarLayoutV1 &layout, AicoreWorkerContextV1 *context,
+    AicoreRunControlV1 *run_control, int64_t task_id, uint8_t pending_slot = 0, uint16_t kernel_id = 1,
+    uint8_t subtask_slot = 0
+) {
+    context->dispatch_payload_offset = layout.dispatch_payloads_offset;
+    run_control->claim_bindings_offset = layout.claim_bindings_offset;
+    AicoreTaskClaimBindingV1 binding = aicore_make_claim_binding_v1(
+        context, task_id, kernel_id, subtask_slot, pending_slot, fake_callable_address()
+    );
+    aicore_publish_claim_binding_v1(sidecar, run_control, binding);
+    return binding;
+}
+
 TEST(AicoreSidecarV1, PlansOnlyTypedStreamsTaskControlsAndTrace) {
     AicoreExecutionSidecarLayoutV1 layout{};
     ASSERT_TRUE(aicore_sidecar_plan_v1(5, 3, 2, &layout));
@@ -142,6 +176,7 @@ TEST(AicoreSidecarV1, PlansOnlyTypedStreamsTaskControlsAndTrace) {
     EXPECT_EQ(layout.aiv_task_count, 2u);
     EXPECT_EQ(layout.total_size % AICORE_SIDECAR_ALIGNMENT_V1, 0u);
     EXPECT_EQ(layout.task_controls_offset % alignof(AicoreTaskControlV1), 0u);
+    EXPECT_EQ(layout.claim_bindings_offset % alignof(AicoreTaskClaimBindingV1), 0u);
     EXPECT_EQ(layout.completion_inboxes_offset % alignof(AicoreCompletionInboxV1), 0u);
     EXPECT_EQ(layout.aic_stream_offset % alignof(AicoreTaskStreamV1), 0u);
     EXPECT_EQ(layout.aic_tickets_offset % alignof(AicoreTaskTicketV1), 0u);
@@ -167,6 +202,74 @@ TEST(AicoreSidecarV1, PlansOnlyTypedStreamsTaskControlsAndTrace) {
     auto *aiv_stream = aicore_sidecar_at_v1<AicoreTaskStreamV1>(storage.base(), layout.aiv_stream_offset);
     EXPECT_EQ(aic_stream->tickets_offset, layout.aic_tickets_offset);
     EXPECT_EQ(aiv_stream->tickets_offset, layout.aiv_tickets_offset);
+    auto *bindings =
+        aicore_sidecar_at_v1<AicoreTaskClaimBindingV1>(storage.base(), layout.claim_bindings_offset);
+    for (uint64_t task = 0; task < layout.task_count; ++task)
+        EXPECT_EQ(bindings[task].task_id, AICORE_TASK_ID_INVALID_V1);
+    EXPECT_EQ(
+        layout.claim_bindings_offset - layout.dispatch_payloads_offset,
+        AICORE_WORKER_CAPACITY_V1 * AICORE_PENDING_SLOT_COUNT_V1 * sizeof(PTO2DispatchPayload)
+    );
+}
+
+TEST(AicoreTicketSchedulerV1, RouteDefersReadyPublicationUntilPayloadIsMaterialized) {
+    GraphBuffer graph_storage(1);
+    graph_storage.executable(0, AicoreRootCoreTypeV0::AIC);
+    AicoreReadonlyGraphV0 graph = graph_storage.graph();
+    AicoreExecutionSidecarLayoutV1 layout{};
+    ASSERT_TRUE(aicore_sidecar_plan_v1(1, 1, 0, &layout));
+    SidecarBuffer sidecar(layout);
+    AicoreWorkerContextV1 context{};
+    context.task_controls_offset = layout.task_controls_offset;
+    AicoreRunControlV1 run_control{};
+    AicoreWakeStatsV1 stats{};
+
+    EXPECT_EQ(
+        aicore_route_task_v1(graph, sidecar.base(), &context, &run_control, 0, &stats),
+        AicoreRouteResultV1::READY_TO_PUBLISH
+    );
+    auto *controls = aicore_sidecar_at_v1<AicoreTaskControlV1>(sidecar.base(), layout.task_controls_offset);
+    EXPECT_EQ(controls[0].state, static_cast<int64_t>(AicoreTaskStateV1::BLOCKED));
+}
+
+TEST(AicoreTicketSchedulerV1, ClaimedPendingSlotsMaterializeIndependentPayloads) {
+    GraphBuffer graph_storage(2);
+    graph_storage.executable(0, 0, 1);
+    graph_storage.executable(1, 1, 2);
+    AicoreReadonlyGraphV0 graph = graph_storage.graph();
+    AicoreExecutionSidecarLayoutV1 layout{};
+    ASSERT_TRUE(aicore_sidecar_plan_v1(2, 1, 1, &layout));
+    SidecarBuffer sidecar(layout);
+    AicoreWorkerContextV1 owner{};
+    owner.task_controls_offset = layout.task_controls_offset;
+    owner.dispatch_payload_offset = layout.dispatch_payloads_offset;
+    owner.worker_index = 7;
+    AicoreRunControlV1 run_control{};
+    run_control.claim_bindings_offset = layout.claim_bindings_offset;
+    AicoreWakeStatsV1 stats{};
+
+    AicoreTaskClaimBindingV1 first = aicore_make_claim_binding_v1(&owner, 0, 1, 0, 0, fake_callable_address());
+    AicoreTaskClaimBindingV1 second = aicore_make_claim_binding_v1(&owner, 1, 2, 1, 1, fake_callable_address());
+    aicore_publish_claim_binding_v1(sidecar.base(), &run_control, first);
+    aicore_publish_claim_binding_v1(sidecar.base(), &run_control, second);
+    ASSERT_EQ(
+        aicore_route_task_v1(graph, sidecar.base(), &owner, &run_control, 0, &stats),
+        AicoreRouteResultV1::READY_TO_PUBLISH
+    );
+    ASSERT_EQ(
+        aicore_route_task_v1(graph, sidecar.base(), &owner, &run_control, 1, &stats),
+        AicoreRouteResultV1::READY_TO_PUBLISH
+    );
+    ASSERT_TRUE(aicore_finalize_ready_v1(graph, sidecar.base(), &owner, &run_control, first, false));
+    ASSERT_TRUE(aicore_finalize_ready_v1(graph, sidecar.base(), &owner, &run_control, second, true));
+
+    auto *first_payload = aicore_sidecar_at_v1<PTO2DispatchPayload>(sidecar.base(), first.dispatch_payload_offset);
+    auto *second_payload = aicore_sidecar_at_v1<PTO2DispatchPayload>(sidecar.base(), second.dispatch_payload_offset);
+    EXPECT_NE(first_payload, second_payload);
+    EXPECT_EQ(first_payload->local_context.async_ctx.task_token.raw, 0u);
+    EXPECT_EQ(second_payload->local_context.async_ctx.task_token.raw, 1u);
+    EXPECT_EQ(first_payload->global_context.sub_block_id, 0u);
+    EXPECT_EQ(second_payload->global_context.sub_block_id, 0u);
 }
 
 TEST(AicoreSidecarV1, RejectsInvalidCountsAndOverflow) {
@@ -197,7 +300,7 @@ TEST(AicoreTicketSchedulerV1, TicketClaimsAreUniqueAndExhaustOncePerWorker) {
     auto *stream = aicore_sidecar_at_v1<AicoreTaskStreamV1>(storage.base(), layout.aic_stream_offset);
     auto *tickets = aicore_sidecar_at_v1<AicoreTaskTicketV1>(storage.base(), layout.aic_tickets_offset);
     for (uint64_t task = 0; task < kTaskCount; ++task)
-        tickets[task].task_id = static_cast<uint32_t>(task);
+        tickets[task] = aicore_task_ticket_make_v1(static_cast<uint32_t>(task), 0, 0, 0);
 
     std::vector<std::atomic<int>> seen(kTaskCount);
     std::vector<std::thread> workers;
@@ -211,7 +314,7 @@ TEST(AicoreTicketSchedulerV1, TicketClaimsAreUniqueAndExhaustOncePerWorker) {
                     exhaustion_count.fetch_add(1, std::memory_order_relaxed);
                     break;
                 }
-                seen[ticket.task_id].fetch_add(1, std::memory_order_relaxed);
+                seen[aicore_task_ticket_task_id_v1(ticket)].fetch_add(1, std::memory_order_relaxed);
             }
         });
     }
@@ -245,6 +348,7 @@ TEST(AicoreTicketSchedulerV1, WakeMigrationRemembersCompletedFaninPrefix) {
     AicoreRunControlV1 run_control{};
     AicoreWakeStatsV1 stats{};
     auto *controls = aicore_sidecar_at_v1<AicoreTaskControlV1>(storage.base(), layout.task_controls_offset);
+    publish_test_binding(storage.base(), layout, &context, &run_control, 2);
     EXPECT_EQ(
         aicore_route_task_v1(graph, storage.base(), &context, &run_control, 2, &stats), AicoreRouteResultV1::WAITING
     );
@@ -281,10 +385,7 @@ TEST(AicoreTicketSchedulerV1, CompletionInboxBatchesAndStealsWithoutLoss) {
     AicoreWakeStatsV1 wake_stats{};
     AicoreCompletionStatsV1 completion_stats{};
     for (int64_t task = 0; task < kTaskCount; ++task) {
-        ASSERT_EQ(
-            aicore_route_task_v1(graph, sidecar.base(), &context, &run_control, task, &wake_stats),
-            AicoreRouteResultV1::READY
-        );
+        publish_ready_candidate(graph, sidecar.base(), &context, &run_control, task, &wake_stats);
         ASSERT_TRUE(
             aicore_enqueue_completion_v1(
                 graph, sidecar.base(), &context, &run_control, run_control.aiv_active_worker_count, task,
@@ -339,11 +440,8 @@ TEST(AicoreTicketSchedulerV1, ConcurrentExecutorsPushOneInboxExactlyOnce) {
     for (int64_t thread = 0; thread < kThreadCount; ++thread) {
         producers.emplace_back([&, thread] {
             for (int64_t task = thread; task < kTaskCount; task += kThreadCount) {
-                EXPECT_EQ(
-                    aicore_route_task_v1(
-                        graph, sidecar.base(), &contexts[thread], &run_control, task, &wake_stats[thread]
-                    ),
-                    AicoreRouteResultV1::READY
+                publish_ready_candidate(
+                    graph, sidecar.base(), &contexts[thread], &run_control, task, &wake_stats[thread]
                 );
                 EXPECT_TRUE(aicore_enqueue_completion_v1(
                     graph, sidecar.base(), &contexts[thread], &run_control, run_control.aiv_active_worker_count, task,
@@ -387,10 +485,7 @@ TEST(AicoreTicketSchedulerV1, ResolverWaitsForDetachedCompletionLinkPublication)
     run_control.aiv_active_worker_count = 1;
     AicoreWakeStatsV1 wake_stats{};
     AicoreCompletionStatsV1 completion_stats{};
-    ASSERT_EQ(
-        aicore_route_task_v1(graph, sidecar.base(), &context, &run_control, 0, &wake_stats),
-        AicoreRouteResultV1::READY
-    );
+    publish_ready_candidate(graph, sidecar.base(), &context, &run_control, 0, &wake_stats);
 
     auto *controls = aicore_sidecar_at_v1<AicoreTaskControlV1>(sidecar.base(), layout.task_controls_offset);
     auto *inboxes = aicore_sidecar_at_v1<AicoreCompletionInboxV1>(sidecar.base(), layout.completion_inboxes_offset);
@@ -441,10 +536,7 @@ TEST(AicoreTicketSchedulerV1, AicWorkerCannotResolveCompletionInbox) {
     run_control.aiv_active_worker_count = 1;
     AicoreWakeStatsV1 wake_stats{};
     AicoreCompletionStatsV1 completion_stats{};
-    ASSERT_EQ(
-        aicore_route_task_v1(graph, sidecar.base(), &aic_context, &run_control, 0, &wake_stats),
-        AicoreRouteResultV1::READY
-    );
+    publish_ready_candidate(graph, sidecar.base(), &aic_context, &run_control, 0, &wake_stats);
     ASSERT_TRUE(aicore_enqueue_completion_v1(
         graph, sidecar.base(), &aic_context, &run_control, run_control.aiv_active_worker_count, 0, &completion_stats
     ));
@@ -485,16 +577,22 @@ TEST(AicoreTicketSchedulerV1, RegistrationRacingCompletionCannotLoseWakeup) {
         AicoreRunControlV1 run_control{};
         AicoreWakeStatsV1 route_stats{};
         AicoreWakeStatsV1 complete_stats{};
-        ASSERT_EQ(
-            aicore_route_task_v1(graph, sidecar.base(), &complete_context, &run_control, 0, &complete_stats),
-            AicoreRouteResultV1::READY
-        );
+        publish_ready_candidate(graph, sidecar.base(), &complete_context, &run_control, 0, &complete_stats);
+        publish_test_binding(sidecar.base(), layout, &route_context, &run_control, 1, 1, 1, 1);
         std::atomic<bool> start{false};
         std::thread route([&] {
             while (!start.load(std::memory_order_acquire)) {}
             AicoreRouteResultV1 result =
                 aicore_route_task_v1(graph, sidecar.base(), &route_context, &run_control, 1, &route_stats);
-            EXPECT_TRUE(result == AicoreRouteResultV1::WAITING || result == AicoreRouteResultV1::READY);
+            if (result == AicoreRouteResultV1::READY_TO_PUBLISH) {
+                AicoreTaskClaimBindingV1 binding{};
+                ASSERT_TRUE(aicore_observe_claim_binding_v1(sidecar.base(), &run_control, 1, &binding));
+                EXPECT_TRUE(aicore_finalize_ready_v1(
+                    graph, sidecar.base(), &route_context, &run_control, binding, false
+                ));
+            } else {
+                EXPECT_EQ(result, AicoreRouteResultV1::WAITING);
+            }
         });
         std::thread complete([&] {
             while (!start.load(std::memory_order_acquire)) {}
@@ -537,7 +635,7 @@ TEST(AicoreTicketSchedulerV1, PendingCachesTaskClassification) {
         AicorePendingSlotV1 pending{};
         aicore_pending_initialize_v1(ticket, 7, AicoreClaimKindV1::TICKET, 10, 11, &pending);
         EXPECT_EQ(pending.task_id, test_case.task_id);
-        EXPECT_EQ(pending.fanin_count, ticket.fanin_count);
+        EXPECT_EQ(pending.fanin_count, aicore_task_ticket_fanin_count_v1(ticket));
         EXPECT_EQ(pending.kernel_id, test_case.kernel_id);
         EXPECT_EQ(pending.subtask_slot, test_case.subtask_slot);
     }

@@ -29,13 +29,19 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     int64_t task_id = args[1];
     uint64_t producer_mask = static_cast<uint64_t>(args[2]);
     for (int64_t producer = 0; producer < 64; ++producer) {
-        if ((producer_mask & (UINT64_C(1) << producer)) != 0 && state[producer] != producer + 1) {
-            state[task_id] = -(producer + 1);
+        if ((producer_mask & (UINT64_C(1) << producer)) != 0)
+            dcci(&state[producer * 8], SINGLE_CACHE_LINE);
+    }
+    dsb((mem_dsb_t)0);
+    for (int64_t producer = 0; producer < 64; ++producer) {
+        if ((producer_mask & (UINT64_C(1) << producer)) != 0 && state[producer * 8] != producer + 1) {
+            state[task_id * 8] = -(producer + 1);
+            dcci(&state[task_id * 8], SINGLE_CACHE_LINE, CACHELINE_OUT);
+            dsb((mem_dsb_t)0);
             return;
         }
     }
-    // Publication is intentionally owned by the A5 HBG AICore scheduler. Keeping
-    // this kernel free of DCCI makes mixed AIC/AIV tests exercise the generic
-    // producer-publish / consumer-invalidate protocol.
-    state[task_id] = task_id + 1;
+    state[task_id * 8] = task_id + 1;
+    dcci(&state[task_id * 8], SINGLE_CACHE_LINE, CACHELINE_OUT);
+    dsb((mem_dsb_t)0);
 }

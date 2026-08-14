@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <pto/pto-inst.hpp>
 
+#include "intrinsic.h"
 #include "tensor.h"
 
 #ifndef __gm__
@@ -30,15 +31,25 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     const int64_t fanin_count = args[3];
     bool ready = true;
     if (graph_case == 1 && task_id >= 32) {
+        for (int64_t producer = 0; producer < 32; ++producer)
+            dcci(&state[(producer + 1) * 8], SINGLE_CACHE_LINE);
+        dsb((mem_dsb_t)0);
         for (int64_t producer = 0; producer < 32; ++producer) {
-            ready = ready && state[producer + 1] == producer + 1;
+            ready = ready && state[(producer + 1) * 8] == producer + 1;
         }
     } else {
         const int64_t checked = fanin_count < 4 ? fanin_count : 4;
         for (int64_t i = 0; i < checked; ++i) {
             const int64_t producer = args[4 + i];
-            ready = ready && producer >= 0 && state[producer + 1] == producer + 1;
+            if (producer >= 0) dcci(&state[(producer + 1) * 8], SINGLE_CACHE_LINE);
+        }
+        dsb((mem_dsb_t)0);
+        for (int64_t i = 0; i < checked; ++i) {
+            const int64_t producer = args[4 + i];
+            ready = ready && producer >= 0 && state[(producer + 1) * 8] == producer + 1;
         }
     }
-    state[task_id + 1] = ready ? task_id + 1 : -(task_id + 1);
+    state[(task_id + 1) * 8] = ready ? task_id + 1 : -(task_id + 1);
+    dcci(&state[(task_id + 1) * 8], SINGLE_CACHE_LINE, CACHELINE_OUT);
+    dsb((mem_dsb_t)0);
 }

@@ -45,6 +45,30 @@ inline __aicore__ void aicore_observe_data_cache_v0(__gm__ void *address) {
 #endif
 }
 
+inline __aicore__ void aicore_publish_dispatch_payload_v1(__gm__ PTO2DispatchPayload *payload) {
+#if defined(__CCE_AICORE__)
+    for (uint64_t offset = 0; offset < sizeof(PTO2DispatchPayload); offset += 64) {
+        dcci(reinterpret_cast<__gm__ uint8_t *>(payload) + offset, SINGLE_CACHE_LINE, CACHELINE_OUT);
+    }
+    dsb((mem_dsb_t)0);
+#else
+    (void)payload;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
+}
+
+inline __aicore__ void aicore_observe_dispatch_payload_v1(__gm__ PTO2DispatchPayload *payload) {
+#if defined(__CCE_AICORE__)
+    for (uint64_t offset = 0; offset < sizeof(PTO2DispatchPayload); offset += 64) {
+        dcci(reinterpret_cast<__gm__ uint8_t *>(payload) + offset, SINGLE_CACHE_LINE);
+    }
+    dsb((mem_dsb_t)0);
+#else
+    (void)payload;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
+}
+
 // These wrappers are a runtime-local subset of simpler-dist FDWIC's validated
 // A5 raw-GM atomic protocol. They intentionally expose the observed old value
 // returned by the hardware instead of emulating std::atomic's API.

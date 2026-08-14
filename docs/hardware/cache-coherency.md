@@ -34,6 +34,22 @@ host- or AICPU-written GM).
 The rest of this doc fills in why each row of the table is what it is,
 and what code lives on each side.
 
+### AICore-to-AICore data is access-path specific
+
+Do not infer a whole-kernel cache operation merely because two scheduled tasks
+have a dependency. Tensor operands consumed through the Tensor/MTE load path do
+not require an AICore data-cache invalidation. In contrast, ordinary scalar LSU
+loads and stores use the AICore data cache: a producer must clean the exact
+written lines with `dcci(..., SINGLE_CACHE_LINE, CACHELINE_OUT)` followed by one
+`dsb`, and a consumer must invalidate those exact lines before loading them,
+again followed by one `dsb`. Independent writers must use separate cache lines.
+
+The A5 `host_build_graph` scheduler therefore performs cache maintenance only
+for scheduler-owned metadata and dispatch payloads. It does not issue a final
+whole-data-cache invalidation around every kernel. Kernels that communicate via
+scalar LSU GM accesses own their precise observe/publish protocol; Tensor/MTE
+data remains outside that protocol.
+
 ## The two cache primitives
 
 | Primitive | Side | Purpose | Cost (rough, a2a3 / DAV_3510) |
@@ -176,6 +192,9 @@ When you are about to insert a cache operation, ask in order:
    yes, and there is no data/address dependency between that read and
    this one, insert `rmb()` between them — coherency does not imply
    load-load ordering on ARM64.
+6. Is this an AICore consuming another AICore's data? If it is Tensor/MTE
+   traffic, do not add a D-cache operation. If it is scalar LSU traffic,
+   invalidate/publish only the exact cache lines in the kernel contract.
 
 If the answer to (1) is "I'm not sure" — find out. The cost of one
 wrong `cache_invalidate_range` is silent perf rot; the cost of a

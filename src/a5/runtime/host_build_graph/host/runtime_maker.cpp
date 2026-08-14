@@ -729,14 +729,12 @@ bool create_aicore_sidecar_v1(
             return false;
         }
         __gm__ uint8_t *payload = aicore_graph_payload_v0(host_graph, task_id);
-        task_tickets[static_cast<size_t>(task_id)] = {
+        task_tickets[static_cast<size_t>(task_id)] = aicore_task_ticket_make_v1(
             static_cast<uint32_t>(task_id),
             static_cast<uint16_t>(task.kernel_id),
             static_cast<uint8_t>(task.subtask_slot),
-            0,
-            *reinterpret_cast<__gm__ int32_t *>(payload + AICORE_GRAPH_FANIN_COUNT_OFFSET_V0),
-            0,
-        };
+            *reinterpret_cast<__gm__ int32_t *>(payload + AICORE_GRAPH_FANIN_COUNT_OFFSET_V0)
+        );
     }
 
     AicoreTicketStreams streams;
@@ -800,6 +798,7 @@ bool create_aicore_sidecar_v1(
     auto *run_control = aicore_sidecar_at_v1<AicoreRunControlV1>(host_base, layout.run_control_offset);
     run_control->expected_task_count = static_cast<uint64_t>(total_tasks);
     run_control->inline_completed_count = inline_completed_task_ids.size();
+    run_control->claim_bindings_offset = layout.claim_bindings_offset;
     run_control->error_task_id = UINT64_MAX;
     run_control->error_core_id = UINT64_MAX;
     run_control->error_core_type = UINT64_MAX;
@@ -822,7 +821,8 @@ bool create_aicore_sidecar_v1(
         context.graph_payloads_address = device_sm_address + device_segments.payloads;
         context.sidecar_base_address = aligned_address;
         context.dispatch_payload_offset =
-            layout.dispatch_payloads_offset + static_cast<uint64_t>(i) * sizeof(PTO2DispatchPayload);
+            layout.dispatch_payloads_offset + static_cast<uint64_t>(i) * AICORE_PENDING_SLOT_COUNT_V1 *
+                                                  sizeof(PTO2DispatchPayload);
         context.trace_cells_offset = layout.trace_cells_offset;
         context.task_window_mask = task_window_size - 1;
         context.graph_task_count = static_cast<uint64_t>(total_tasks);

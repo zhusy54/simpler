@@ -78,14 +78,50 @@ struct alignas(128) AicoreCompletionInboxV1 {
     uint8_t atomic_line_padding[120];
 };
 
-struct AicoreTaskTicketV1 {
-    uint32_t task_id;
+struct alignas(64) AicoreTaskClaimBindingV1 {
+    int64_t task_id;
+    uint64_t callable_address;
+    uint64_t dispatch_payload_offset;
+    uint64_t owner_worker_id;
     uint16_t kernel_id;
     uint8_t subtask_slot;
-    uint8_t reserved0;
-    int32_t fanin_count;
-    uint32_t reserved1;
+    uint8_t pending_slot;
+    uint32_t reserved0;
+    uint64_t reserved[3];
 };
+
+struct alignas(16) AicoreTaskTicketV1 {
+    // Four tickets fit exactly in one A5 64-byte data-cache line. Packing the
+    // fields into two words lets the AICore claim path issue two contiguous
+    // 64-bit GM loads instead of four mixed-width scalar loads.
+    uint64_t task_and_fanin;
+    uint64_t kernel_and_subtask;
+};
+
+inline __host__ __aicore__ AicoreTaskTicketV1 aicore_task_ticket_make_v1(
+    uint32_t task_id, uint16_t kernel_id, uint8_t subtask_slot, int32_t fanin_count
+) {
+    return {
+        static_cast<uint64_t>(task_id) | (static_cast<uint64_t>(static_cast<uint32_t>(fanin_count)) << 32),
+        static_cast<uint64_t>(kernel_id) | (static_cast<uint64_t>(subtask_slot) << 16),
+    };
+}
+
+inline __host__ __aicore__ uint32_t aicore_task_ticket_task_id_v1(const AicoreTaskTicketV1 &ticket) {
+    return static_cast<uint32_t>(ticket.task_and_fanin);
+}
+
+inline __host__ __aicore__ int32_t aicore_task_ticket_fanin_count_v1(const AicoreTaskTicketV1 &ticket) {
+    return static_cast<int32_t>(ticket.task_and_fanin >> 32);
+}
+
+inline __host__ __aicore__ uint16_t aicore_task_ticket_kernel_id_v1(const AicoreTaskTicketV1 &ticket) {
+    return static_cast<uint16_t>(ticket.kernel_and_subtask);
+}
+
+inline __host__ __aicore__ uint8_t aicore_task_ticket_subtask_slot_v1(const AicoreTaskTicketV1 &ticket) {
+    return static_cast<uint8_t>(ticket.kernel_and_subtask >> 16);
+}
 
 struct alignas(128) AicoreTaskStreamV1 {
     uint64_t tickets_offset;
@@ -105,7 +141,8 @@ struct alignas(128) AicoreRunControlV1 {
     uint64_t inline_completed_count;
     uint64_t aic_active_worker_count;
     uint64_t aiv_active_worker_count;
-    uint64_t config_reserved[9];
+    uint64_t claim_bindings_offset;
+    uint64_t config_reserved[8];
 
     volatile uint64_t attached_count;
     volatile uint64_t drained_worker_count;
@@ -223,6 +260,7 @@ struct AicoreExecutionSidecarLayoutV1 {
     uint64_t run_control_offset;
     uint64_t worker_contexts_offset;
     uint64_t dispatch_payloads_offset;
+    uint64_t claim_bindings_offset;
     uint64_t task_controls_offset;
     uint64_t completion_inboxes_offset;
     uint64_t aic_stream_offset;
@@ -240,7 +278,10 @@ static_assert(offsetof(AicoreTaskControlV1, next_waiter) == 64, "waiter metadata
 static_assert(offsetof(AicoreTaskControlV1, completion_next) == 80, "completion link offset changed");
 static_assert(sizeof(AicoreCompletionInboxV1) == 128, "completion inbox layout changed");
 static_assert(alignof(AicoreCompletionInboxV1) == 128, "completion inbox alignment changed");
+static_assert(sizeof(AicoreTaskClaimBindingV1) == 64, "claim binding must occupy one cache line");
+static_assert(alignof(AicoreTaskClaimBindingV1) == 64, "claim binding must be cache-line aligned");
 static_assert(sizeof(AicoreTaskTicketV1) == 16, "task ticket layout changed");
+static_assert(alignof(AicoreTaskTicketV1) == 16, "task tickets must not straddle 16-byte boundaries");
 static_assert(sizeof(AicoreTaskStreamV1) == 256, "task stream layout changed");
 static_assert(offsetof(AicoreTaskStreamV1, next_index) == 128, "ticket cursor must have its own line");
 static_assert(sizeof(AicoreRunControlV1) == 384, "run control layout changed");
@@ -262,6 +303,8 @@ static_assert(std::is_standard_layout_v<AicoreTaskControlV1>);
 static_assert(std::is_trivially_copyable_v<AicoreTaskControlV1>);
 static_assert(std::is_standard_layout_v<AicoreCompletionInboxV1>);
 static_assert(std::is_trivially_copyable_v<AicoreCompletionInboxV1>);
+static_assert(std::is_standard_layout_v<AicoreTaskClaimBindingV1>);
+static_assert(std::is_trivially_copyable_v<AicoreTaskClaimBindingV1>);
 static_assert(std::is_standard_layout_v<AicoreTaskTicketV1>);
 static_assert(std::is_trivially_copyable_v<AicoreTaskTicketV1>);
 static_assert(std::is_standard_layout_v<AicoreTaskStreamV1>);
@@ -325,8 +368,14 @@ inline bool aicore_sidecar_plan_v1(
         ) ||
         !aicore_sidecar_checked_mul_v1(AICORE_WORKER_CAPACITY_V1, sizeof(AicoreWorkerContextV1), &bytes) ||
         !aicore_sidecar_reserve_v1(&cursor, bytes, alignof(AicoreWorkerContextV1), &next.worker_contexts_offset) ||
-        !aicore_sidecar_checked_mul_v1(AICORE_WORKER_CAPACITY_V1, sizeof(PTO2DispatchPayload), &bytes) ||
+        !aicore_sidecar_checked_mul_v1(
+            AICORE_WORKER_CAPACITY_V1 * AICORE_PENDING_SLOT_COUNT_V1, sizeof(PTO2DispatchPayload), &bytes
+        ) ||
         !aicore_sidecar_reserve_v1(&cursor, bytes, alignof(PTO2DispatchPayload), &next.dispatch_payloads_offset) ||
+        !aicore_sidecar_checked_mul_v1(task_count, sizeof(AicoreTaskClaimBindingV1), &bytes) ||
+        !aicore_sidecar_reserve_v1(
+            &cursor, bytes, alignof(AicoreTaskClaimBindingV1), &next.claim_bindings_offset
+        ) ||
         !aicore_sidecar_checked_mul_v1(task_count, sizeof(AicoreTaskControlV1), &bytes) ||
         !aicore_sidecar_reserve_v1(
             &cursor, bytes, alignof(AicoreTaskControlV1), &next.task_controls_offset
@@ -368,6 +417,9 @@ inline bool aicore_sidecar_init_v1(void *base, const AicoreExecutionSidecarLayou
         return false;
     }
     __builtin_memset(base, 0, static_cast<size_t>(layout.total_size));
+    auto *bindings = aicore_sidecar_at_v1<AicoreTaskClaimBindingV1>(base, layout.claim_bindings_offset);
+    for (uint64_t i = 0; i < layout.task_count; ++i)
+        bindings[i].task_id = AICORE_TASK_ID_INVALID_V1;
     auto *controls = aicore_sidecar_at_v1<AicoreTaskControlV1>(base, layout.task_controls_offset);
     for (uint64_t i = 0; i < layout.task_count; ++i) {
         controls[i].state = static_cast<int64_t>(AicoreTaskStateV1::BLOCKED);

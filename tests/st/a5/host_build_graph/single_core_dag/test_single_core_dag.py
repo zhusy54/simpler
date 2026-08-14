@@ -71,14 +71,14 @@ class TestHbgSingleCoreDag(SceneTestCase):
 
     def generate_args(self, params):
         return TaskArgsBuilder(
-            Tensor("task_state", torch.zeros(64, dtype=torch.int64)),
+            Tensor("task_state", torch.zeros(64 * 8, dtype=torch.int64)),
             Scalar("graph_case", ctypes.c_int64(params["graph_case"])),
             Scalar("core_type", ctypes.c_int64({"aic": 0, "aiv": 1, "mixed": 2}[params["core_type"]])),
         )
 
     def compute_golden(self, args, params):
         count = params["task_count"]
-        args.task_state[:count] = torch.arange(1, count + 1, dtype=torch.int64)
+        args.task_state[: count * 8 : 8] = torch.arange(1, count + 1, dtype=torch.int64)
 
 
 if __name__ == "__main__":

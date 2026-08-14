@@ -157,13 +157,13 @@ class TestDepGenHostBuildGraphA5Explicit(SceneTestCase):
 
     def generate_args(self, params):
         return TaskArgsBuilder(
-            Tensor("task_state", torch.zeros(64, dtype=torch.int64)),
+            Tensor("task_state", torch.zeros(64 * 8, dtype=torch.int64)),
             Scalar("graph_case", ctypes.c_int64(0)),
             Scalar("core_type", ctypes.c_int64(1)),
         )
 
     def compute_golden(self, args, params):
-        args.task_state[:] = torch.arange(1, 65, dtype=torch.int64)
+        args.task_state[::8] = torch.arange(1, 65, dtype=torch.int64)
 
     def test_run(self, st_platform, st_worker, request):
         run_marker = int(time.time())

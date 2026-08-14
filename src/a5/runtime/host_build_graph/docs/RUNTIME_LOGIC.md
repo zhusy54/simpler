@@ -31,7 +31,8 @@ The 128-byte-aligned v1 sidecar contains:
   isolated cursor; every ticket carries the host-validated task ID, kernel ID,
   subtask slot, and fanin count;
 - split configuration, lifecycle, and first-error run-control cache lines;
-- one private dispatch payload and one debug/statistics context per worker; and
+- two private dispatch payloads (one per pending slot), one claim-binding cache
+  line per task, and one debug/statistics context per worker; and
 - per-task scheduler phase cells written only during level-1 capture.
 
 Inline-completed tasks start as `DONE` and do not enter either typed stream.
@@ -51,10 +52,22 @@ For each core type, AICPU activates
 
 Each active worker maintains two owner-only pending slots. Claim initialization
 copies the host-validated ticket metadata into a slot without re-reading or
-revalidating graph descriptors. Routing scans from the remembered fanin index
+revalidating graph descriptors. Before routing, the owner publishes a binding
+from the task to its worker, pending slot, payload address, callable, kernel ID,
+and subtask slot. Routing scans from the remembered fanin index
 and links a blocked consumer into the first incomplete producer's wake list.
 The consumer stays in its owner's pending slot; there is no ReadyQ and no
 execution ownership migration.
+
+Routing does not publish `READY` when the final dependency is resolved. For a
+claim-ready task, the owner materializes its slot's payload and then publishes
+`READY`. For a blocked task, the AIV worker resolving the completion observes
+the binding, materializes that owner's payload, publishes its exact eight cache
+lines, and only then publishes `READY`. The owner invalidates those same eight
+lines after observing remotely published readiness and executes immediately;
+the old execution-time descriptor, function-table, and whole-data-cache
+invalidations are not needed. A payload slot is cleaned before its next claim
+so a stale owner cache line cannot overwrite a remote materialization.
 
 Each worker atomically snapshots the immutable `aiv_active_worker_count` once
 after startup and reuses it for enqueue routing and inbox service. After a
@@ -68,6 +81,11 @@ keeps retry and contention handling out of the producer hot path. LIFO order is
 valid because completion events have no FIFO semantic; dependency order is
 enforced by task state and wake-list routing. Kernel code owns publication of
 cacheable GM output, matching the `tensormap_and_ringbuffer` execution contract.
+Tensor data moved through the Tensor/MTE path needs no scheduler-wide D-cache
+operation. A kernel that uses scalar LSU loads/stores for cross-core GM
+communication must invalidate the producer cache lines before reading and clean
+them after writing, with a `dsb` after each batch; writers must not share a
+cache line.
 
 Before idle backoff, an AIV worker detaches its whole local inbox or rotates
 across one AIV victim inbox. AIC workers never service completion inboxes. The
