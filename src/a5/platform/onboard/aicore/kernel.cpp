@@ -48,6 +48,7 @@ class Runtime;
 // linker dedup the otherwise-duplicate symbol definitions across the two
 // compilation units.
 [[block_local]] static uint32_t s_aicore_profiling_flag;
+[[block_local]] static uint64_t s_aicore_entry_cycles;
 // Slot pointer (NOT the dereferenced head address) — see
 // aicore_profiling_state.h for the lazy-deref contract.
 [[block_local]] static __gm__ uint64_t *s_chip_swimlane_aicore_head_slot;
@@ -57,6 +58,8 @@ class Runtime;
 
 __attribute__((weak)) __aicore__ void set_aicore_profiling_flag(uint32_t flag) { s_aicore_profiling_flag = flag; }
 __attribute__((weak)) __aicore__ uint32_t get_aicore_profiling_flag() { return s_aicore_profiling_flag; }
+__attribute__((weak)) __aicore__ void set_aicore_entry_cycles(uint64_t cycles) { s_aicore_entry_cycles = cycles; }
+__attribute__((weak)) __aicore__ uint64_t get_aicore_entry_cycles() { return s_aicore_entry_cycles; }
 
 __attribute__((weak)) __aicore__ void set_chip_swimlane_aicore_head_slot(__gm__ uint64_t *slot_ptr) {
     s_chip_swimlane_aicore_head_slot = slot_ptr;
@@ -103,6 +106,9 @@ extern __aicore__ void aicore_execute(__gm__ Runtime *runtime, int block_idx, Co
  * @param k_args Address of KernelArgs structure (contains runtime_args + profiling tables)
  */
 extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ KernelArgs *k_args) {
+    const uint64_t aicore_entry_cycles =
+        SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE) ? get_sys_cnt_aicore() : 0;
+    set_aicore_entry_cycles(aicore_entry_cycles);
     // Calculate block_idx for this core
 #ifdef __DAV_VEC__
     block_idx = get_block_idx() * get_subblockdim() + get_subblockid() + get_block_num();

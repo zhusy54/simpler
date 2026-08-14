@@ -36,8 +36,9 @@ static_assert(sizeof(PTO2TaskDescriptor) == AICORE_GRAPH_TASK_DESCRIPTOR_STRIDE_
 static_assert(sizeof(PTO2TaskPayload) == AICORE_GRAPH_TASK_PAYLOAD_STRIDE_V0);
 static_assert(sizeof(AicorePendingSlotV1) == 64);
 static_assert(sizeof(AicoreTaskControlV1) == 128);
-static_assert(sizeof(AicoreTaskTicketV1) == 16);
-static_assert(alignof(AicoreTaskTicketV1) == 16);
+static_assert(sizeof(AicoreTaskTicketV1) == 8);
+static_assert(alignof(AicoreTaskTicketV1) == 8);
+static_assert(sizeof(AicpuCoreLifecycleTraceV1) == 128);
 static_assert(sizeof(AicoreTaskClaimBindingV1) == 64);
 static_assert(offsetof(PTO2TaskDescriptor, kernel_id) == AICORE_GRAPH_KERNEL_IDS_OFFSET_V0);
 static_assert(offsetof(PTO2TaskPayload, fanin_count) == AICORE_GRAPH_FANIN_COUNT_OFFSET_V0);
@@ -143,8 +144,8 @@ uint64_t fake_callable_address() {
 }
 
 void publish_ready_candidate(
-    const AicoreReadonlyGraphV0 &graph, void *sidecar, AicoreWorkerContextV1 *context,
-    AicoreRunControlV1 *run_control, int64_t task_id, AicoreWakeStatsV1 *stats
+    const AicoreReadonlyGraphV0 &graph, void *sidecar, AicoreWorkerContextV1 *context, AicoreRunControlV1 *run_control,
+    int64_t task_id, AicoreWakeStatsV1 *stats
 ) {
     ASSERT_EQ(
         aicore_route_task_v1(graph, sidecar, context, run_control, task_id, stats),
@@ -161,9 +162,8 @@ AicoreTaskClaimBindingV1 publish_test_binding(
 ) {
     context->dispatch_payload_offset = layout.dispatch_payloads_offset;
     run_control->claim_bindings_offset = layout.claim_bindings_offset;
-    AicoreTaskClaimBindingV1 binding = aicore_make_claim_binding_v1(
-        context, task_id, kernel_id, subtask_slot, pending_slot, fake_callable_address()
-    );
+    AicoreTaskClaimBindingV1 binding =
+        aicore_make_claim_binding_v1(context, task_id, kernel_id, subtask_slot, pending_slot, fake_callable_address());
     aicore_publish_claim_binding_v1(sidecar, run_control, binding);
     return binding;
 }
@@ -176,6 +176,7 @@ TEST(AicoreSidecarV1, PlansOnlyTypedStreamsTaskControlsAndTrace) {
     EXPECT_EQ(layout.aiv_task_count, 2u);
     EXPECT_EQ(layout.total_size % AICORE_SIDECAR_ALIGNMENT_V1, 0u);
     EXPECT_EQ(layout.task_controls_offset % alignof(AicoreTaskControlV1), 0u);
+    EXPECT_EQ(layout.aicpu_lifecycle_traces_offset % alignof(AicpuCoreLifecycleTraceV1), 0u);
     EXPECT_EQ(layout.claim_bindings_offset % alignof(AicoreTaskClaimBindingV1), 0u);
     EXPECT_EQ(layout.completion_inboxes_offset % alignof(AicoreCompletionInboxV1), 0u);
     EXPECT_EQ(layout.aic_stream_offset % alignof(AicoreTaskStreamV1), 0u);
@@ -186,13 +187,21 @@ TEST(AicoreSidecarV1, PlansOnlyTypedStreamsTaskControlsAndTrace) {
     EXPECT_EQ(sizeof(AicoreTaskTraceCellV1), 256u);
 
     SidecarBuffer storage(layout);
+    auto *lifecycle_traces =
+        aicore_sidecar_at_v1<AicpuCoreLifecycleTraceV1>(storage.base(), layout.aicpu_lifecycle_traces_offset);
+    EXPECT_EQ(
+        reinterpret_cast<uintptr_t>(&lifecycle_traces[1]) - reinterpret_cast<uintptr_t>(&lifecycle_traces[0]),
+        sizeof(AicpuCoreLifecycleTraceV1)
+    );
     auto *controls = aicore_sidecar_at_v1<AicoreTaskControlV1>(storage.base(), layout.task_controls_offset);
     for (uint64_t task = 0; task < layout.task_count; ++task) {
         EXPECT_EQ(controls[task].state, static_cast<int64_t>(AicoreTaskStateV1::BLOCKED));
         EXPECT_EQ(controls[task].wake_list_head, AICORE_WAKE_LIST_OPEN_V1);
         if (task != 0) {
-            EXPECT_EQ(reinterpret_cast<uintptr_t>(&controls[task]) - reinterpret_cast<uintptr_t>(&controls[task - 1]),
-                      sizeof(AicoreTaskControlV1));
+            EXPECT_EQ(
+                reinterpret_cast<uintptr_t>(&controls[task]) - reinterpret_cast<uintptr_t>(&controls[task - 1]),
+                sizeof(AicoreTaskControlV1)
+            );
         }
     }
     auto *inboxes = aicore_sidecar_at_v1<AicoreCompletionInboxV1>(storage.base(), layout.completion_inboxes_offset);
@@ -202,8 +211,7 @@ TEST(AicoreSidecarV1, PlansOnlyTypedStreamsTaskControlsAndTrace) {
     auto *aiv_stream = aicore_sidecar_at_v1<AicoreTaskStreamV1>(storage.base(), layout.aiv_stream_offset);
     EXPECT_EQ(aic_stream->tickets_offset, layout.aic_tickets_offset);
     EXPECT_EQ(aiv_stream->tickets_offset, layout.aiv_tickets_offset);
-    auto *bindings =
-        aicore_sidecar_at_v1<AicoreTaskClaimBindingV1>(storage.base(), layout.claim_bindings_offset);
+    auto *bindings = aicore_sidecar_at_v1<AicoreTaskClaimBindingV1>(storage.base(), layout.claim_bindings_offset);
     for (uint64_t task = 0; task < layout.task_count; ++task)
         EXPECT_EQ(bindings[task].task_id, AICORE_TASK_ID_INVALID_V1);
     EXPECT_EQ(
@@ -365,6 +373,32 @@ TEST(AicoreTicketSchedulerV1, WakeMigrationRemembersCompletedFaninPrefix) {
     EXPECT_EQ(stats.wake_migrate_count, 2u);
 }
 
+TEST(AicoreTicketSchedulerV1, BlockedPollLeavesDebugMetadataForColdRefresh) {
+    AicoreExecutionSidecarLayoutV1 layout{};
+    ASSERT_TRUE(aicore_sidecar_plan_v1(1, 1, 0, &layout));
+    SidecarBuffer storage(layout);
+    AicoreWorkerContextV1 context{};
+    context.task_controls_offset = layout.task_controls_offset;
+    auto *control = aicore_task_control_at_v1(storage.base(), &context, 0);
+    control->next_fanin_index = 3;
+    control->waiting_producer = 7;
+
+    AicorePendingSlotV1 pending{};
+    pending.task_id = 0;
+    pending.has_fanin = 1;
+    pending.next_fanin_index = 1;
+    pending.waiting_producer = 5;
+
+    EXPECT_EQ(aicore_pending_state_v1(storage.base(), &context, &pending), AicorePendingStateV1::BLOCKED);
+    EXPECT_EQ(pending.next_fanin_index, 1);
+    EXPECT_EQ(pending.waiting_producer, 5);
+
+    EXPECT_TRUE(aicore_refresh_pending_debug_v1(storage.base(), &context, &pending));
+    EXPECT_EQ(pending.next_fanin_index, 3);
+    EXPECT_EQ(pending.waiting_producer, 7);
+    EXPECT_FALSE(aicore_refresh_pending_debug_v1(storage.base(), &context, &pending));
+}
+
 TEST(AicoreTicketSchedulerV1, CompletionInboxBatchesAndStealsWithoutLoss) {
     constexpr int64_t kTaskCount = 16;
     GraphBuffer graph_storage(kTaskCount);
@@ -386,12 +420,9 @@ TEST(AicoreTicketSchedulerV1, CompletionInboxBatchesAndStealsWithoutLoss) {
     AicoreCompletionStatsV1 completion_stats{};
     for (int64_t task = 0; task < kTaskCount; ++task) {
         publish_ready_candidate(graph, sidecar.base(), &context, &run_control, task, &wake_stats);
-        ASSERT_TRUE(
-            aicore_enqueue_completion_v1(
-                graph, sidecar.base(), &context, &run_control, run_control.aiv_active_worker_count, task,
-                &completion_stats
-            )
-        );
+        ASSERT_TRUE(aicore_enqueue_completion_v1(
+            graph, sidecar.base(), &context, &run_control, run_control.aiv_active_worker_count, task, &completion_stats
+        ));
     }
 
     uint64_t victim_cursor = 1;
@@ -587,9 +618,9 @@ TEST(AicoreTicketSchedulerV1, RegistrationRacingCompletionCannotLoseWakeup) {
             if (result == AicoreRouteResultV1::READY_TO_PUBLISH) {
                 AicoreTaskClaimBindingV1 binding{};
                 ASSERT_TRUE(aicore_observe_claim_binding_v1(sidecar.base(), &run_control, 1, &binding));
-                EXPECT_TRUE(aicore_finalize_ready_v1(
-                    graph, sidecar.base(), &route_context, &run_control, binding, false
-                ));
+                EXPECT_TRUE(
+                    aicore_finalize_ready_v1(graph, sidecar.base(), &route_context, &run_control, binding, false)
+                );
             } else {
                 EXPECT_EQ(result, AicoreRouteResultV1::WAITING);
             }
@@ -612,8 +643,8 @@ TEST(AicoreTicketSchedulerV1, RegistrationRacingCompletionCannotLoseWakeup) {
 TEST(AicoreTicketSchedulerV1, PendingCachesTaskClassification) {
     GraphBuffer storage(3);
     storage.executable(0, 0, 17);
-    storage.executable(1, 1, 18);
-    storage.executable(2, 2, 19);
+    storage.executable(1, 1, 18, {0});
+    storage.executable(2, 2, 19, {0, 1});
     AicoreReadonlyGraphV0 graph = storage.graph();
 
     const struct {
@@ -621,10 +652,11 @@ TEST(AicoreTicketSchedulerV1, PendingCachesTaskClassification) {
         AicoreRootCoreTypeV0 core_type;
         uint16_t kernel_id;
         uint8_t subtask_slot;
+        bool has_fanin;
     } cases[] = {
-        {0, AicoreRootCoreTypeV0::AIC, 17, 0},
-        {1, AicoreRootCoreTypeV0::AIV, 18, 1},
-        {2, AicoreRootCoreTypeV0::AIV, 19, 2},
+        {0, AicoreRootCoreTypeV0::AIC, 17, 0, false},
+        {1, AicoreRootCoreTypeV0::AIV, 18, 1, true},
+        {2, AicoreRootCoreTypeV0::AIV, 19, 2, true},
     };
     for (const auto &test_case : cases) {
         AicoreTaskTicketV1 ticket{};
@@ -635,7 +667,8 @@ TEST(AicoreTicketSchedulerV1, PendingCachesTaskClassification) {
         AicorePendingSlotV1 pending{};
         aicore_pending_initialize_v1(ticket, 7, AicoreClaimKindV1::TICKET, 10, 11, &pending);
         EXPECT_EQ(pending.task_id, test_case.task_id);
-        EXPECT_EQ(pending.fanin_count, aicore_task_ticket_fanin_count_v1(ticket));
+        EXPECT_EQ(aicore_task_ticket_has_fanin_v1(ticket), test_case.has_fanin);
+        EXPECT_EQ(pending.has_fanin != 0, test_case.has_fanin);
         EXPECT_EQ(pending.kernel_id, test_case.kernel_id);
         EXPECT_EQ(pending.subtask_slot, test_case.subtask_slot);
     }

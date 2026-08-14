@@ -288,6 +288,7 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
     aicore_rows = data.get("aicore_tasks") or []
     aicore_resolve_rows = data.get("aicore_resolve_phases") or []
     aicore_scheduler_rows = data.get("aicore_scheduler_phases") or []
+    aicpu_lifecycle_rows = data.get("aicpu_lifecycle_phases") or []
     aicpu_rows = data.get("aicpu_tasks") or []
     sched_phases_raw = data.get("aicpu_scheduler_phases") or []
     orch_phases_raw = data.get("aicpu_orchestrator_phases") or []
@@ -335,6 +336,9 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
         _track(int(start_c))
         _track(int(end_c))
     for phase in aicore_scheduler_rows:
+        _track(int(phase.get("start_cycles", 0)))
+        _track(int(phase.get("end_cycles", 0)))
+    for phase in aicpu_lifecycle_rows:
         _track(int(phase.get("start_cycles", 0)))
         _track(int(phase.get("end_cycles", 0)))
     for _, _, d, f in aicpu_rows:
@@ -447,6 +451,20 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
             "end_time_us": end_us,
             "duration_us": end_us - start_us,
         }
+        for field in ("atomic_count", "poll_count"):
+            if field in phase:
+                converted[field] = int(phase[field])
+        poll_time_us = int(phase.get("poll_cycles", 0)) * cycles_to_us_factor
+        backoff_time_us = int(phase.get("backoff_cycles", 0)) * cycles_to_us_factor
+        if "poll_cycles" in phase:
+            converted["poll_time_us"] = poll_time_us
+            poll_count = int(phase.get("poll_count", 0))
+            if poll_count > 0:
+                converted["poll_avg_time_us"] = poll_time_us / poll_count
+        if "backoff_cycles" in phase:
+            converted["backoff_time_us"] = backoff_time_us
+        if "poll_cycles" in phase or "backoff_cycles" in phase:
+            converted["other_time_us"] = max(0.0, converted["duration_us"] - poll_time_us - backoff_time_us)
         aicore_scheduler_phases.append(converted)
         if converted["phase"] == "Kernel" and task_id >= 0:
             scheduler_tasks.append(
@@ -468,6 +486,34 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
     if level == 1 and scheduler_tasks:
         tasks = scheduler_tasks
     aicore_scheduler_phases.sort(key=lambda phase: (phase["start_time_us"], phase["core_id"]))
+
+    aicpu_lifecycle_phases = []
+    for phase in aicpu_lifecycle_rows:
+        worker_id = int(phase.get("worker_id", -1))
+        start_us = _to_us(int(phase.get("start_cycles", 0)))
+        end_us = _to_us(int(phase.get("end_cycles", 0)))
+        converted = {
+            "worker_id": worker_id,
+            "aicpu_thread_id": int(phase.get("aicpu_thread_id", 0)),
+            "core_type": "global" if worker_id == 0xFFFFFFFFFFFFFFFF else _core_type(worker_id),
+            "phase": str(phase.get("phase", "unknown")),
+            "start_time_us": start_us,
+            "end_time_us": end_us,
+            "duration_us": end_us - start_us,
+        }
+        for field in ("poll_count", "error_poll_count"):
+            if field in phase:
+                converted[field] = int(phase[field])
+        if "poll_cycles" in phase:
+            poll_time_us = int(phase["poll_cycles"]) * cycles_to_us_factor
+            converted["poll_time_us"] = poll_time_us
+            poll_count = int(phase.get("poll_count", 0))
+            if poll_count > 0:
+                converted["poll_avg_time_us"] = poll_time_us / poll_count
+        aicpu_lifecycle_phases.append(converted)
+    aicpu_lifecycle_phases.sort(
+        key=lambda phase: (phase["start_time_us"], phase["aicpu_thread_id"], phase["worker_id"])
+    )
 
     tasks.sort(key=lambda t: int(t["task_id"]))
 
@@ -539,6 +585,8 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
         out["aicore_resolve_phases"] = aicore_resolve_phases
     if aicore_scheduler_phases:
         out["aicore_scheduler_phases"] = aicore_scheduler_phases
+    if aicpu_lifecycle_phases:
+        out["aicpu_lifecycle_phases"] = aicpu_lifecycle_phases
     if aicpu_scheduler_phases:
         out["aicpu_scheduler_phases"] = aicpu_scheduler_phases
     if aicpu_orchestrator_phases:
@@ -1264,6 +1312,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     emit_overhead=False,
     aicore_resolve_phases=None,
     aicore_scheduler_phases=None,
+    aicpu_lifecycle_phases=None,
 ):
     """Generate Chrome Trace Event Format JSON from task data.
 
@@ -1281,6 +1330,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         core_to_thread: Optional list mapping core_id (index) to scheduler thread index (-1 = unassigned)
         aicore_resolve_phases: Optional AICore dependency-resolution spans
         aicore_scheduler_phases: Optional AICore ticket/pending scheduler spans
+        aicpu_lifecycle_phases: Optional AICPU startup/completion/shutdown spans
 
     Generates processes in the trace:
         - pid=5 "Graph Execution": one end-to-end envelope per Graph task
@@ -1492,6 +1542,10 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         "Payload": "cq_build_running",
         "Kernel": "good",
         "CompletionPublish": "cq_build_passed",
+        "ExecutorDrainPublish": "thread_state_runnable",
+        "WaitForExit": "thread_state_iowait",
+        "FinalStatsPublish": "cq_build_passed",
+        "ExitAckPublish": "good",
         "Drain": "terrible",
     }
     for phase in aicore_scheduler_phases or []:
@@ -1503,6 +1557,16 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             "taskId": task_id,
             "duration-us": phase["duration_us"],
         }
+        for field in (
+            "atomic_count",
+            "poll_count",
+            "poll_time_us",
+            "poll_avg_time_us",
+            "backoff_time_us",
+            "other_time_us",
+        ):
+            if field in phase:
+                phase_args[field] = phase[field]
         event_name = f"{phase_name}({task_label})"
         phase_event = {
             "args": phase_args,
@@ -1546,6 +1610,57 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             scheduler_task_tid[key] = phase_event["tid"]
             event_id += 1
         events.append(phase_event)
+
+    if aicpu_lifecycle_phases:
+        events.append(
+            {"args": {"name": "AICPU Lifecycle"}, "cat": "__metadata", "name": "process_name", "ph": "M", "pid": 6}
+        )
+        events.append(
+            {"args": {"sort_index": 2}, "cat": "__metadata", "name": "process_sort_index", "ph": "M", "pid": 6}
+        )
+        lifecycle_threads = sorted({phase["aicpu_thread_id"] for phase in aicpu_lifecycle_phases})
+        for thread_id in lifecycle_threads:
+            events.append(
+                {
+                    "args": {"name": f"AICPU_{thread_id} Lifecycle"},
+                    "cat": "__metadata",
+                    "name": "thread_name",
+                    "ph": "M",
+                    "pid": 6,
+                    "tid": thread_id + 1,
+                }
+            )
+        lifecycle_colors = {
+            "WaitExecutors": "thread_state_iowait",
+            "WaitResolved": "thread_state_iowait",
+            "CompletionDecision": "thread_state_runnable",
+            "RegisterRelease": "good",
+            "ExitSignalToAck": "terrible",
+        }
+        for phase in aicpu_lifecycle_phases:
+            worker_id = phase["worker_id"]
+            worker_label = "global" if worker_id == 0xFFFFFFFFFFFFFFFF else f"worker_{worker_id}"
+            phase_args = {
+                "worker_id": worker_id,
+                "core_type": phase["core_type"],
+                "duration-us": phase["duration_us"],
+            }
+            for field in ("poll_count", "error_poll_count", "poll_time_us", "poll_avg_time_us"):
+                if field in phase:
+                    phase_args[field] = phase[field]
+            events.append(
+                {
+                    "args": phase_args,
+                    "cat": "aicpu_lifecycle",
+                    "cname": lifecycle_colors.get(phase["phase"], "generic_work"),
+                    "name": f"{phase['phase']}({worker_label})",
+                    "ph": "X",
+                    "pid": 6,
+                    "tid": phase["aicpu_thread_id"] + 1,
+                    "ts": phase["start_time_us"],
+                    "dur": phase["duration_us"],
+                }
+            )
 
     # Duration events (Complete events "X")
     aicpu_worker_anchor_map: dict[int, list[dict]] = defaultdict(list)
@@ -3028,6 +3143,7 @@ def main():
             emit_overhead=args.overhead,
             aicore_resolve_phases=data.get("aicore_resolve_phases"),
             aicore_scheduler_phases=data.get("aicore_scheduler_phases"),
+            aicpu_lifecycle_phases=data.get("aicpu_lifecycle_phases"),
         )
         if args.overhead and deps_edges is None:
             print(

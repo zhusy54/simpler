@@ -17,13 +17,16 @@
 #include "common/core_type.h"
 
 class Runtime;
+struct AicpuCoreLifecycleTraceV1;
 
 class AicoreLifecycle {
 public:
     int32_t pre_handshake_init(Runtime *runtime, int32_t aicpu_thread_num, uint64_t regs_base);
     void handshake_partition(Runtime *runtime, int32_t tidx, int32_t nthreads);
     int32_t post_handshake_init(Runtime *runtime);
-    int32_t shutdown(int32_t thread_idx, Runtime *runtime);
+    int32_t release_partition(int32_t thread_idx, bool start_execution);
+    void signal_shutdown_partition(int32_t thread_idx);
+    int32_t finish_shutdown_partition(int32_t thread_idx, Runtime *runtime);
     void deinit();
 
 private:
@@ -33,9 +36,8 @@ private:
         uint64_t reg_addr;
         uint32_t physical_core_id;
         CoreType core_type;
+        AicpuCoreLifecycleTraceV1 *trace;
     };
-
-    void emergency_shutdown();
 
     CoreState cores_[kMaxWorkers]{};
     uint32_t physical_core_ids_[kMaxWorkers]{};

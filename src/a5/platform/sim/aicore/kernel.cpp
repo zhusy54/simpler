@@ -35,6 +35,7 @@ static pthread_key_t g_reg_base_key;
 static pthread_key_t g_core_id_key;
 static pthread_key_t g_block_idx_key;
 static pthread_key_t g_aicore_profiling_flag_key;
+static pthread_key_t g_aicore_entry_cycles_key;
 // Slot pointer (NOT the dereferenced head address) — see
 // aicore_profiling_state.h for the lazy-deref contract.
 static pthread_key_t g_chip_swimlane_aicore_head_slot_key;
@@ -48,6 +49,7 @@ static void create_tls_keys() {
     pthread_key_create(&g_core_id_key, nullptr);
     pthread_key_create(&g_block_idx_key, nullptr);
     pthread_key_create(&g_aicore_profiling_flag_key, nullptr);
+    pthread_key_create(&g_aicore_entry_cycles_key, nullptr);
     pthread_key_create(&g_chip_swimlane_aicore_head_slot_key, nullptr);
     pthread_key_create(&g_chip_swimlane_aicore_head_key, nullptr);
     pthread_key_create(&g_aicore_pmu_ring_key, nullptr);
@@ -70,6 +72,12 @@ __aicore__ void set_aicore_profiling_flag(uint32_t flag) {
 }
 __aicore__ uint32_t get_aicore_profiling_flag() {
     return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pthread_getspecific(g_aicore_profiling_flag_key)));
+}
+__aicore__ void set_aicore_entry_cycles(uint64_t cycles) {
+    pthread_setspecific(g_aicore_entry_cycles_key, reinterpret_cast<void *>(static_cast<uintptr_t>(cycles)));
+}
+__aicore__ uint64_t get_aicore_entry_cycles() {
+    return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(pthread_getspecific(g_aicore_entry_cycles_key)));
 }
 
 __aicore__ void set_chip_swimlane_aicore_head_slot(__gm__ uint64_t *slot_ptr) {
@@ -127,6 +135,9 @@ extern "C" void aicore_execute_wrapper(
     uint32_t enable_profiling_flag, uint64_t chip_swimlane_aicore_rotation_table, uint64_t aicore_pmu_ring_addrs
 ) {
     pthread_once(&g_tls_once, create_tls_keys);
+    const uint64_t aicore_entry_cycles =
+        (enable_profiling_flag & SIMPLER_DFX_FLAG_CHIP_SWIMLANE) ? get_sys_cnt_aicore() : 0;
+    set_aicore_entry_cycles(aicore_entry_cycles);
 
     // Set up simulated register base for this thread.
     // regs points to an array of uint64_t base addresses (one per core).

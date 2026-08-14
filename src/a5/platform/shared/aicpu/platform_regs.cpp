@@ -36,10 +36,9 @@ void platform_init_aicore_regs(uint64_t reg_addr) {
     write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
 }
 
-int32_t platform_deinit_aicore_regs(uint64_t reg_addr) {
-    // Send exit signal to AICore
-    write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
+void platform_signal_aicore_exit(uint64_t reg_addr) { write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL); }
 
+int32_t platform_wait_aicore_exit(uint64_t reg_addr) {
     // Wait for AICore to acknowledge exit by writing AICORE_EXITED_VALUE to COND.
     // Timeout is variant-specific (sim wider than onboard) — see
     // inner_get_deinit_timeout_ticks declaration in platform_regs.h.
@@ -56,6 +55,11 @@ int32_t platform_deinit_aicore_regs(uint64_t reg_addr) {
     // Initialize task dispatch register to idle state
     write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
     return 0;
+}
+
+int32_t platform_deinit_aicore_regs(uint64_t reg_addr) {
+    platform_signal_aicore_exit(reg_addr);
+    return platform_wait_aicore_exit(reg_addr);
 }
 
 uint32_t platform_get_physical_cores_count() {

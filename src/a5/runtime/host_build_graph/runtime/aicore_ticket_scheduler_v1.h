@@ -62,11 +62,11 @@ inline __host__ __aicore__ uint64_t aicore_scheduler_cycles_v1() {
 
 struct AicorePendingSlotV1 {
     int64_t task_id;
-    int32_t fanin_count;
     int32_t next_fanin_index;
     int32_t waiting_producer;
     uint16_t kernel_id;
     uint8_t subtask_slot;
+    uint8_t has_fanin;
     uint8_t payload_needs_observe;
     uint64_t stream_index;
     uint64_t claim_start_cycles;
@@ -82,10 +82,10 @@ inline __host__ __aicore__ void aicore_pending_clear_v1(AicorePendingSlotV1 *slo
     *slot = {
         AICORE_TASK_ID_INVALID_V1,
         0,
-        0,
         static_cast<int32_t>(AICORE_TASK_ID_INVALID_V1),
         UINT16_MAX,
         UINT8_MAX,
+        0,
         0,
         0,
         0,
@@ -110,9 +110,8 @@ inline __host__ __aicore__ __gm__ AicoreCompletionInboxV1 *aicore_completion_inb
     );
 }
 
-inline __host__ __aicore__ __gm__ AicoreTaskClaimBindingV1 *aicore_claim_binding_at_v1(
-    __gm__ void *sidecar_base, __gm__ const AicoreRunControlV1 *run_control, int64_t task_id
-) {
+inline __host__ __aicore__ __gm__ AicoreTaskClaimBindingV1 *
+aicore_claim_binding_at_v1(__gm__ void *sidecar_base, __gm__ const AicoreRunControlV1 *run_control, int64_t task_id) {
     return aicore_sidecar_at_v1<AicoreTaskClaimBindingV1>(
         sidecar_base,
         run_control->claim_bindings_offset + static_cast<uint64_t>(task_id) * sizeof(AicoreTaskClaimBindingV1)
@@ -136,8 +135,7 @@ inline __host__ __aicore__ AicoreTaskClaimBindingV1 aicore_make_claim_binding_v1
 }
 
 inline __aicore__ void aicore_publish_claim_binding_v1(
-    __gm__ void *sidecar_base, __gm__ const AicoreRunControlV1 *run_control,
-    const AicoreTaskClaimBindingV1 &binding
+    __gm__ void *sidecar_base, __gm__ const AicoreRunControlV1 *run_control, const AicoreTaskClaimBindingV1 &binding
 ) {
     __gm__ AicoreTaskClaimBindingV1 *destination =
         aicore_claim_binding_at_v1(sidecar_base, run_control, binding.task_id);
@@ -224,25 +222,23 @@ inline __host__ AicoreRootStatusV0 aicore_make_task_ticket_v1(
     }
     __gm__ uint8_t *payload = aicore_graph_payload_v0(graph, task_id);
     *ticket = aicore_task_ticket_make_v1(
-        static_cast<uint32_t>(task_id),
-        static_cast<uint16_t>(task.kernel_id),
-        static_cast<uint8_t>(task.subtask_slot),
-        *reinterpret_cast<__gm__ int32_t *>(payload + AICORE_GRAPH_FANIN_COUNT_OFFSET_V0)
+        static_cast<uint32_t>(task_id), static_cast<uint16_t>(task.kernel_id), static_cast<uint8_t>(task.subtask_slot),
+        *reinterpret_cast<__gm__ int32_t *>(payload + AICORE_GRAPH_FANIN_COUNT_OFFSET_V0) != 0
     );
     return AicoreRootStatusV0::OK;
 }
 
 inline __host__ __aicore__ void aicore_pending_initialize_v1(
-    const AicoreTaskTicketV1 &ticket, uint64_t stream_index, AicoreClaimKindV1 claim_kind,
-    uint64_t claim_start_cycles, uint64_t claim_end_cycles, AicorePendingSlotV1 *slot
+    const AicoreTaskTicketV1 &ticket, uint64_t stream_index, AicoreClaimKindV1 claim_kind, uint64_t claim_start_cycles,
+    uint64_t claim_end_cycles, AicorePendingSlotV1 *slot
 ) {
     *slot = {
         static_cast<int64_t>(aicore_task_ticket_task_id_v1(ticket)),
-        aicore_task_ticket_fanin_count_v1(ticket),
         0,
         static_cast<int32_t>(AICORE_TASK_ID_INVALID_V1),
         aicore_task_ticket_kernel_id_v1(ticket),
         aicore_task_ticket_subtask_slot_v1(ticket),
+        static_cast<uint8_t>(aicore_task_ticket_has_fanin_v1(ticket) ? 1 : 0),
         0,
         stream_index,
         claim_start_cycles,
@@ -252,11 +248,9 @@ inline __host__ __aicore__ void aicore_pending_initialize_v1(
     };
 }
 
-inline __host__ __aicore__ void aicore_load_task_ticket_v1(
-    __gm__ const AicoreTaskTicketV1 *source, AicoreTaskTicketV1 *ticket
-) {
-    ticket->task_and_fanin = source->task_and_fanin;
-    ticket->kernel_and_subtask = source->kernel_and_subtask;
+inline __host__ __aicore__ void
+aicore_load_task_ticket_v1(__gm__ const AicoreTaskTicketV1 *source, AicoreTaskTicketV1 *ticket) {
+    ticket->packed = source->packed;
 }
 
 inline __aicore__ AicoreRouteResultV1 aicore_route_task_v1(
@@ -336,8 +330,7 @@ inline __aicore__ AicoreRouteResultV1 aicore_route_task_v1(
 
 inline __aicore__ bool aicore_materialize_claim_payload_v1(
     const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *context,
-    __gm__ AicoreRunControlV1 *run_control, const AicoreTaskClaimBindingV1 &binding,
-    bool publish_payload
+    __gm__ AicoreRunControlV1 *run_control, const AicoreTaskClaimBindingV1 &binding, bool publish_payload
 ) {
     if (binding.task_id < 0 || static_cast<uint64_t>(binding.task_id) >= graph.task_count ||
         binding.pending_slot >= AICORE_PENDING_SLOT_COUNT_V1 || binding.dispatch_payload_offset == 0) {
@@ -354,8 +347,7 @@ inline __aicore__ bool aicore_materialize_claim_payload_v1(
     };
     __gm__ PTO2DispatchPayload *payload =
         aicore_sidecar_at_v1<PTO2DispatchPayload>(sidecar_base, binding.dispatch_payload_offset);
-    AicoreRootStatusV0 status =
-        aicore_materialize_task_payload_v0(graph, task, binding.callable_address, payload);
+    AicoreRootStatusV0 status = aicore_materialize_task_payload_v0(graph, task, binding.callable_address, payload);
     if (status != AicoreRootStatusV0::OK) {
         aicore_record_scheduler_error_v1(run_control, binding.task_id, status, &graph, context);
         return false;
@@ -366,16 +358,13 @@ inline __aicore__ bool aicore_materialize_claim_payload_v1(
 
 inline __aicore__ bool aicore_finalize_ready_v1(
     const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *context,
-    __gm__ AicoreRunControlV1 *run_control, const AicoreTaskClaimBindingV1 &binding,
-    bool publish_payload, bool trace_enabled = false
+    __gm__ AicoreRunControlV1 *run_control, const AicoreTaskClaimBindingV1 &binding, bool publish_payload,
+    bool trace_enabled = false
 ) {
-    if (!aicore_materialize_claim_payload_v1(
-            graph, sidecar_base, context, run_control, binding, publish_payload
-        )) {
+    if (!aicore_materialize_claim_payload_v1(graph, sidecar_base, context, run_control, binding, publish_payload)) {
         return false;
     }
-    __gm__ AicoreTaskControlV1 *control =
-        aicore_task_control_at_v1(sidecar_base, context, binding.task_id);
+    __gm__ AicoreTaskControlV1 *control = aicore_task_control_at_v1(sidecar_base, context, binding.task_id);
     if (trace_enabled) {
         control->ready_publish_cycles = aicore_scheduler_cycles_v1();
         aicore_publish_cache_line_v0(&control->next_waiter);
@@ -388,32 +377,38 @@ inline __aicore__ AicorePendingStateV1 aicore_pending_state_v1(
     __gm__ void *sidecar_base, __gm__ const AicoreWorkerContextV1 *context, AicorePendingSlotV1 *slot
 ) {
     if (slot == nullptr || slot->task_id < 0) return AicorePendingStateV1::EMPTY;
-    if (slot->fanin_count == 0) return AicorePendingStateV1::READY;
+    if (slot->has_fanin == 0) return AicorePendingStateV1::READY;
     __gm__ AicoreTaskControlV1 *control = aicore_task_control_at_v1(sidecar_base, context, slot->task_id);
     int64_t state = aicore_gm_load_v0(control->state);
-    if (state == static_cast<int64_t>(AicoreTaskStateV1::BLOCKED)) {
-        aicore_observe_cache_line_v0(&control->next_waiter);
-        slot->next_fanin_index = control->next_fanin_index;
-        slot->waiting_producer = control->waiting_producer;
-        return AicorePendingStateV1::BLOCKED;
-    }
+    if (state == static_cast<int64_t>(AicoreTaskStateV1::BLOCKED)) return AicorePendingStateV1::BLOCKED;
     if (state == static_cast<int64_t>(AicoreTaskStateV1::READY)) return AicorePendingStateV1::READY;
     return AicorePendingStateV1::ERROR;
 }
 
+inline __aicore__ bool aicore_refresh_pending_debug_v1(
+    __gm__ void *sidecar_base, __gm__ const AicoreWorkerContextV1 *context, AicorePendingSlotV1 *slot
+) {
+    if (slot == nullptr || slot->task_id < 0 || slot->has_fanin == 0) return false;
+    __gm__ AicoreTaskControlV1 *control = aicore_task_control_at_v1(sidecar_base, context, slot->task_id);
+    int32_t previous_fanin = slot->next_fanin_index;
+    int32_t previous_producer = slot->waiting_producer;
+    aicore_observe_cache_line_v0(&control->next_waiter);
+    slot->next_fanin_index = control->next_fanin_index;
+    slot->waiting_producer = control->waiting_producer;
+    return previous_fanin != slot->next_fanin_index || previous_producer != slot->waiting_producer;
+}
+
 inline __aicore__ bool aicore_claim_ticket_v1(
-    __gm__ void *sidecar_base, __gm__ AicoreTaskStreamV1 *stream, uint64_t *stream_index,
-    AicoreTaskTicketV1 *ticket
+    __gm__ void *sidecar_base, __gm__ AicoreTaskStreamV1 *stream, uint64_t *stream_index, AicoreTaskTicketV1 *ticket
 ) {
     if (stream_index == nullptr || ticket == nullptr) return false;
     uint64_t index = aicore_gm_fetch_add_v0(stream->next_index, UINT64_C(1));
     *stream_index = index;
     if (index >= stream->task_count) {
-        ticket->task_and_fanin = UINT32_MAX;
+        ticket->packed = UINT32_MAX;
         return false;
     }
-    __gm__ AicoreTaskTicketV1 *tickets =
-        aicore_sidecar_at_v1<AicoreTaskTicketV1>(sidecar_base, stream->tickets_offset);
+    __gm__ AicoreTaskTicketV1 *tickets = aicore_sidecar_at_v1<AicoreTaskTicketV1>(sidecar_base, stream->tickets_offset);
     aicore_load_task_ticket_v1(&tickets[index], ticket);
     return true;
 }
@@ -439,8 +434,7 @@ inline __aicore__ bool aicore_complete_and_wake_v1(
         __gm__ AicoreTaskControlV1 *waiter_control = aicore_task_control_at_v1(sidecar_base, context, waiter);
         int64_t next = aicore_observe_next_waiter_v1(waiter_control);
         if (stats != nullptr) ++stats->wake_migrate_count;
-        AicoreRouteResultV1 route =
-            aicore_route_task_v1(graph, sidecar_base, context, run_control, waiter, stats);
+        AicoreRouteResultV1 route = aicore_route_task_v1(graph, sidecar_base, context, run_control, waiter, stats);
         if (route == AicoreRouteResultV1::ERROR) {
             return false;
         }
@@ -531,9 +525,7 @@ inline __aicore__ bool aicore_resolve_completion_v1(
         if (route == AicoreRouteResultV1::READY_TO_PUBLISH) {
             AicoreTaskClaimBindingV1 binding{};
             if (!aicore_observe_claim_binding_v1(sidecar_base, run_control, waiter, &binding) ||
-                !aicore_finalize_ready_v1(
-                    graph, sidecar_base, context, run_control, binding, true, trace_enabled
-                )) {
+                !aicore_finalize_ready_v1(graph, sidecar_base, context, run_control, binding, true, trace_enabled)) {
                 return false;
             }
         }

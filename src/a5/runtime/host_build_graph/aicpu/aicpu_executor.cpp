@@ -23,6 +23,8 @@
 
 #include "aicore_lifecycle.h"
 #include "aicpu/cache_maintenance.h"
+#include "aicpu/chip_swimlane_collector_aicpu.h"
+#include "aicpu/device_time.h"
 #include "../common/pto_runtime_status.h"
 #include "pto_shared_memory.h"
 #include "runtime.h"
@@ -49,13 +51,17 @@ struct AicpuExecutor {
     // exposes no affinity idx (sim, where platform_aicpu_affinity_thread_idx()
     // is -1 during init) so the threads don't all collapse to leader 0.
     std::atomic<bool> hs_setup_done_{false};
+    std::atomic<bool> hs_config_done_{false};
     std::atomic<int32_t> hs_arrived_{0};
+    std::atomic<int32_t> hs_release_arrived_{0};
     std::atomic<int32_t> hs_thread_seq_{0};
 
     int32_t aicpu_thread_num_{0};
 
     simpler::ThreadCompletionGate completion_gate_;
-    std::atomic<bool> runtime_init_ready_{false};
+    std::atomic<bool> shutdown_ready_{false};
+    std::atomic<int32_t> shutdown_signaled_{0};
+    std::atomic<int32_t> run_status_{0};
 
     // AICPU owns only the AICore launch/teardown lifecycle. AICore owns graph
     // ticket ownership, private pending polling, and task execution.
@@ -90,7 +96,8 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     // dominant preamble cost (serial MMIO, ~217 µs of ~283 µs for 72 cores), so
     // it is parallelized: the leader (tidx 0) does the shared setup, every
     // thread handshakes a disjoint slice of cores, then the leader finishes init
-    // after a barrier. Non-leaders spin on init_done_.
+    // across two barriers: discovery precedes configuration, and all register
+    // releases precede init completion.
     int32_t nthreads = runtime->aicpu_thread_num;
     if (nthreads == 0) nthreads = 1;
     if (nthreads < 1 || nthreads > PLATFORM_MAX_AICPU_THREADS) {
@@ -126,41 +133,56 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         aicpu_thread_num_ = nthreads;
 
         hs_arrived_.store(0, std::memory_order_relaxed);
+        hs_release_arrived_.store(0, std::memory_order_relaxed);
         if (aicore_lifecycle_.pre_handshake_init(runtime, aicpu_thread_num_, get_platform_regs()) != 0) {
             init_failed_.store(true, std::memory_order_release);
-            hs_setup_done_.store(true, std::memory_order_release);
-            return -1;
         }
         hs_setup_done_.store(true, std::memory_order_release);
     } else {
         while (!hs_setup_done_.load(std::memory_order_acquire)) {
-            if (init_failed_.load(std::memory_order_acquire)) return -1;
+            SPIN_WAIT_HINT();
         }
-        if (init_failed_.load(std::memory_order_acquire)) return -1;
     }
 
     // All threads: handshake this thread's slice of cores in parallel.
     aicore_lifecycle_.handshake_partition(runtime, tidx, nthreads);
 
-    // Barrier: leader waits for every slice to finish, then completes init.
+    // Barrier 1: every thread discovers its core slice before the leader builds
+    // and publishes the topology-dependent execution configuration.
     hs_arrived_.fetch_add(1, std::memory_order_acq_rel);
     if (is_leader) {
-        while (hs_arrived_.load(std::memory_order_acquire) < nthreads) {}
+        while (hs_arrived_.load(std::memory_order_acquire) < nthreads)
+            SPIN_WAIT_HINT();
         completion_gate_.reset();
-        if (aicore_lifecycle_.post_handshake_init(runtime) != 0) {
+        if (!init_failed_.load(std::memory_order_acquire) && aicore_lifecycle_.post_handshake_init(runtime) != 0) {
             init_failed_.store(true, std::memory_order_release);
-            init_done_.store(true, std::memory_order_release);
-            return -1;
         }
-        init_done_.store(true, std::memory_order_release);
-        LOG_INFO("AicpuExecutor: Init complete");
+        hs_config_done_.store(true, std::memory_order_release);
     } else {
-        while (!init_done_.load(std::memory_order_acquire)) {
-            if (init_failed_.load(std::memory_order_acquire)) return -1;
-        }
-        if (init_failed_.load(std::memory_order_acquire)) return -1;
+        while (!hs_config_done_.load(std::memory_order_acquire))
+            SPIN_WAIT_HINT();
     }
-    return 0;
+
+    // The DMB register is the execution gate. On success each AICPU thread
+    // opens its own slice only after the shared configuration is visible. On
+    // failure the same partitioned path sends EXIT and waits for every ACK.
+    if (aicore_lifecycle_.release_partition(tidx, !init_failed_.load(std::memory_order_acquire)) != 0) {
+        init_failed_.store(true, std::memory_order_release);
+    }
+
+    // Barrier 2: init cannot return until every successful slice is released,
+    // or every failed slice has acknowledged EXIT.
+    hs_release_arrived_.fetch_add(1, std::memory_order_acq_rel);
+    if (is_leader) {
+        while (hs_release_arrived_.load(std::memory_order_acquire) < nthreads)
+            SPIN_WAIT_HINT();
+        init_done_.store(true, std::memory_order_release);
+        if (!init_failed_.load(std::memory_order_acquire)) LOG_INFO("AicpuExecutor: Init complete");
+    } else {
+        while (!init_done_.load(std::memory_order_acquire))
+            SPIN_WAIT_HINT();
+    }
+    return init_failed_.load(std::memory_order_acquire) ? -1 : 0;
 }
 
 /**
@@ -176,95 +198,54 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         );
         return -1;
     }
-    int32_t run_rc = 0;
-
-    // The supervisor discovers topology and publishes the active ticket workers.
-    if (runtime->aicore_sidecar_base == nullptr || runtime->host_total_tasks < 0) {
-        LOG_ERROR("A5 HBG AICore scheduler requires an initialized graph");
-        run_rc = -1;
-        runtime_init_ready_.store(true, std::memory_order_release);
-    } else if (thread_idx == aicpu_thread_num_ - 1) {
-        auto *run_control = aicore_sidecar_at_v1<AicoreRunControlV1>(
-            runtime->aicore_sidecar_base, runtime->aicore_sidecar_layout.run_control_offset
-        );
-        auto *contexts = aicore_sidecar_at_v1<AicoreWorkerContextV1>(
-            runtime->aicore_sidecar_base, runtime->aicore_sidecar_layout.worker_contexts_offset
-        );
-        while (true) {
-            cache_invalidate_range(run_control, sizeof(*run_control));
-            if (run_control->attached_count == static_cast<uint64_t>(runtime->worker_count)) {
-                break;
-            }
-            SPIN_WAIT_HINT();
-        }
-
-        cache_invalidate_range(contexts, static_cast<size_t>(runtime->worker_count) * sizeof(*contexts));
-        int32_t aic_count = 0;
-        int32_t aiv_count = 0;
-        for (int32_t i = 0; i < runtime->worker_count; ++i) {
-            if (static_cast<CoreType>(contexts[i].core_type) == CoreType::AIC) {
-                contexts[i].type_rank = aic_count++;
-            } else {
-                contexts[i].type_rank = aiv_count++;
-            }
-            contexts[i].active = 0;
-        }
-
-        const int32_t active_aic = static_cast<int32_t>(
-            std::min<uint64_t>(static_cast<uint64_t>(aic_count), runtime->aicore_sidecar_layout.aic_task_count)
-        );
-        const int32_t active_aiv_executors = static_cast<int32_t>(
-            std::min<uint64_t>(static_cast<uint64_t>(aiv_count), runtime->aicore_sidecar_layout.aiv_task_count)
-        );
-        const uint64_t executable_task_count =
-            runtime->aicore_sidecar_layout.aic_task_count + runtime->aicore_sidecar_layout.aiv_task_count;
-        const int32_t active_aiv =
-            aiv_count == 0 ? 0 : std::max(active_aiv_executors, executable_task_count != 0 ? 1 : 0);
-        for (int32_t i = 0; i < runtime->worker_count; ++i) {
-            const bool is_aiv = static_cast<CoreType>(contexts[i].core_type) == CoreType::AIV;
-            const int32_t active_count = is_aiv ? active_aiv : active_aic;
-            contexts[i].active = contexts[i].type_rank < active_count ? 1 : 0;
-            contexts[i].inbox_index =
-                is_aiv && contexts[i].active != 0 ? static_cast<uint64_t>(contexts[i].type_rank) : UINT64_MAX;
-        }
-        auto *aic_stream = aicore_sidecar_at_v1<AicoreTaskStreamV1>(
-            runtime->aicore_sidecar_base, runtime->aicore_sidecar_layout.aic_stream_offset
-        );
-        auto *aiv_stream = aicore_sidecar_at_v1<AicoreTaskStreamV1>(
-            runtime->aicore_sidecar_base, runtime->aicore_sidecar_layout.aiv_stream_offset
-        );
-        aic_stream->initial_ticket_count = static_cast<uint64_t>(active_aic);
-        aic_stream->next_index = static_cast<uint64_t>(active_aic);
-        aiv_stream->initial_ticket_count = static_cast<uint64_t>(active_aiv_executors);
-        aiv_stream->next_index = static_cast<uint64_t>(active_aiv_executors);
-        run_control->active_worker_count = static_cast<uint64_t>(active_aic) + static_cast<uint64_t>(active_aiv);
-        run_control->aic_active_worker_count = static_cast<uint64_t>(active_aic);
-        run_control->aiv_active_worker_count = static_cast<uint64_t>(active_aiv);
-        cache_flush_range(contexts, static_cast<size_t>(runtime->worker_count) * sizeof(*contexts));
-        cache_flush_range(aic_stream, sizeof(*aic_stream));
-        cache_flush_range(aiv_stream, sizeof(*aiv_stream));
-
-        if ((runtime->aicore_sidecar_layout.aic_task_count != 0 && active_aic == 0) ||
-            (runtime->aicore_sidecar_layout.aiv_task_count != 0 && active_aiv_executors == 0) ||
-            (executable_task_count != 0 && active_aiv == 0)) {
-            LOG_ERROR(
-                "A5 HBG AICore scheduler: topology cannot execute graph (tasks AIC=%" PRIu64 " AIV=%" PRIu64
-                ", cores AIC=%d AIV=%d)",
-                runtime->aicore_sidecar_layout.aic_task_count, runtime->aicore_sidecar_layout.aiv_task_count, aic_count,
-                aiv_count
+    if (thread_idx == aicpu_thread_num_ - 1) {
+        int32_t supervisor_rc = 0;
+        if (runtime->aicore_sidecar_base == nullptr || runtime->host_total_tasks < 0) {
+            LOG_ERROR("A5 HBG AICore scheduler requires an initialized graph");
+            supervisor_rc = -1;
+        } else {
+            auto *run_control = aicore_sidecar_at_v1<AicoreRunControlV1>(
+                runtime->aicore_sidecar_base, runtime->aicore_sidecar_layout.run_control_offset
             );
-            run_rc = -1;
-        } else if (run_control->active_worker_count != 0) {
-            run_control->startup_phase = static_cast<uint64_t>(AicoreRunPhaseV1::RUN);
-            cache_flush_range(run_control, 128);
+            const uint64_t executable_task_count =
+                runtime->aicore_sidecar_layout.aic_task_count + runtime->aicore_sidecar_layout.aiv_task_count;
+            const bool trace_enabled = is_chip_swimlane_enabled();
+            const uint64_t completion_wait_start_cycles = trace_enabled ? get_sys_cnt_aicpu() : 0;
+            uint64_t all_executors_drained_cycles = 0;
+            uint64_t all_tasks_resolved_cycles = 0;
+            uint64_t completion_poll_count = 0;
+            uint64_t completion_poll_cycles = 0;
+            uint64_t error_poll_total = 0;
+            uint32_t error_poll_count = 0;
             while (true) {
-                cache_invalidate_range(run_control, sizeof(*run_control));
-                if (run_control->drained_worker_count == run_control->active_worker_count ||
-                    run_control->scheduler_error != 0) {
+                const uint64_t poll_start = trace_enabled ? get_sys_cnt_aicpu() : 0;
+                cache_invalidate_range(reinterpret_cast<uint8_t *>(run_control) + 128, 128);
+                const bool executors_drained =
+                    run_control->executor_drained_worker_count == run_control->active_worker_count;
+                const bool tasks_resolved = run_control->resolved_task_count == executable_task_count;
+                if (trace_enabled) {
+                    const uint64_t poll_end = get_sys_cnt_aicpu();
+                    ++completion_poll_count;
+                    completion_poll_cycles += poll_end - poll_start;
+                    if (executors_drained && all_executors_drained_cycles == 0) {
+                        all_executors_drained_cycles = poll_end;
+                    }
+                    if (executors_drained && tasks_resolved && all_tasks_resolved_cycles == 0) {
+                        all_tasks_resolved_cycles = poll_end;
+                    }
+                }
+                if (executors_drained && tasks_resolved) {
                     break;
+                }
+                if (++error_poll_count == 64) {
+                    error_poll_count = 0;
+                    ++error_poll_total;
+                    cache_invalidate_range(reinterpret_cast<uint8_t *>(run_control) + 256, 128);
+                    if (run_control->scheduler_error != 0) break;
                 }
                 SPIN_WAIT_HINT();
             }
+            cache_invalidate_range(reinterpret_cast<uint8_t *>(run_control) + 128, 256);
             if (run_control->scheduler_error != 0) {
                 LOG_ERROR(
                     "A5 HBG AICore scheduler: graph execution failed at task=%" PRIu64 " status=%" PRIu64
@@ -275,34 +256,42 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                     run_control->error_descriptors_address, run_control->error_payloads_address,
                     run_control->error_task_window_mask
                 );
-                run_rc = -1;
+                supervisor_rc = -1;
+            }
+            if (supervisor_rc == 0 && run_control->executed_task_count + run_control->inline_completed_count !=
+                                          run_control->expected_task_count) {
+                LOG_ERROR(
+                    "A5 HBG AICore scheduler: count mismatch expected=%" PRIu64 " executed=%" PRIu64 " inline=%" PRIu64,
+                    run_control->expected_task_count, run_control->executed_task_count,
+                    run_control->inline_completed_count
+                );
+                supervisor_rc = -1;
+            }
+            if (trace_enabled) {
+                run_control->completion_wait_start_cycles = completion_wait_start_cycles;
+                run_control->all_executors_drained_cycles = all_executors_drained_cycles;
+                run_control->all_tasks_resolved_cycles = all_tasks_resolved_cycles;
+                run_control->shutdown_ready_cycles = get_sys_cnt_aicpu();
+                run_control->completion_poll_count = completion_poll_count;
+                run_control->completion_poll_cycles = completion_poll_cycles;
+                run_control->error_poll_count = error_poll_total;
+                cache_flush_range(reinterpret_cast<uint8_t *>(run_control) + 128, 128);
             }
         }
-
-        run_control->exit_requested = 1;
-        run_control->startup_phase = static_cast<uint64_t>(AicoreRunPhaseV1::EXIT);
-        cache_flush_range(run_control, 128);
-        while (true) {
-            cache_invalidate_range(run_control, sizeof(*run_control));
-            if (run_control->finished_count == static_cast<uint64_t>(runtime->worker_count)) break;
-            SPIN_WAIT_HINT();
-        }
-        if (run_rc == 0 && run_control->executed_task_count + run_control->inline_completed_count !=
-                               run_control->expected_task_count) {
-            LOG_ERROR(
-                "A5 HBG AICore scheduler: count mismatch expected=%" PRIu64 " executed=%" PRIu64 " inline=%" PRIu64,
-                run_control->expected_task_count, run_control->executed_task_count, run_control->inline_completed_count
-            );
-            run_rc = -1;
-        }
-        runtime_init_ready_.store(true, std::memory_order_release);
+        run_status_.store(supervisor_rc, std::memory_order_release);
+        shutdown_ready_.store(true, std::memory_order_release);
     } else {
-        while (!runtime_init_ready_.load(std::memory_order_acquire))
+        while (!shutdown_ready_.load(std::memory_order_acquire))
             SPIN_WAIT_HINT();
     }
 
-    int32_t m0_shutdown_rc = aicore_lifecycle_.shutdown(thread_idx, runtime);
-    if (m0_shutdown_rc != 0 && run_rc == 0) run_rc = m0_shutdown_rc;
+    int32_t run_rc = run_status_.load(std::memory_order_acquire);
+    aicore_lifecycle_.signal_shutdown_partition(thread_idx);
+    shutdown_signaled_.fetch_add(1, std::memory_order_acq_rel);
+    while (shutdown_signaled_.load(std::memory_order_acquire) < aicpu_thread_num_)
+        SPIN_WAIT_HINT();
+    int32_t shutdown_rc = aicore_lifecycle_.finish_shutdown_partition(thread_idx, runtime);
+    if (shutdown_rc != 0 && run_rc == 0) run_rc = shutdown_rc;
     completion_gate_.arrive_and_finalize_if_last(aicpu_thread_num_, [] {});
     return run_rc;
 }
@@ -316,7 +305,9 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     aicore_lifecycle_.deinit();
 
     completion_gate_.reset();
-    runtime_init_ready_.store(false, std::memory_order_release);
+    shutdown_ready_.store(false, std::memory_order_release);
+    shutdown_signaled_.store(0, std::memory_order_release);
+    run_status_.store(0, std::memory_order_release);
 
     aicpu_thread_num_ = 0;
 
@@ -325,7 +316,9 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     init_done_.store(false, std::memory_order_release);
     init_failed_.store(false, std::memory_order_release);
     hs_setup_done_.store(false, std::memory_order_release);
+    hs_config_done_.store(false, std::memory_order_release);
     hs_arrived_.store(0, std::memory_order_release);
+    hs_release_arrived_.store(0, std::memory_order_release);
     hs_thread_seq_.store(0, std::memory_order_release);
     thread_idx_.store(0, std::memory_order_release);
 

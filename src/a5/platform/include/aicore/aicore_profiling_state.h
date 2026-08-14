@@ -65,6 +65,9 @@
 __aicore__ void set_aicore_profiling_flag(uint32_t flag);
 __aicore__ uint32_t get_aicore_profiling_flag();
 
+__aicore__ void set_aicore_entry_cycles(uint64_t cycles);
+__aicore__ uint64_t get_aicore_entry_cycles();
+
 /**
  * Per-core AICore head channel.
  *

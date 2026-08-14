@@ -128,6 +128,22 @@ void write_reg(uint64_t reg_base_addr, RegId reg, uint64_t value);
 void platform_init_aicore_regs(uint64_t reg_addr);
 
 /**
+ * Publish the AICore exit signal without waiting for an acknowledgement.
+ *
+ * Separating publication from acknowledgement lets every AICPU thread signal
+ * its core slice before any thread enters the serial MMIO polling loop.
+ */
+void platform_signal_aicore_exit(uint64_t reg_addr);
+
+/**
+ * Wait for an AICore exit acknowledgement and restore the dispatch register.
+ *
+ * @param reg_addr  Register base address of the AICore
+ * @return 0 if the core acknowledged exit, non-zero on timeout
+ */
+int32_t platform_wait_aicore_exit(uint64_t reg_addr);
+
+/**
  * Deinitialize AICore registers before termination
  *
  * This function sends exit signal and closes fast path control.

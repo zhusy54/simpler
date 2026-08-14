@@ -74,11 +74,29 @@ class TestHbgSingleAicRoot(SceneTestCase):
         assert capture["chip_swimlane_level"] == 1
         assert len(capture["aicore_tasks"]) == 1
         assert {phase["phase"] for phase in capture["aicore_scheduler_phases"]} == {
+            "AICoreEntryToHandshake",
+            "HandshakeToRegisterRelease",
+            "RegisterReleaseToDescriptorReady",
+            "DescriptorReadyToSeedClaim",
             "SeedClaim",
             "Payload",
             "Kernel",
-            "CompletionPublish",
+            "CompletionEnqueue",
+            "PostCompletion",
+            "ReadyScan",
+            "ReadyToPayload",
+            "ExecutorDrainPublish",
+            "WaitForExit",
+            "FinalStatsPublish",
+            "ExitAckPublish",
             "Drain",
+        }
+        assert {phase["phase"] for phase in capture["aicpu_lifecycle_phases"]} == {
+            "WaitExecutors",
+            "WaitResolved",
+            "CompletionDecision",
+            "RegisterRelease",
+            "ExitSignalToAck",
         }
         assert "aicore_resolve_phases" not in capture
         assert capture["aicpu_tasks"] == []

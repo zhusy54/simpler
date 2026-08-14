@@ -229,9 +229,55 @@ def test_aicore_ticket_scheduler_phases_replace_common_anchors_and_render_once(t
                         "worker_id": 1,
                         "core_type": 1,
                         "task_id": 0xFFFFFFFFFFFFFFFF,
-                        "phase": "Drain",
+                        "phase": "ExecutorDrainPublish",
                         "start_cycles": 151,
-                        "end_cycles": 153,
+                        "end_cycles": 155,
+                        "atomic_count": 2,
+                    },
+                    {
+                        "worker_id": 1,
+                        "core_type": 1,
+                        "task_id": 0xFFFFFFFFFFFFFFFF,
+                        "phase": "WaitForExit",
+                        "start_cycles": 155,
+                        "end_cycles": 170,
+                    },
+                    {
+                        "worker_id": 1,
+                        "core_type": 1,
+                        "task_id": 0xFFFFFFFFFFFFFFFF,
+                        "phase": "FinalStatsPublish",
+                        "start_cycles": 170,
+                        "end_cycles": 180,
+                    },
+                    {
+                        "worker_id": 1,
+                        "core_type": 1,
+                        "task_id": 0xFFFFFFFFFFFFFFFF,
+                        "phase": "Drain",
+                        "start_cycles": 180,
+                        "end_cycles": 182,
+                    },
+                ],
+                "aicpu_lifecycle_phases": [
+                    {
+                        "worker_id": 0xFFFFFFFFFFFFFFFF,
+                        "aicpu_thread_id": 1,
+                        "core_type": 0xFFFFFFFFFFFFFFFF,
+                        "phase": "WaitResolved",
+                        "start_cycles": 155,
+                        "end_cycles": 175,
+                        "poll_count": 4,
+                        "poll_cycles": 8,
+                        "error_poll_count": 1,
+                    },
+                    {
+                        "worker_id": 1,
+                        "aicpu_thread_id": 0,
+                        "core_type": 1,
+                        "phase": "ExitSignalToAck",
+                        "start_cycles": 175,
+                        "end_cycles": 181,
                     },
                 ],
             }
@@ -246,13 +292,24 @@ def test_aicore_ticket_scheduler_phases_replace_common_anchors_and_render_once(t
     assert [phase["phase"] for phase in parsed["aicore_scheduler_phases"]] == [
         "PendingWait",
         "Kernel",
+        "ExecutorDrainPublish",
+        "WaitForExit",
+        "FinalStatsPublish",
         "Drain",
     ]
+    wait_resolved = next(phase for phase in parsed["aicpu_lifecycle_phases"] if phase["phase"] == "WaitResolved")
+    assert wait_resolved["poll_count"] == 4
+    assert wait_resolved["poll_time_us"] == 8.0
+    assert wait_resolved["poll_avg_time_us"] == 2.0
+    assert wait_resolved["error_poll_count"] == 1
+    publish = next(phase for phase in parsed["aicore_scheduler_phases"] if phase["phase"] == "ExecutorDrainPublish")
+    assert publish["atomic_count"] == 2
     output_path = tmp_path / "merged_swimlane.json"
     sc.generate_chrome_trace_json(
         parsed["tasks"],
         str(output_path),
         aicore_scheduler_phases=parsed["aicore_scheduler_phases"],
+        aicpu_lifecycle_phases=parsed["aicpu_lifecycle_phases"],
     )
     events = json.loads(output_path.read_text())["traceEvents"]
     assert any(
@@ -269,7 +326,20 @@ def test_aicore_ticket_scheduler_phases_replace_common_anchors_and_render_once(t
     assert {event["name"] for event in events if event.get("cat") == "aicore_scheduler"} == {
         "PendingWait(t7)",
         "Kernel: task(t7)",
+        "ExecutorDrainPublish(worker)",
+        "WaitForExit(worker)",
+        "FinalStatsPublish(worker)",
         "Drain(worker)",
+    }
+    wait_event = next(event for event in events if event.get("name") == "WaitResolved(global)")
+    assert wait_event["args"] == {
+        "worker_id": 0xFFFFFFFFFFFFFFFF,
+        "core_type": "global",
+        "duration-us": 20.0,
+        "poll_count": 4,
+        "poll_time_us": 8.0,
+        "poll_avg_time_us": 2.0,
+        "error_poll_count": 1,
     }
 
 

@@ -6,10 +6,12 @@
 host: build, validate, relocate, and upload the complete graph
   → host: order AIC/AIV task streams by remaining critical-path length
           and build the execution sidecar
-  → AICPU: handshake workers, discover topology, publish active prefixes and RUN
+  → AICPU: handshake workers, discover topology, publish configuration,
+           then open each worker's DMB register gate
   → AICore: seed by type rank, claim tickets, route private pending tasks,
             execute kernels, enqueue completions, and resolve completion batches
-  → AICPU: wait for active workers to drain, publish EXIT, and tear down
+  → AICPU: centrally wait for executors and resolutions, broadcast DMB EXIT,
+           wait for every acknowledgement, and tear down
   → host: validate completions/counters and copy output tensors back
 ```
 
@@ -29,11 +31,12 @@ The 128-byte-aligned v1 sidecar contains:
 - one cache-line-isolated completion inbox per possible worker;
 - dependency-priority-ordered AIC and AIV task-ticket streams, each with an
   isolated cursor; every ticket carries the host-validated task ID, kernel ID,
-  subtask slot, and fanin count;
+  subtask slot, and a zero/nonzero-fanin flag;
 - split configuration, lifecycle, and first-error run-control cache lines;
 - two private dispatch payloads (one per pending slot), one claim-binding cache
   line per task, and one debug/statistics context per worker; and
-- per-task scheduler phase cells written only during level-1 capture.
+- per-task scheduler phase cells and per-core AICPU lifecycle cells written
+  only during level-1 capture.
 
 Inline-completed tasks start as `DONE` and do not enter either typed stream.
 
@@ -58,6 +61,11 @@ and subtask slot. Routing scans from the remembered fanin index
 and links a blocked consumer into the first incomplete producer's wake list.
 The consumer stays in its owner's pending slot; there is no ReadyQ and no
 execution ownership migration.
+
+Ready polling observes only the task-state cache line. The second control
+cache line contains diagnostic dependency progress and is refreshed when a
+task first waits, on the periodic scheduler diagnostic sample, and when the
+ticket cursor is exhausted.
 
 Routing does not publish `READY` when the final dependency is resolved. For a
 claim-ready task, the owner materializes its slot's payload and then publishes
@@ -98,11 +106,26 @@ cannot starve completions.
 
 For a graph with no AIV tasks, one AIV worker is activated as a resolver-only
 worker and skips seed/ticket execution. Cursor exhaustion plus empty pending
-slots marks `EXECUTOR_DRAINED`, but an AIV worker continues resolving. Final `drained_worker_count` is published only
-after every executor drained and the batch-updated resolved count equals the
-executable task count. There is no peer-core wake primitive, so an idle worker
-still performs bounded GM inbox checks followed by the existing local
-exponential backoff.
+slots publishes `executor_drained_worker_count`, but an AIV worker continues
+resolving. One AICPU supervisor polls the isolated lifecycle cache line until
+every executor has drained and the batch-updated resolved count equals the
+executable task count. AICore workers no longer duplicate those global polls.
+There is no peer-core wake primitive, so an idle resolver still performs
+bounded GM inbox checks followed by the existing local exponential backoff.
+
+Startup uses two AICPU barriers. All parallel handshake slices finish before
+the leader derives topology, active prefixes, inbox ownership, stream cursors,
+and PMU state. After those cache lines are published, every AICPU thread opens
+its disjoint DMB register slice; the second barrier prevents init from returning
+before all cores are released. An initialization failure uses the same slices
+to send DMB `EXIT` and wait for acknowledgement.
+
+After central completion, every AICPU thread first broadcasts `EXIT` to its
+slice. A barrier guarantees that all signals are issued before any thread waits
+for acknowledgements. Each AICore observes only its local DMB register in the
+scheduler loop, publishes final worker statistics, acknowledges exit, and
+returns. DFX and PMU finalization happen only after the corresponding slice has
+acknowledged.
 
 ## Validation and diagnostics
 
@@ -115,7 +138,8 @@ Host validation checks:
   executable task count;
 - worker and run-control execution totals match both typed streams;
 - inline plus executable counts match the graph task count;
-- active, executor-drained, resolver-drained, and finished worker counts agree;
+- the active and executor-drained worker counts agree, and the resolved count
+  matches the executable task count;
 - each typed cursor reached or passed its stream length.
 
 The first scheduler error records task, worker, graph-address, and window
@@ -125,14 +149,24 @@ blocked slot changes producer, the typed cursor is exhausted, and the worker
 drains. Seed, successful ticket claim, and task completion do not publish a
 snapshot on the steady-state path.
 
-Level-1 chip-swimlane capture exports `SeedClaim`, `TicketClaim`,
-`PendingWait`, `Payload`, `Kernel`, `CompletionEnqueue`,
+Level-1 chip-swimlane capture exports `AICoreEntryToHandshake`,
+`HandshakeToRegisterRelease`, `RegisterReleaseToDescriptorReady`,
+`DescriptorReadyToSeedClaim`, `SeedClaim`,
+`TicketClaim`, `PendingWait`, `Payload`, `Kernel`, `CompletionEnqueue`,
 `PostCompletion`, `CompletionService`, `TraceCommit`, scheduler-loop detail,
 `ReadyScan`, `ReadyToPayload`, `CompletionBatchClaim`, `WakeResolve`,
-`ReadyPublish`, and `Drain` phases. These phases partition the same-worker
+`ReadyPublish`, `ExecutorDrainPublish`, `WaitForExit`, `FinalStatsPublish`,
+`ExitAckPublish`, and `Drain` AICore phases. Separate AICPU lifecycle lanes
+export global `WaitExecutors`, `WaitResolved`, and `CompletionDecision`, plus
+per-core `RegisterRelease` and `ExitSignalToAck`. These phases partition the same-worker
 inter-task scheduling gap from `CompletionEnqueue` end to `Payload` start.
-Drain-time counters include own/steal batches, link publication waits,
-enqueue-to-resolve lag, and READY-to-kernel lag.
+The termination phases expose executor-drain publication, the AICPU's central
+executor and completion-resolution waits, DMB-exit latency, poll counts,
+atomic-poll instruction-window cycles, and local backoff cycles.
+Result-dependent A5 pipeline retirement can appear in the wait phase's residual
+time rather than the bracketed atomic-poll cycles. Final statistics include own/steal
+batches, link publication waits, enqueue-to-resolve lag, and READY-to-kernel
+lag.
 The host STRACE tree also exposes `simpler_run.bind.ticket_stream_plan` for
 the stream-planning cost.
 See [profiling_levels.md](profiling_levels.md).
