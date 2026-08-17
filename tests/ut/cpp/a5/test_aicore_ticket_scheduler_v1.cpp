@@ -179,6 +179,7 @@ TEST(AicoreSidecarV1, PlansOnlyTypedStreamsTaskControlsAndTrace) {
     EXPECT_EQ(layout.aicpu_lifecycle_traces_offset % alignof(AicpuCoreLifecycleTraceV1), 0u);
     EXPECT_EQ(layout.claim_bindings_offset % alignof(AicoreTaskClaimBindingV1), 0u);
     EXPECT_EQ(layout.completion_inboxes_offset % alignof(AicoreCompletionInboxV1), 0u);
+    EXPECT_EQ(layout.root_prepare_inboxes_offset % alignof(AicoreRootPrepareInboxV1), 0u);
     EXPECT_EQ(layout.aic_stream_offset % alignof(AicoreTaskStreamV1), 0u);
     EXPECT_EQ(layout.aic_tickets_offset % alignof(AicoreTaskTicketV1), 0u);
     EXPECT_EQ(layout.aiv_stream_offset % alignof(AicoreTaskStreamV1), 0u);
@@ -207,6 +208,10 @@ TEST(AicoreSidecarV1, PlansOnlyTypedStreamsTaskControlsAndTrace) {
     auto *inboxes = aicore_sidecar_at_v1<AicoreCompletionInboxV1>(storage.base(), layout.completion_inboxes_offset);
     for (uint64_t inbox = 0; inbox < AICORE_WORKER_CAPACITY_V1; ++inbox)
         EXPECT_EQ(inboxes[inbox].head, AICORE_COMPLETION_INBOX_EMPTY_V1);
+    auto *root_prepare_inboxes =
+        aicore_sidecar_at_v1<AicoreRootPrepareInboxV1>(storage.base(), layout.root_prepare_inboxes_offset);
+    for (uint64_t inbox = 0; inbox < AICORE_WORKER_CAPACITY_V1; ++inbox)
+        EXPECT_EQ(root_prepare_inboxes[inbox].head, AICORE_ROOT_PREPARE_INBOX_EMPTY_V1);
     auto *aic_stream = aicore_sidecar_at_v1<AicoreTaskStreamV1>(storage.base(), layout.aic_stream_offset);
     auto *aiv_stream = aicore_sidecar_at_v1<AicoreTaskStreamV1>(storage.base(), layout.aiv_stream_offset);
     EXPECT_EQ(aic_stream->tickets_offset, layout.aic_tickets_offset);
@@ -278,6 +283,127 @@ TEST(AicoreTicketSchedulerV1, ClaimedPendingSlotsMaterializeIndependentPayloads)
     EXPECT_EQ(second_payload->local_context.async_ctx.task_token.raw, 1u);
     EXPECT_EQ(first_payload->global_context.sub_block_id, 0u);
     EXPECT_EQ(second_payload->global_context.sub_block_id, 0u);
+}
+
+TEST(AicoreTicketSchedulerV1, RootPrepareBuildsPayloadBeforeReadyAndReusesLinkForCompletion) {
+    GraphBuffer graph_storage(1);
+    graph_storage.executable(0, AicoreRootCoreTypeV0::AIC);
+    AicoreReadonlyGraphV0 graph = graph_storage.graph();
+    AicoreExecutionSidecarLayoutV1 layout{};
+    ASSERT_TRUE(aicore_sidecar_plan_v1(1, 1, 0, &layout));
+    SidecarBuffer sidecar(layout);
+
+    AicoreWorkerContextV1 owner{};
+    owner.task_controls_offset = layout.task_controls_offset;
+    owner.completion_inboxes_offset = layout.completion_inboxes_offset;
+    owner.root_prepare_inboxes_offset = layout.root_prepare_inboxes_offset;
+    owner.dispatch_payload_offset = layout.dispatch_payloads_offset;
+    owner.worker_index = 7;
+    AicoreWorkerContextV1 resolver = owner;
+    resolver.core_type = static_cast<int32_t>(AicoreRootCoreTypeV0::AIV);
+    resolver.inbox_index = 0;
+    resolver.worker_index = 9;
+    AicoreRunControlV1 run_control{};
+    run_control.claim_bindings_offset = layout.claim_bindings_offset;
+    run_control.aiv_active_worker_count = 1;
+
+    AicoreTaskClaimBindingV1 binding = aicore_make_claim_binding_v1(&owner, 0, 1, 0, 0, fake_callable_address());
+    aicore_publish_claim_binding_v1(sidecar.base(), &run_control, binding);
+    AicoreRootPrepareStatsV1 root_stats{};
+    ASSERT_TRUE(aicore_enqueue_root_prepare_v1(
+        graph, sidecar.base(), &owner, &run_control, run_control.aiv_active_worker_count, 0, &root_stats
+    ));
+
+    AicorePendingSlotV1 pending{};
+    pending.task_id = 0;
+    pending.has_fanin = 0;
+    EXPECT_EQ(aicore_pending_state_v1(sidecar.base(), &owner, &pending), AicorePendingStateV1::BLOCKED);
+    auto *control = aicore_task_control_at_v1(sidecar.base(), &owner, 0);
+    EXPECT_EQ(control->state, static_cast<int64_t>(AicoreTaskStateV1::PREPARING));
+    EXPECT_EQ(run_control.resolved_task_count, 0u);
+
+    uint64_t root_victim_cursor = 0;
+    bool root_progress = false;
+    ASSERT_TRUE(aicore_service_root_prepare_inboxes_v1(
+        graph, sidecar.base(), &resolver, &run_control, run_control.aiv_active_worker_count, &root_victim_cursor,
+        &root_stats, &root_progress
+    ));
+    EXPECT_TRUE(root_progress);
+    EXPECT_EQ(control->state, static_cast<int64_t>(AicoreTaskStateV1::READY));
+    EXPECT_EQ(control->completion_next, AICORE_COMPLETION_LINK_UNPUBLISHED_V1);
+    EXPECT_EQ(root_stats.enqueue_count, 1u);
+    EXPECT_EQ(root_stats.resolve_count, 1u);
+    EXPECT_EQ(run_control.resolved_task_count, 0u);
+    auto *payload = aicore_sidecar_at_v1<PTO2DispatchPayload>(sidecar.base(), binding.dispatch_payload_offset);
+    EXPECT_NE(payload->function_bin_addr, 0u);
+    EXPECT_EQ(payload->local_context.async_ctx.task_token.raw, 0u);
+
+    AicoreCompletionStatsV1 completion_stats{};
+    AicoreWakeStatsV1 wake_stats{};
+    ASSERT_TRUE(aicore_enqueue_completion_v1(
+        graph, sidecar.base(), &owner, &run_control, run_control.aiv_active_worker_count, 0, &completion_stats
+    ));
+    uint64_t completion_victim_cursor = 0;
+    bool completion_progress = false;
+    ASSERT_TRUE(aicore_service_completion_inboxes_v1(
+        graph, sidecar.base(), &resolver, &run_control, run_control.aiv_active_worker_count, &completion_victim_cursor,
+        &wake_stats, &completion_stats, &completion_progress
+    ));
+    EXPECT_TRUE(completion_progress);
+    EXPECT_EQ(control->state, static_cast<int64_t>(AicoreTaskStateV1::DONE));
+    EXPECT_EQ(run_control.resolved_task_count, 1u);
+}
+
+TEST(AicoreTicketSchedulerV1, RootPrepareBatchesAndStealsWithoutLoss) {
+    constexpr int64_t kTaskCount = 8;
+    GraphBuffer graph_storage(kTaskCount);
+    for (int64_t task = 0; task < kTaskCount; ++task)
+        graph_storage.executable(static_cast<size_t>(task), AicoreRootCoreTypeV0::AIC);
+    AicoreReadonlyGraphV0 graph = graph_storage.graph();
+    AicoreExecutionSidecarLayoutV1 layout{};
+    ASSERT_TRUE(aicore_sidecar_plan_v1(kTaskCount, kTaskCount, 0, &layout));
+    SidecarBuffer sidecar(layout);
+    AicoreWorkerContextV1 owner{};
+    owner.task_controls_offset = layout.task_controls_offset;
+    owner.root_prepare_inboxes_offset = layout.root_prepare_inboxes_offset;
+    owner.dispatch_payload_offset = layout.dispatch_payloads_offset;
+    AicoreWorkerContextV1 resolver = owner;
+    resolver.core_type = static_cast<int32_t>(AicoreRootCoreTypeV0::AIV);
+    resolver.inbox_index = 0;
+    AicoreRunControlV1 run_control{};
+    run_control.claim_bindings_offset = layout.claim_bindings_offset;
+    run_control.aiv_active_worker_count = 2;
+    AicoreRootPrepareStatsV1 stats{};
+    for (int64_t task = 0; task < kTaskCount; ++task) {
+        AicoreWorkerContextV1 binding_owner = owner;
+        binding_owner.dispatch_payload_offset =
+            layout.dispatch_payloads_offset + static_cast<uint64_t>(task) * sizeof(PTO2DispatchPayload);
+        AicoreTaskClaimBindingV1 binding =
+            aicore_make_claim_binding_v1(&binding_owner, task, 1, 0, 0, fake_callable_address());
+        aicore_publish_claim_binding_v1(sidecar.base(), &run_control, binding);
+        ASSERT_TRUE(aicore_enqueue_root_prepare_v1(
+            graph, sidecar.base(), &owner, &run_control, run_control.aiv_active_worker_count, task, &stats
+        ));
+    }
+
+    uint64_t victim_cursor = 1;
+    for (int service = 0; service < 2; ++service) {
+        bool progress = false;
+        ASSERT_TRUE(aicore_service_root_prepare_inboxes_v1(
+            graph, sidecar.base(), &resolver, &run_control, run_control.aiv_active_worker_count, &victim_cursor, &stats,
+            &progress
+        ));
+        EXPECT_TRUE(progress);
+    }
+    EXPECT_EQ(stats.enqueue_count, static_cast<uint64_t>(kTaskCount));
+    EXPECT_EQ(stats.resolve_count, static_cast<uint64_t>(kTaskCount));
+    EXPECT_EQ(stats.batch_count, 2u);
+    EXPECT_EQ(stats.steal_count, 1u);
+    auto *controls = aicore_sidecar_at_v1<AicoreTaskControlV1>(sidecar.base(), layout.task_controls_offset);
+    for (int64_t task = 0; task < kTaskCount; ++task) {
+        EXPECT_EQ(controls[task].state, static_cast<int64_t>(AicoreTaskStateV1::READY));
+        EXPECT_EQ(controls[task].completion_next, AICORE_COMPLETION_LINK_UNPUBLISHED_V1);
+    }
 }
 
 TEST(AicoreSidecarV1, RejectsInvalidCountsAndOverflow) {

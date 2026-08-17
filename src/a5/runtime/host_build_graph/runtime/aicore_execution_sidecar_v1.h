@@ -36,11 +36,13 @@ inline constexpr int64_t AICORE_WAKE_LIST_OPEN_V1 = -1;
 inline constexpr int64_t AICORE_WAKE_LIST_CLOSED_V1 = -2;
 inline constexpr int64_t AICORE_COMPLETION_INBOX_EMPTY_V1 = -1;
 inline constexpr int64_t AICORE_COMPLETION_LINK_UNPUBLISHED_V1 = -2;
+inline constexpr int64_t AICORE_ROOT_PREPARE_INBOX_EMPTY_V1 = -1;
 
 enum class AicoreTaskStateV1 : int64_t {
     BLOCKED = 0,
     READY = 1,
     DONE = 2,
+    PREPARING = 3,
 };
 
 enum class AicoreClaimKindV1 : uint64_t {
@@ -59,6 +61,9 @@ struct alignas(128) AicoreTaskControlV1 {
     int64_t next_waiter;
     int32_t next_fanin_index;
     int32_t waiting_producer;
+    // RootPrepare and Completion reuse this intrusive link sequentially. The
+    // RootPrepare resolver restores UNPUBLISHED before it publishes READY, so
+    // execution completion can safely reuse the same field.
     volatile int64_t completion_next;
     uint64_t completion_enqueue_cycles;
     uint64_t completion_resolve_start_cycles;
@@ -72,6 +77,11 @@ struct alignas(128) AicoreCompletionInboxV1 {
     uint8_t atomic_line_padding[120];
 };
 
+struct alignas(128) AicoreRootPrepareInboxV1 {
+    volatile int64_t head;
+    uint8_t atomic_line_padding[120];
+};
+
 struct alignas(64) AicoreTaskClaimBindingV1 {
     int64_t task_id;
     uint64_t callable_address;
@@ -81,7 +91,9 @@ struct alignas(64) AicoreTaskClaimBindingV1 {
     uint8_t subtask_slot;
     uint8_t pending_slot;
     uint32_t reserved0;
-    uint64_t reserved[3];
+    uint64_t root_prepare_start_cycles;
+    uint64_t root_prepare_end_cycles;
+    uint64_t root_prepare_resolver_worker_id;
 };
 
 struct alignas(8) AicoreTaskTicketV1 {
@@ -133,7 +145,8 @@ struct alignas(128) AicoreRunControlV1 {
     uint64_t aic_active_worker_count;
     uint64_t aiv_active_worker_count;
     uint64_t claim_bindings_offset;
-    uint64_t config_reserved[8];
+    uint64_t expected_root_prepare_count;
+    uint64_t config_reserved[7];
 
     volatile uint64_t executed_task_count;
     volatile uint64_t executor_drained_worker_count;
@@ -195,7 +208,8 @@ struct alignas(128) AicoreWorkerContextV1 {
     int32_t pending_waiting_producer[AICORE_PENDING_SLOT_COUNT_V1];
     uint64_t cursor_exhausted;
     uint64_t lifecycle_state;
-    uint8_t debug_padding[80];
+    uint64_t root_prepare_inboxes_offset;
+    uint8_t debug_padding[72];
 
     uint64_t seeded_task_count;
     uint64_t ticket_claim_count;
@@ -238,7 +252,14 @@ struct alignas(128) AicoreWorkerContextV1 {
     uint64_t final_stats_publish_start_cycles;
     uint64_t final_stats_publish_end_cycles;
     uint64_t exit_ack_publish_cycles;
-    uint64_t termination_reserved[9];
+    uint64_t root_prepare_enqueue_count;
+    uint64_t root_prepare_batch_count;
+    uint64_t root_prepare_resolve_count;
+    uint64_t root_prepare_steal_count;
+    uint64_t root_prepare_link_wait_count;
+    uint64_t root_prepare_link_wait_max;
+    uint64_t root_prepare_cycles;
+    uint64_t termination_reserved[2];
 };
 
 struct alignas(128) AicoreTaskTraceCellV1 {
@@ -284,6 +305,7 @@ struct AicoreExecutionSidecarLayoutV1 {
     uint64_t claim_bindings_offset;
     uint64_t task_controls_offset;
     uint64_t completion_inboxes_offset;
+    uint64_t root_prepare_inboxes_offset;
     uint64_t aic_stream_offset;
     uint64_t aic_tickets_offset;
     uint64_t aiv_stream_offset;
@@ -299,6 +321,8 @@ static_assert(offsetof(AicoreTaskControlV1, next_waiter) == 64, "waiter metadata
 static_assert(offsetof(AicoreTaskControlV1, completion_next) == 80, "completion link offset changed");
 static_assert(sizeof(AicoreCompletionInboxV1) == 128, "completion inbox layout changed");
 static_assert(alignof(AicoreCompletionInboxV1) == 128, "completion inbox alignment changed");
+static_assert(sizeof(AicoreRootPrepareInboxV1) == 128, "root prepare inbox layout changed");
+static_assert(alignof(AicoreRootPrepareInboxV1) == 128, "root prepare inbox alignment changed");
 static_assert(sizeof(AicoreTaskClaimBindingV1) == 64, "claim binding must occupy one cache line");
 static_assert(alignof(AicoreTaskClaimBindingV1) == 64, "claim binding must be cache-line aligned");
 static_assert(sizeof(AicoreTaskTicketV1) == 8, "task ticket layout changed");
@@ -331,6 +355,8 @@ static_assert(std::is_standard_layout_v<AicoreTaskControlV1>);
 static_assert(std::is_trivially_copyable_v<AicoreTaskControlV1>);
 static_assert(std::is_standard_layout_v<AicoreCompletionInboxV1>);
 static_assert(std::is_trivially_copyable_v<AicoreCompletionInboxV1>);
+static_assert(std::is_standard_layout_v<AicoreRootPrepareInboxV1>);
+static_assert(std::is_trivially_copyable_v<AicoreRootPrepareInboxV1>);
 static_assert(std::is_standard_layout_v<AicoreTaskClaimBindingV1>);
 static_assert(std::is_trivially_copyable_v<AicoreTaskClaimBindingV1>);
 static_assert(std::is_standard_layout_v<AicoreTaskTicketV1>);
@@ -412,6 +438,10 @@ inline bool aicore_sidecar_plan_v1(
         !aicore_sidecar_reserve_v1(&cursor, bytes, alignof(AicoreTaskControlV1), &next.task_controls_offset) ||
         !aicore_sidecar_checked_mul_v1(AICORE_WORKER_CAPACITY_V1, sizeof(AicoreCompletionInboxV1), &bytes) ||
         !aicore_sidecar_reserve_v1(&cursor, bytes, alignof(AicoreCompletionInboxV1), &next.completion_inboxes_offset) ||
+        !aicore_sidecar_checked_mul_v1(AICORE_WORKER_CAPACITY_V1, sizeof(AicoreRootPrepareInboxV1), &bytes) ||
+        !aicore_sidecar_reserve_v1(
+            &cursor, bytes, alignof(AicoreRootPrepareInboxV1), &next.root_prepare_inboxes_offset
+        ) ||
         !aicore_sidecar_reserve_v1(
             &cursor, sizeof(AicoreTaskStreamV1), alignof(AicoreTaskStreamV1), &next.aic_stream_offset
         ) ||
@@ -456,6 +486,10 @@ inline bool aicore_sidecar_init_v1(void *base, const AicoreExecutionSidecarLayou
     auto *inboxes = aicore_sidecar_at_v1<AicoreCompletionInboxV1>(base, layout.completion_inboxes_offset);
     for (uint64_t i = 0; i < AICORE_WORKER_CAPACITY_V1; ++i)
         inboxes[i].head = AICORE_COMPLETION_INBOX_EMPTY_V1;
+    auto *root_prepare_inboxes =
+        aicore_sidecar_at_v1<AicoreRootPrepareInboxV1>(base, layout.root_prepare_inboxes_offset);
+    for (uint64_t i = 0; i < AICORE_WORKER_CAPACITY_V1; ++i)
+        root_prepare_inboxes[i].head = AICORE_ROOT_PREPARE_INBOX_EMPTY_V1;
     auto *aic_stream = aicore_sidecar_at_v1<AicoreTaskStreamV1>(base, layout.aic_stream_offset);
     aic_stream->tickets_offset = layout.aic_tickets_offset;
     aic_stream->task_count = layout.aic_task_count;

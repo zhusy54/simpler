@@ -1539,6 +1539,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         "SeedClaim": "thread_state_running",
         "TicketClaim": "thread_state_runnable",
         "PendingWait": "thread_state_iowait",
+        "RootPrepare": "cq_build_running",
         "Payload": "cq_build_running",
         "Kernel": "good",
         "CompletionPublish": "cq_build_passed",

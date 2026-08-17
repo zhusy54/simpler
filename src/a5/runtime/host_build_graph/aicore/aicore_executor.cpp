@@ -38,6 +38,7 @@ struct AicoreWorkerStatsV1 {
     uint64_t task_state_poll_count{0};
     AicoreWakeStatsV1 wake{};
     AicoreCompletionStatsV1 completion{};
+    AicoreRootPrepareStatsV1 root_prepare{};
     uint64_t idle_iteration_count{0};
     uint64_t backoff_cycles{0};
     uint64_t claim_cycles{0};
@@ -126,7 +127,15 @@ publish_worker_stats(__gm__ AicoreWorkerContextV1 *context, const AicoreWorkerSt
     context->final_stats_publish_start_cycles = stats.final_stats_publish_start_cycles;
     context->final_stats_publish_end_cycles = stats.final_stats_publish_end_cycles;
     context->exit_ack_publish_cycles = stats.exit_ack_publish_cycles;
+    context->root_prepare_enqueue_count = stats.root_prepare.enqueue_count;
+    context->root_prepare_batch_count = stats.root_prepare.batch_count;
+    context->root_prepare_resolve_count = stats.root_prepare.resolve_count;
+    context->root_prepare_steal_count = stats.root_prepare.steal_count;
+    context->root_prepare_link_wait_count = stats.root_prepare.link_wait_count;
+    context->root_prepare_link_wait_max = stats.root_prepare.link_wait_max;
+    context->root_prepare_cycles = stats.root_prepare.prepare_cycles;
     aicore_publish_cache_line_v0(&context->executor_drain_publish_start_cycles);
+    aicore_publish_cache_line_v0(&context->root_prepare_batch_count);
 }
 
 __aicore__ __attribute__((always_inline)) void refresh_worker_pending_debug(
@@ -258,6 +267,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         bool cursor_exhausted = !executor_worker;
         bool executor_drained = false;
         uint64_t victim_cursor = resolver_worker ? (worker_context->inbox_index + 1) % resolver_count : 0;
+        uint64_t root_prepare_victim_cursor = resolver_worker ? (worker_context->inbox_index + 1) % resolver_count : 0;
         uint64_t completions_since_service = 0;
         uint64_t previous_trace_commit_end = 0;
 
@@ -286,15 +296,24 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                 worker_context, seed_task_id, pending[0].kernel_id, pending[0].subtask_slot, 0,
                 runtime->func_id_to_addr_[pending[0].kernel_id]
             );
-            const bool seed_local_ready = pending[0].has_fanin == 0;
-            if (!seed_local_ready) aicore_publish_claim_binding_v1(sidecar_base, run_control, seed_binding);
+            const bool seed_root = pending[0].has_fanin == 0;
+            aicore_publish_claim_binding_v1(sidecar_base, run_control, seed_binding);
             payload_slot_used[0] = true;
             if (chip_swimlane_enabled) record_task_initialize_end(sidecar_base, worker_context, seed_task_id);
-            AicoreRouteResultV1 route = seed_local_ready ? AicoreRouteResultV1::READY :
-                                                           aicore_route_task_v1(
-                                                               graph, sidecar_base, worker_context, run_control,
-                                                               seed_task_id, &stats.wake, chip_swimlane_enabled, false
-                                                           );
+            AicoreRouteResultV1 route = AicoreRouteResultV1::ERROR;
+            if (seed_root) {
+                if (aicore_enqueue_root_prepare_v1(
+                        graph, sidecar_base, worker_context, run_control, resolver_count, seed_task_id,
+                        &stats.root_prepare
+                    )) {
+                    route = AicoreRouteResultV1::WAITING;
+                }
+            } else {
+                route = aicore_route_task_v1(
+                    graph, sidecar_base, worker_context, run_control, seed_task_id, &stats.wake, chip_swimlane_enabled,
+                    false
+                );
+            }
             if (route == AicoreRouteResultV1::ERROR || route == AicoreRouteResultV1::COMPLETED) {
                 if (route == AicoreRouteResultV1::COMPLETED) {
                     aicore_record_scheduler_error_v1(
@@ -376,17 +395,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                     sidecar_base, worker_context->dispatch_payload_offset +
                                       static_cast<uint64_t>(ready_slot) * sizeof(PTO2DispatchPayload)
                 );
-                if (task_pending.has_fanin == 0) {
-                    AicoreTaskClaimBindingV1 binding = aicore_make_claim_binding_v1(
-                        worker_context, task_pending.task_id, task_pending.kernel_id, task_pending.subtask_slot,
-                        static_cast<uint8_t>(ready_slot), runtime->func_id_to_addr_[task_pending.kernel_id]
-                    );
-                    if (!aicore_materialize_claim_payload_v1(
-                            graph, sidecar_base, worker_context, run_control, binding, false
-                        )) {
-                        break;
-                    }
-                } else if (task_pending.payload_needs_observe != 0) {
+                if (task_pending.payload_needs_observe != 0) {
                     aicore_observe_dispatch_payload_v1(dispatch_payload);
                 }
 
@@ -442,6 +451,13 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                         graph, sidecar_base, worker_context, run_control, resolver_count, &victim_cursor, &stats.wake,
                         &stats.completion, &resolved, chip_swimlane_enabled
                     );
+                    if (service_ok) {
+                        bool root_prepared = false;
+                        service_ok = aicore_service_root_prepare_inboxes_v1(
+                            graph, sidecar_base, worker_context, run_control, resolver_count,
+                            &root_prepare_victim_cursor, &stats.root_prepare, &root_prepared, chip_swimlane_enabled
+                        );
+                    }
                     completion_service_end = chip_swimlane_enabled ? get_sys_cnt_aicore() : 0;
                     completions_since_service = 0;
                 }
@@ -486,15 +502,24 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                         worker_context, task_id, pending[free_slot].kernel_id, pending[free_slot].subtask_slot,
                         static_cast<uint8_t>(free_slot), runtime->func_id_to_addr_[pending[free_slot].kernel_id]
                     );
-                    const bool local_ready = pending[free_slot].has_fanin == 0;
-                    if (!local_ready) aicore_publish_claim_binding_v1(sidecar_base, run_control, binding);
+                    const bool root_task = pending[free_slot].has_fanin == 0;
+                    aicore_publish_claim_binding_v1(sidecar_base, run_control, binding);
                     payload_slot_used[free_slot] = true;
                     if (chip_swimlane_enabled) record_task_initialize_end(sidecar_base, worker_context, task_id);
-                    AicoreRouteResultV1 route = local_ready ? AicoreRouteResultV1::READY :
-                                                              aicore_route_task_v1(
-                                                                  graph, sidecar_base, worker_context, run_control,
-                                                                  task_id, &stats.wake, chip_swimlane_enabled, false
-                                                              );
+                    AicoreRouteResultV1 route = AicoreRouteResultV1::ERROR;
+                    if (root_task) {
+                        if (aicore_enqueue_root_prepare_v1(
+                                graph, sidecar_base, worker_context, run_control, resolver_count, task_id,
+                                &stats.root_prepare
+                            )) {
+                            route = AicoreRouteResultV1::WAITING;
+                        }
+                    } else {
+                        route = aicore_route_task_v1(
+                            graph, sidecar_base, worker_context, run_control, task_id, &stats.wake,
+                            chip_swimlane_enabled, false
+                        );
+                    }
                     if (route == AicoreRouteResultV1::ERROR || route == AicoreRouteResultV1::COMPLETED) {
                         if (route == AicoreRouteResultV1::COMPLETED) {
                             aicore_record_scheduler_error_v1(
@@ -533,6 +558,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             for (uint32_t slot = 0; slot < AICORE_PENDING_SLOT_COUNT_V1; ++slot)
                 pending_empty = pending_empty && pending[slot].task_id < 0;
             bool completion_progress = false;
+            bool root_prepare_progress = false;
             if (resolver_worker) {
                 if (!aicore_service_completion_inboxes_v1(
                         graph, sidecar_base, worker_context, run_control, resolver_count, &victim_cursor, &stats.wake,
@@ -540,8 +566,14 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                     )) {
                     break;
                 }
+                if (!aicore_service_root_prepare_inboxes_v1(
+                        graph, sidecar_base, worker_context, run_control, resolver_count, &root_prepare_victim_cursor,
+                        &stats.root_prepare, &root_prepare_progress, chip_swimlane_enabled
+                    )) {
+                    break;
+                }
             }
-            if (completion_progress) {
+            if (completion_progress || root_prepare_progress) {
                 backoff_iterations = kInitialBackoffIterations;
                 continue;
             }

@@ -213,6 +213,14 @@ def test_aicore_ticket_scheduler_phases_replace_common_anchors_and_render_once(t
                         "worker_id": 1,
                         "core_type": 1,
                         "task_id": 7,
+                        "phase": "RootPrepare",
+                        "start_cycles": 102,
+                        "end_cycles": 104,
+                    },
+                    {
+                        "worker_id": 1,
+                        "core_type": 1,
+                        "task_id": 7,
                         "phase": "PendingWait",
                         "start_cycles": 105,
                         "end_cycles": 120,
@@ -290,6 +298,7 @@ def test_aicore_ticket_scheduler_phases_replace_common_anchors_and_render_once(t
     assert parsed["tasks"][0]["start_time_us"] == 25.0
     assert parsed["tasks"][0]["end_time_us"] == 50.0
     assert [phase["phase"] for phase in parsed["aicore_scheduler_phases"]] == [
+        "RootPrepare",
         "PendingWait",
         "Kernel",
         "ExecutorDrainPublish",
@@ -324,6 +333,7 @@ def test_aicore_ticket_scheduler_phases_replace_common_anchors_and_render_once(t
     )
     assert not any(event.get("cat") == "event" and event.get("name") == "task(t7)" for event in events)
     assert {event["name"] for event in events if event.get("cat") == "aicore_scheduler"} == {
+        "RootPrepare(t7)",
         "PendingWait(t7)",
         "Kernel: task(t7)",
         "ExecutorDrainPublish(worker)",
@@ -331,6 +341,8 @@ def test_aicore_ticket_scheduler_phases_replace_common_anchors_and_render_once(t
         "FinalStatsPublish(worker)",
         "Drain(worker)",
     }
+    root_prepare = next(event for event in events if event.get("name") == "RootPrepare(t7)")
+    assert root_prepare["cname"] == "cq_build_running"
     wait_event = next(event for event in events if event.get("name") == "WaitResolved(global)")
     assert wait_event["args"] == {
         "worker_id": 0xFFFFFFFFFFFFFFFF,
