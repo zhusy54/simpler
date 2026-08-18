@@ -201,8 +201,8 @@ __aicore__ bool bootstrap_dispatch_worker(
         AicoreRouteResultV1 second_route = AicoreRouteResultV1::ERROR;
         if (!aicore_prepare_dispatch_binding_v1(
                 graph, sidecar_base, resolver, run_control, target, target_worker_index, 1, second_ticket, stream_index,
-                AicoreClaimKindV1::TICKET, claim_start, claim_end, resolver->worker_index, &stats->wake, &second_binding,
-                &second_route, trace_enabled
+                AicoreClaimKindV1::TICKET, claim_start, claim_end, resolver->worker_index, &stats->wake,
+                &second_binding, &second_route, trace_enabled
             )) {
             return false;
         }
@@ -357,7 +357,16 @@ __aicore__ bool run_offloaded_dispatch_loop(
             uint32_t slot_index = static_cast<uint32_t>(ready_slot);
             __gm__ AicoreDispatchSlotV1 *slot =
                 aicore_dispatch_slot_at_v1(sidecar_base, context, context->worker_index, slot_index);
-            aicore_observe_cache_line_v0(slot);
+            __gm__ PTO2DispatchPayload *dispatch_payload = aicore_sidecar_at_v1<PTO2DispatchPayload>(
+                sidecar_base,
+                context->dispatch_payload_offset + static_cast<uint64_t>(slot_index) * sizeof(PTO2DispatchPayload)
+            );
+            uint64_t ready_observe = get_sys_cnt_aicore();
+            uint64_t payload_start = ready_observe;
+            aicore_invalidate_cache_line_v0(slot);
+            aicore_observe_dispatch_payload_control_v1(dispatch_payload);
+            aicore_observe_dispatch_payload_arguments_v1(dispatch_payload);
+            aicore_observe_dispatch_payload_barrier_v1();
             if (slot->pending_slot != slot_index || slot->task_id < 0 ||
                 static_cast<uint64_t>(slot->task_id) >= graph.task_count ||
                 slot->generation != aicore_dispatch_generation_v1(ready_publication)) {
@@ -382,19 +391,10 @@ __aicore__ bool run_offloaded_dispatch_loop(
             pending.pending_wait_start_cycles = slot->pending_wait_start_cycles;
             pending.claim_kind = static_cast<AicoreClaimKindV1>(slot->claim_kind);
 
-            uint64_t ready_observe = get_sys_cnt_aicore();
             uint64_t pending_wait_end = pending.pending_wait_start_cycles == 0 ? 0 : ready_observe;
             if (pending_wait_end != 0) {
                 stats->dependency_wait_cycles += pending_wait_end - pending.pending_wait_start_cycles;
             }
-            __gm__ PTO2DispatchPayload *dispatch_payload = aicore_sidecar_at_v1<PTO2DispatchPayload>(
-                sidecar_base,
-                context->dispatch_payload_offset + static_cast<uint64_t>(slot_index) * sizeof(PTO2DispatchPayload)
-            );
-            uint64_t payload_start = get_sys_cnt_aicore();
-            aicore_observe_dispatch_payload_control_v1(dispatch_payload);
-            aicore_observe_dispatch_payload_arguments_v1(dispatch_payload);
-            aicore_observe_dispatch_payload_barrier_v1();
             OUT_OF_ORDER_STORE_BARRIER();
 
             __gm__ ChipSwimlaneAicoreTaskRecord *profile_record =
