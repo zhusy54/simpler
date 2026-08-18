@@ -194,7 +194,7 @@ TEST(AicoreSidecarV1, PlansOnlyTypedStreamsTaskControlsAndTrace) {
     EXPECT_EQ(layout.aiv_stream_offset % alignof(AicoreTaskStreamV1), 0u);
     EXPECT_EQ(layout.aiv_tickets_offset % alignof(AicoreTaskTicketV1), 0u);
     EXPECT_EQ(layout.trace_cells_offset % alignof(AicoreTaskTraceCellV1), 0u);
-    EXPECT_EQ(sizeof(AicoreTaskTraceCellV1), 384u);
+    EXPECT_EQ(sizeof(AicoreTaskTraceCellV1), 256u);
 
     SidecarBuffer storage(layout);
     auto *lifecycle_traces =
@@ -415,18 +415,10 @@ TEST(AicoreTicketSchedulerV1, CompletionRefillConsumesPrefetchAndPublishesExecut
     EXPECT_EQ(root_stats.resolve_count, 1u);
     const auto *traces = aicore_sidecar_at_v1<AicoreTaskTraceCellV1>(sidecar.base(), layout.trace_cells_offset);
     const AicoreTaskTraceCellV1 &trace = traces[0];
-    EXPECT_LE(trace.completion_inbox_probe_start_cycles, trace.completion_inbox_detach_start_cycles);
-    EXPECT_LE(trace.completion_inbox_detach_start_cycles, trace.completion_inbox_detach_end_cycles);
-    EXPECT_LE(trace.completion_inbox_detach_end_cycles, trace.completion_node_start_cycles);
-    EXPECT_EQ(trace.completion_inbox_stolen, 0u);
+    EXPECT_LE(trace.completion_prepare_start_cycles, trace.refill_start_cycles);
     EXPECT_EQ(trace.refill_resolver_worker_id, resolver.worker_index);
     EXPECT_EQ(trace.refill_task_id, 1u);
-    EXPECT_LE(trace.refill_start_cycles, trace.refill_observe_end_cycles);
-    EXPECT_LE(trace.refill_observe_end_cycles, trace.refill_prefetch_take_end_cycles);
-    EXPECT_LE(trace.refill_prefetch_take_end_cycles, trace.refill_bind_route_end_cycles);
-    EXPECT_LE(trace.refill_bind_route_end_cycles, trace.refill_payload_publish_end_cycles);
-    EXPECT_LE(trace.refill_payload_publish_end_cycles, trace.refill_next_prefetch_end_cycles);
-    EXPECT_LE(trace.refill_next_prefetch_end_cycles, trace.refill_end_cycles);
+    EXPECT_LE(trace.refill_start_cycles, trace.refill_end_cycles);
 }
 
 TEST(AicoreTicketSchedulerV1, RootPrepareBuildsPayloadBeforeReadyAndReusesLinkForCompletion) {
@@ -715,11 +707,6 @@ TEST(AicoreTicketSchedulerV1, CompletionInboxBatchesAndStealsWithoutLoss) {
         EXPECT_EQ(controls[task].state, static_cast<int64_t>(AicoreTaskStateV1::DONE));
         EXPECT_EQ(controls[task].wake_list_head, AICORE_WAKE_LIST_CLOSED_V1);
     }
-    const auto *traces = aicore_sidecar_at_v1<AicoreTaskTraceCellV1>(sidecar.base(), layout.trace_cells_offset);
-    uint64_t stolen_heads = 0;
-    for (int64_t task = 0; task < kTaskCount; ++task)
-        stolen_heads += traces[task].completion_inbox_stolen;
-    EXPECT_EQ(stolen_heads, 1u);
 }
 
 TEST(AicoreTicketSchedulerV1, ConcurrentExecutorsPushOneInboxExactlyOnce) {

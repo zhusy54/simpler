@@ -543,13 +543,16 @@ bool append_aicore_scheduler_trace(
         if (trace.worker_id < static_cast<uint64_t>(runtime->worker_count)) {
             worker_traces[static_cast<size_t>(trace.worker_id)].push_back(&trace);
         }
+        const uint64_t trace_core_type = trace.worker_id < static_cast<uint64_t>(runtime->worker_count)
+                                             ? static_cast<uint64_t>(contexts[trace.worker_id].core_type)
+                                             : UINT64_MAX;
         const char *claim_phase = "TicketClaim";
         if (trace.claim_kind == static_cast<uint64_t>(AicoreClaimKindV1::SEED)) claim_phase = "SeedClaim";
         if (trace.claim_kind == static_cast<uint64_t>(AicoreClaimKindV1::PREFETCH)) claim_phase = "PrefetchClaim";
         if (trace.claim_kind == static_cast<uint64_t>(AicoreClaimKindV1::REFILL_FALLBACK)) {
             claim_phase = "RefillFallbackClaim";
         }
-        uint64_t claim_core_type = trace.core_type;
+        uint64_t claim_core_type = trace_core_type;
         if (trace.claim_worker_id < static_cast<uint64_t>(runtime->worker_count)) {
             claim_core_type = static_cast<uint64_t>(contexts[trace.claim_worker_id].core_type);
         }
@@ -559,153 +562,64 @@ bool append_aicore_scheduler_trace(
         );
         if (trace.claim_kind == static_cast<uint64_t>(AicoreClaimKindV1::SEED)) {
             emit(
-                trace.worker_id, trace.core_type, trace.task_id, "AICoreEntryToHandshake", trace.aicore_entry_cycles,
+                trace.worker_id, trace_core_type, trace.task_id, "AICoreEntryToHandshake", trace.aicore_entry_cycles,
                 trace.handshake_publish_cycles
             );
             emit(
-                trace.worker_id, trace.core_type, trace.task_id, "HandshakeToRegisterRelease",
+                trace.worker_id, trace_core_type, trace.task_id, "HandshakeToRegisterRelease",
                 trace.handshake_publish_cycles, trace.register_release_cycles
             );
             emit(
-                trace.worker_id, trace.core_type, trace.task_id, "RegisterReleaseToDescriptorReady",
+                trace.worker_id, trace_core_type, trace.task_id, "RegisterReleaseToDescriptorReady",
                 trace.register_release_cycles, trace.descriptor_cache_observed_cycles
             );
             emit(
-                trace.worker_id, trace.core_type, trace.task_id, "DescriptorReadyToSeedClaim",
+                trace.worker_id, trace_core_type, trace.task_id, "DescriptorReadyToSeedClaim",
                 trace.descriptor_cache_observed_cycles, trace.claim_start_cycles
             );
         }
         emit(
-            trace.worker_id, trace.core_type, trace.task_id, "PendingWait", trace.pending_wait_start_cycles,
+            trace.worker_id, trace_core_type, trace.task_id, "PendingWait", trace.pending_wait_start_cycles,
             trace.pending_wait_end_cycles
         );
-        if (trace.payload_cache_control_end_cycles >= trace.payload_start_cycles &&
-            trace.payload_cache_invalidate_end_cycles >= trace.payload_cache_control_end_cycles &&
-            trace.payload_observe_end_cycles >= trace.payload_cache_invalidate_end_cycles &&
-            trace.kernel_start_cycles >= trace.payload_observe_end_cycles) {
-            emit(
-                trace.worker_id, trace.core_type, trace.task_id, "PayloadCacheObserveCL0", trace.payload_start_cycles,
-                trace.payload_cache_control_end_cycles
-            );
-            emit(
-                trace.worker_id, trace.core_type, trace.task_id, "PayloadCacheObserveCL1To7",
-                trace.payload_cache_control_end_cycles, trace.payload_cache_invalidate_end_cycles
-            );
-            emit(
-                trace.worker_id, trace.core_type, trace.task_id, "PayloadCacheObserveBarrier",
-                trace.payload_cache_invalidate_end_cycles, trace.payload_observe_end_cycles
-            );
-            emit(
-                trace.worker_id, trace.core_type, trace.task_id, "PayloadSetup", trace.payload_observe_end_cycles,
-                trace.kernel_start_cycles
-            );
-        } else {
-            emit(
-                trace.worker_id, trace.core_type, trace.task_id, "Payload", trace.payload_start_cycles,
-                trace.kernel_start_cycles
-            );
-        }
         emit(
-            trace.worker_id, trace.core_type, trace.task_id, "Kernel", trace.kernel_start_cycles,
+            trace.worker_id, trace_core_type, trace.task_id, "Payload", trace.ready_observe_cycles,
+            trace.kernel_start_cycles
+        );
+        emit(
+            trace.worker_id, trace_core_type, trace.task_id, "Kernel", trace.kernel_start_cycles,
             trace.kernel_end_cycles
         );
         emit(
-            trace.worker_id, trace.core_type, trace.task_id, "CompletionEnqueue", trace.kernel_end_cycles,
+            trace.worker_id, trace_core_type, trace.task_id, "CompletionEnqueue", trace.kernel_end_cycles,
             trace.completion_end_cycles
         );
         emit(
-            trace.worker_id, trace.core_type, trace.task_id, "PostCompletion", trace.completion_end_cycles,
+            trace.worker_id, trace_core_type, trace.task_id, "PostCompletion", trace.completion_end_cycles,
             trace.completion_bookkeeping_end_cycles
         );
         emit(
-            trace.worker_id, trace.core_type, trace.task_id, "ReadyScan", trace.ready_scan_start_cycles,
+            trace.worker_id, trace_core_type, trace.task_id, "ReadyScan", trace.ready_scan_start_cycles,
             trace.ready_observe_cycles
-        );
-        emit(
-            trace.worker_id, trace.core_type, trace.task_id, "ReadyToPayload", trace.ready_observe_cycles,
-            trace.payload_base_load_start_cycles
-        );
-        emit(
-            trace.worker_id, trace.core_type, trace.task_id, "PayloadBaseAtomicLoad",
-            trace.payload_base_load_start_cycles, trace.payload_start_cycles
         );
         const AicoreTaskControlV1 &control = task_controls[task_id];
         const AicoreTaskClaimBindingV1 &binding = claim_bindings[task_id];
-        if (trace.completion_node_start_cycles != 0 &&
+        if (trace.completion_prepare_start_cycles != 0 &&
             trace.refill_resolver_worker_id < static_cast<uint64_t>(runtime->worker_count)) {
             const uint64_t resolver_worker_id = trace.refill_resolver_worker_id;
             const uint64_t resolver_core_type = static_cast<uint64_t>(contexts[resolver_worker_id].core_type);
-            const char *probe_phase =
-                trace.completion_inbox_stolen != 0 ? "CompletionInboxStealProbe" : "CompletionInboxProbe";
-            const char *detach_phase =
-                trace.completion_inbox_stolen != 0 ? "CompletionInboxStealDetach" : "CompletionInboxDetach";
-            if (trace.completion_inbox_probe_start_cycles != 0 &&
-                trace.completion_inbox_detach_start_cycles >= trace.completion_inbox_probe_start_cycles) {
+            if (trace.refill_start_cycles >= trace.completion_prepare_start_cycles) {
                 emit(
-                    resolver_worker_id, resolver_core_type, trace.task_id, probe_phase,
-                    trace.completion_inbox_probe_start_cycles, trace.completion_inbox_detach_start_cycles
-                );
-            }
-            if (trace.completion_inbox_detach_start_cycles != 0 &&
-                trace.completion_inbox_detach_end_cycles >= trace.completion_inbox_detach_start_cycles) {
-                emit(
-                    resolver_worker_id, resolver_core_type, trace.task_id, detach_phase,
-                    trace.completion_inbox_detach_start_cycles, trace.completion_inbox_detach_end_cycles
-                );
-            }
-            if (trace.completion_inbox_detach_end_cycles != 0 &&
-                trace.completion_node_start_cycles >= trace.completion_inbox_detach_end_cycles) {
-                emit(
-                    resolver_worker_id, resolver_core_type, trace.task_id, "CompletionBatchWalk",
-                    trace.completion_inbox_detach_end_cycles, trace.completion_node_start_cycles
-                );
-            }
-            if (trace.refill_start_cycles >= trace.completion_node_start_cycles) {
-                emit(
-                    resolver_worker_id, resolver_core_type, trace.task_id, "CompletionLinkObserve",
-                    trace.completion_node_start_cycles, trace.refill_start_cycles
+                    resolver_worker_id, resolver_core_type, trace.task_id, "CompletionBatchPrepare",
+                    trace.completion_prepare_start_cycles, trace.refill_start_cycles
                 );
             }
             if (trace.refill_start_cycles != 0 &&
                 trace.refill_task_id < runtime->aicore_sidecar_layout.task_count &&
-                trace.refill_observe_end_cycles >= trace.refill_start_cycles &&
-                trace.refill_prefetch_take_end_cycles >= trace.refill_observe_end_cycles &&
-                trace.refill_bind_route_end_cycles >= trace.refill_prefetch_take_end_cycles &&
-                trace.refill_payload_publish_end_cycles >= trace.refill_bind_route_end_cycles &&
-                trace.refill_next_prefetch_end_cycles >= trace.refill_payload_publish_end_cycles) {
+                trace.refill_end_cycles >= trace.refill_start_cycles) {
                 emit(
-                    resolver_worker_id, resolver_core_type, trace.refill_task_id, "SlotRefillObserve",
-                    trace.refill_start_cycles, trace.refill_observe_end_cycles
-                );
-                emit(
-                    resolver_worker_id, resolver_core_type, trace.refill_task_id, "SlotRefillTakePrefetch",
-                    trace.refill_observe_end_cycles, trace.refill_prefetch_take_end_cycles
-                );
-                const AicoreTaskTraceCellV1 &refilled_trace = traces[trace.refill_task_id];
-                if (refilled_trace.initialize_end_cycles >= trace.refill_prefetch_take_end_cycles &&
-                    refilled_trace.route_end_cycles >= refilled_trace.initialize_end_cycles &&
-                    trace.refill_bind_route_end_cycles >= refilled_trace.route_end_cycles) {
-                    emit(
-                        resolver_worker_id, resolver_core_type, trace.refill_task_id, "SlotRefillBind",
-                        trace.refill_prefetch_take_end_cycles, refilled_trace.initialize_end_cycles
-                    );
-                    emit(
-                        resolver_worker_id, resolver_core_type, trace.refill_task_id, "SlotRefillRoute",
-                        refilled_trace.initialize_end_cycles, trace.refill_bind_route_end_cycles
-                    );
-                } else {
-                    emit(
-                        resolver_worker_id, resolver_core_type, trace.refill_task_id, "SlotRefillBindRoute",
-                        trace.refill_prefetch_take_end_cycles, trace.refill_bind_route_end_cycles
-                    );
-                }
-                emit(
-                    resolver_worker_id, resolver_core_type, trace.refill_task_id, "SlotRefillPayloadPublish",
-                    trace.refill_bind_route_end_cycles, trace.refill_payload_publish_end_cycles
-                );
-                emit(
-                    resolver_worker_id, resolver_core_type, trace.refill_task_id, "SlotRefillNextPrefetch",
-                    trace.refill_payload_publish_end_cycles, trace.refill_next_prefetch_end_cycles
+                    resolver_worker_id, resolver_core_type, trace.refill_task_id, "SlotRefill",
+                    trace.refill_start_cycles, trace.refill_end_cycles
                 );
             }
         }
@@ -730,7 +644,7 @@ bool append_aicore_scheduler_trace(
             );
         }
         emit(
-            trace.worker_id, trace.core_type, trace.task_id, "ReadyPublish", control.ready_publish_cycles,
+            trace.worker_id, trace_core_type, trace.task_id, "ReadyPublish", control.ready_publish_cycles,
             control.ready_publish_cycles
         );
     }
@@ -744,12 +658,13 @@ bool append_aicore_scheduler_trace(
         for (size_t index = 1; index < worker_trace.size(); ++index) {
             const AicoreTaskTraceCellV1 &previous = *worker_trace[index - 1];
             const AicoreTaskTraceCellV1 &current = *worker_trace[index];
+            const uint64_t current_core_type = static_cast<uint64_t>(contexts[current.worker_id].core_type);
             const uint64_t transition_end = previous.completion_bookkeeping_end_cycles;
             uint64_t scheduler_start = transition_end;
             if (current.previous_trace_commit_end_cycles >= transition_end &&
                 current.previous_trace_commit_end_cycles <= current.ready_scan_start_cycles) {
                 emit(
-                    current.worker_id, current.core_type, current.task_id, "TraceCommit", transition_end,
+                    current.worker_id, current_core_type, current.task_id, "TraceCommit", transition_end,
                     current.previous_trace_commit_end_cycles
                 );
                 scheduler_start = current.previous_trace_commit_end_cycles;
@@ -762,49 +677,25 @@ bool append_aicore_scheduler_trace(
                                                current.ready_scan_start_cycles >= current.route_end_cycles;
             if (claimed_between_tasks) {
                 emit(
-                    current.worker_id, current.core_type, current.task_id, "SchedulerToClaim", scheduler_start,
+                    current.worker_id, current_core_type, current.task_id, "SchedulerToClaim", scheduler_start,
                     current.claim_start_cycles
                 );
                 emit(
-                    current.worker_id, current.core_type, current.task_id, "TaskInitialize", current.claim_end_cycles,
+                    current.worker_id, current_core_type, current.task_id, "TaskInitialize", current.claim_end_cycles,
                     current.initialize_end_cycles
                 );
                 emit(
-                    current.worker_id, current.core_type, current.task_id, "TaskRoute", current.initialize_end_cycles,
+                    current.worker_id, current_core_type, current.task_id, "TaskRoute", current.initialize_end_cycles,
                     current.route_end_cycles
                 );
                 emit(
-                    current.worker_id, current.core_type, current.task_id, "SchedulerToReadyScan",
+                    current.worker_id, current_core_type, current.task_id, "SchedulerToReadyScan",
                     current.route_end_cycles, current.ready_scan_start_cycles
                 );
             } else {
                 if (current.ready_scan_start_cycles < scheduler_start) continue;
-                uint64_t cursor = scheduler_start;
-                uint64_t remaining = current.ready_scan_start_cycles - scheduler_start;
-                uint64_t poll_cycles = std::min(current.inter_task_poll_cycles, remaining);
-                uint64_t publication_poll_cycles =
-                    std::min(current.inter_task_publication_poll_cycles, poll_cycles);
                 emit(
-                    current.worker_id, current.core_type, current.task_id, "InterTaskPublicationPoll", cursor,
-                    cursor + publication_poll_cycles
-                );
-                cursor += publication_poll_cycles;
-                remaining -= publication_poll_cycles;
-                poll_cycles -= publication_poll_cycles;
-                emit(
-                    current.worker_id, current.core_type, current.task_id, "InterTaskPollOverhead", cursor,
-                    cursor + poll_cycles
-                );
-                cursor += poll_cycles;
-                remaining -= poll_cycles;
-                uint64_t backoff_cycles = std::min(current.inter_task_backoff_cycles, remaining);
-                emit(
-                    current.worker_id, current.core_type, current.task_id, "InterTaskBackoff", cursor,
-                    cursor + backoff_cycles
-                );
-                cursor += backoff_cycles;
-                emit(
-                    current.worker_id, current.core_type, current.task_id, "InterTaskOther", cursor,
+                    current.worker_id, current_core_type, current.task_id, "InterTaskSchedule", scheduler_start,
                     current.ready_scan_start_cycles
                 );
             }

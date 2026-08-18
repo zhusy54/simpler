@@ -51,12 +51,9 @@ Supported AICore phase names are `AICoreEntryToHandshake`,
 `DescriptorReadyToSeedClaim`, `SeedClaim`,
 `TicketClaim`, `PendingWait`, `Payload`, `Kernel`, `CompletionEnqueue`, `PostCompletion`,
 `CompletionService`, `TraceCommit`, `SchedulerToClaim`, `TaskInitialize`, `TaskRoute`,
-`SchedulerToReadyScan`, `InterTaskSchedule`, `ReadyScan`, `ReadyToPayload`,
+`SchedulerToReadyScan`, `InterTaskSchedule`, `ReadyScan`,
 `CompletionBatchClaim`, `WakeResolve`, `ReadyPublish`, `ExecutorDrainPublish`,
-`CompletionInboxProbe`, `CompletionInboxDetach`, `CompletionInboxStealProbe`,
-`CompletionInboxStealDetach`, `CompletionBatchWalk`, `CompletionLinkObserve`,
-`SlotRefillObserve`, `SlotRefillTakePrefetch`, `SlotRefillBind`, `SlotRefillRoute`, `SlotRefillBindRoute`,
-`SlotRefillPayloadPublish`, `SlotRefillNextPrefetch`,
+`CompletionBatchPrepare`, `SlotRefill`,
 `WaitForExit`, `FinalStatsPublish`, `ExitAckPublish`, and `Drain`. The swimlane converter renders
 them on per-worker `Scheduler` lanes. Each `Kernel` phase also carries
 the resolved function name and serves as the task/dependency-flow anchor; the
@@ -72,7 +69,7 @@ lanes. Supported names are global `WaitExecutors`, `WaitResolved`, and
 For consecutive tasks on one worker, the interval from the previous task's
 `CompletionEnqueue` end to the current task's `Payload` start is partitioned
 into `PostCompletion`, optional `CompletionService`, `TraceCommit`, scheduler
-work, `ReadyScan`, and `ReadyToPayload`. `PostCompletion` covers the common
+work, `ReadyScan`, and `Payload`. `PostCompletion` covers the common
 profiling commit, statistics, pending-slot clear, and fairness bookkeeping.
 `CompletionService` is present every fourth completion on AIV workers and
 covers completion inbox service. `TraceCommit` isolates publication of the
@@ -85,8 +82,8 @@ When the next task is claimed inside this gap, scheduler work is split into
 `TaskRoute` covers dependency registration and READY/BLOCKED classification.
 Otherwise `InterTaskSchedule` covers the scheduler work between trace
 publication and the final pending-slot scan.
-`ReadyScan` covers that scan through observing READY, and `ReadyToPayload`
-covers local selection through payload materialization start. A task without a
+`ReadyScan` covers that scan through observing READY, and `Payload` covers
+local selection, payload cache observation, setup, and materialization. A task without a
 `PendingWait` phase was ready on its first observed scan.
 
 Only AIV workers emit `CompletionService`, `CompletionBatchClaim`, and
@@ -94,13 +91,12 @@ Only AIV workers emit `CompletionService`, `CompletionBatchClaim`, and
 performed by AIC workers.
 
 Completion refill tracing follows a successfully claimed inbox head through
-slot reuse. `CompletionInbox*Probe` covers the successful head observation,
-`CompletionInbox*Detach` covers the atomic exchange, `CompletionBatchWalk` and
-`CompletionLinkObserve` cover entry into the detached completion chain. The
-`SlotRefill*` phases then split binding/slot observation, prefetched-ticket
-consumption, binding and dependency routing, payload/READY publication, and
-replenishing the next prefetched ticket. Refill phases use the newly assigned
-task ID, while inbox phases use the completed task ID.
+slot reuse. `CompletionBatchPrepare` covers successful inbox observation and
+detach plus entry into and link observation within the detached completion
+chain. `SlotRefill` covers binding/slot observation, prefetched-ticket
+consumption, dependency routing, payload/READY publication, and replenishing
+the next prefetched ticket. Refill phases use the newly assigned task ID, while
+completion preparation uses the completed task ID.
 
 The termination tail is split across AICore and AICPU lanes.
 `ExecutorDrainPublish` covers the shared `executed_task_count` and
@@ -124,6 +120,11 @@ every executed task without contending for a shared append cursor. When the
 sidecar contains `Kernel` phases, the converter treats them as the authoritative
 task timing source and discards the sparse common anchors. Tracing is
 conditional on level 1; normal execution does not write trace cells.
+
+The Level-1 sidecar keeps coarse scheduler boundaries to limit observer cost:
+each task uses a 256-byte trace cell, payload and refill internals use one phase
+each, and idle scheduler polling is reported as `InterTaskSchedule` without
+per-poll timestamp sampling.
 
 Worker statistics are published after local DMB `EXIT` observation. They include completion
 enqueue, batch, resolve and steal counts; unpublished-link wait total/max;

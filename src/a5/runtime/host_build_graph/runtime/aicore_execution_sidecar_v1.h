@@ -341,51 +341,35 @@ struct alignas(128) AicoreTaskTraceCellV1 {
     volatile uint64_t valid;
     uint64_t claim_kind;
     uint64_t worker_id;
-    uint64_t core_type;
     uint64_t task_id;
-    uint64_t stream_index;
+    uint64_t claim_worker_id;
     uint64_t claim_start_cycles;
     uint64_t claim_end_cycles;
+    uint64_t previous_trace_commit_end_cycles;
+
     uint64_t pending_wait_start_cycles;
     uint64_t pending_wait_end_cycles;
-    uint64_t payload_start_cycles;
     uint64_t kernel_start_cycles;
     uint64_t kernel_end_cycles;
     uint64_t completion_end_cycles;
     uint64_t ready_scan_start_cycles;
     uint64_t ready_observe_cycles;
     uint64_t completion_bookkeeping_end_cycles;
-    uint64_t payload_base_load_start_cycles;
-    uint64_t inter_task_publication_poll_cycles;
-    uint64_t previous_trace_commit_end_cycles;
+
     uint64_t initialize_end_cycles;
     uint64_t route_end_cycles;
-    uint64_t claim_worker_id;
-    uint64_t payload_cache_control_end_cycles;
     uint64_t aicore_entry_cycles;
     uint64_t handshake_publish_cycles;
     uint64_t register_release_cycles;
     uint64_t descriptor_cache_observed_cycles;
-    uint64_t payload_cache_invalidate_end_cycles;
-    uint64_t payload_observe_end_cycles;
-    uint64_t inter_task_poll_cycles;
-    uint64_t inter_task_backoff_cycles;
-    uint64_t completion_inbox_probe_start_cycles;
-    uint64_t completion_inbox_detach_start_cycles;
-    uint64_t completion_inbox_detach_end_cycles;
-    uint64_t completion_node_start_cycles;
-    uint64_t completion_inbox_index;
-    uint64_t completion_inbox_stolen;
+    uint64_t execution_reserved[2];
+
+    uint64_t completion_prepare_start_cycles;
     uint64_t refill_resolver_worker_id;
-    uint64_t refill_reserved;
     uint64_t refill_start_cycles;
-    uint64_t refill_observe_end_cycles;
-    uint64_t refill_prefetch_take_end_cycles;
-    uint64_t refill_bind_route_end_cycles;
-    uint64_t refill_payload_publish_end_cycles;
-    uint64_t refill_next_prefetch_end_cycles;
     uint64_t refill_end_cycles;
     uint64_t refill_task_id;
+    uint64_t completion_refill_reserved[3];
 };
 
 struct AicoreExecutionSidecarLayoutV1 {
@@ -444,17 +428,17 @@ static_assert(
     offsetof(AicoreWorkerContextV1, executor_drain_publish_start_cycles) == 512,
     "worker termination trace offset changed"
 );
-static_assert(sizeof(AicoreTaskTraceCellV1) == 384, "task trace layout changed");
+static_assert(sizeof(AicoreTaskTraceCellV1) == 256, "task trace layout changed");
 static_assert(
-    offsetof(AicoreTaskTraceCellV1, completion_bookkeeping_end_cycles) == 128,
-    "post-completion trace needs its own line"
+    offsetof(AicoreTaskTraceCellV1, pending_wait_start_cycles) == 64, "execution timing needs its own line"
 );
-static_assert(offsetof(AicoreTaskTraceCellV1, aicore_entry_cycles) == 192, "startup trace needs its own line");
 static_assert(
-    offsetof(AicoreTaskTraceCellV1, completion_inbox_probe_start_cycles) == 256,
-    "completion inbox trace needs its own line"
+    offsetof(AicoreTaskTraceCellV1, initialize_end_cycles) == 128, "scheduler detail needs its own line"
 );
-static_assert(offsetof(AicoreTaskTraceCellV1, refill_start_cycles) == 320, "slot refill trace needs its own line");
+static_assert(
+    offsetof(AicoreTaskTraceCellV1, completion_prepare_start_cycles) == 192,
+    "completion refill trace needs its own line"
+);
 
 #if !defined(__CCE_AICORE__)
 #include <type_traits>

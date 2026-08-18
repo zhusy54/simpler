@@ -78,7 +78,7 @@ struct AicorePendingSlotV1 {
     uint8_t subtask_slot;
     uint8_t has_fanin;
     uint8_t payload_needs_observe;
-    uint64_t stream_index;
+    uint64_t claim_worker_id;
     uint64_t claim_start_cycles;
     uint64_t claim_end_cycles;
     uint64_t pending_wait_start_cycles;
@@ -658,16 +658,11 @@ inline __aicore__ bool aicore_prepare_dispatch_binding_v1(
     binding->root_prepare_resolver_worker_id = 0;
     aicore_write_claim_binding_v1(sidecar_base, run_control, *binding);
     __gm__ AicoreTaskTraceCellV1 *trace = nullptr;
-    if (trace_enabled) {
+    const bool trace_ticket_route = trace_enabled && claim_kind == AicoreClaimKindV1::TICKET;
+    if (trace_ticket_route) {
         __gm__ AicoreTaskTraceCellV1 *trace_cells =
             aicore_sidecar_at_v1<AicoreTaskTraceCellV1>(sidecar_base, resolver->trace_cells_offset);
         trace = &trace_cells[task_id];
-        trace->claim_kind = static_cast<uint64_t>(claim_kind);
-        trace->stream_index = stream_index;
-        trace->claim_start_cycles = claim_start_cycles;
-        trace->claim_end_cycles = claim_end_cycles;
-        trace->claim_worker_id = claim_worker_id;
-        aicore_writeback_cache_line_v0(trace);
     }
     aicore_cache_barrier_v0();
     if (trace != nullptr) trace->initialize_end_cycles = aicore_scheduler_cycles_v1();
@@ -682,11 +677,9 @@ inline __aicore__ bool aicore_prepare_dispatch_binding_v1(
         slot->pending_wait_start_cycles = aicore_scheduler_cycles_v1();
         aicore_publish_cache_line_v0(slot);
     }
-    if (trace_enabled) {
-        __gm__ AicoreTaskTraceCellV1 *trace_cells =
-            aicore_sidecar_at_v1<AicoreTaskTraceCellV1>(sidecar_base, resolver->trace_cells_offset);
-        trace_cells[task_id].route_end_cycles = aicore_scheduler_cycles_v1();
-        aicore_publish_cache_line_v0(&trace_cells[task_id].initialize_end_cycles);
+    if (trace != nullptr) {
+        trace->route_end_cycles = aicore_scheduler_cycles_v1();
+        aicore_publish_cache_line_v0(&trace->initialize_end_cycles);
     }
     return *route != AicoreRouteResultV1::ERROR && *route != AicoreRouteResultV1::COMPLETED;
 }
@@ -732,7 +725,6 @@ inline __aicore__ bool aicore_refill_completed_slot_v1(
             refill_start_cycles != 0 ? refill_start_cycles : aicore_scheduler_cycles_v1();
         refill_trace->refill_resolver_worker_id = resolver->worker_index;
         refill_trace->refill_task_id = UINT64_MAX;
-        refill_trace->refill_reserved = 0;
     }
     AicoreTaskClaimBindingV1 completed_binding{};
     if (!aicore_observe_claim_binding_v1(sidecar_base, run_control, completed_task_id, &completed_binding))
@@ -754,8 +746,6 @@ inline __aicore__ bool aicore_refill_completed_slot_v1(
         );
         return false;
     }
-    if (refill_trace != nullptr) refill_trace->refill_observe_end_cycles = aicore_scheduler_cycles_v1();
-
     __gm__ AicoreTaskStreamV1 *stream = aicore_worker_stream_v1(sidecar_base, resolver, target);
     __gm__ AicoreClaimPrefetchV1 *prefetch =
         aicore_claim_prefetch_at_v1(sidecar_base, resolver, completed_binding.owner_worker_id);
@@ -776,16 +766,10 @@ inline __aicore__ bool aicore_refill_completed_slot_v1(
         if (valid && ticket_claim_count != nullptr) ++*ticket_claim_count;
         if (!valid && ticket_exhaustion_count != nullptr) ++*ticket_exhaustion_count;
     }
-    if (refill_trace != nullptr) refill_trace->refill_prefetch_take_end_cycles = aicore_scheduler_cycles_v1();
     if (!valid) {
         aicore_retire_dispatch_slot_v1(slot);
         if (refill_trace != nullptr) {
-            const uint64_t refill_end = aicore_scheduler_cycles_v1();
-            refill_trace->refill_bind_route_end_cycles = refill_end;
-            refill_trace->refill_payload_publish_end_cycles = refill_end;
-            refill_trace->refill_next_prefetch_end_cycles = refill_end;
-            refill_trace->refill_end_cycles = refill_end;
-            aicore_publish_cache_line_v0(&refill_trace->refill_start_cycles);
+            refill_trace->refill_end_cycles = aicore_scheduler_cycles_v1();
         }
         return true;
     }
@@ -800,10 +784,6 @@ inline __aicore__ bool aicore_refill_completed_slot_v1(
         )) {
         return false;
     }
-    if (refill_trace != nullptr) {
-        refill_trace->refill_bind_route_end_cycles = aicore_scheduler_cycles_v1();
-        aicore_publish_cache_line_v0(&refill_trace->completion_inbox_probe_start_cycles);
-    }
     if (route == AicoreRouteResultV1::READY_TO_PUBLISH &&
         !aicore_publish_prepared_dispatch_v1(
             graph, sidecar_base, resolver, run_control, binding, !aicore_task_ticket_has_fanin_v1(ticket), root_stats,
@@ -811,7 +791,6 @@ inline __aicore__ bool aicore_refill_completed_slot_v1(
         )) {
         return false;
     }
-    if (refill_trace != nullptr) refill_trace->refill_payload_publish_end_cycles = aicore_scheduler_cycles_v1();
     bool prefetch_filled = false;
     bool prefetch_exhausted = false;
     if (!aicore_fill_claim_prefetch_v1(
@@ -821,9 +800,7 @@ inline __aicore__ bool aicore_refill_completed_slot_v1(
         return false;
     }
     if (refill_trace != nullptr) {
-        refill_trace->refill_next_prefetch_end_cycles = aicore_scheduler_cycles_v1();
         refill_trace->refill_end_cycles = aicore_scheduler_cycles_v1();
-        aicore_publish_cache_line_v0(&refill_trace->refill_start_cycles);
     }
     (void)prefetch_filled;
     (void)prefetch_exhausted;
@@ -969,14 +946,8 @@ inline __aicore__ bool aicore_service_completion_inboxes_v1(
     __gm__ AicoreCompletionInboxV1 *inbox = aicore_completion_inbox_at_v1(sidecar_base, context, inbox_index);
     int64_t task_id = AICORE_COMPLETION_INBOX_EMPTY_V1;
     uint64_t completion_inbox_probe_start = trace_enabled ? aicore_scheduler_cycles_v1() : 0;
-    uint64_t completion_inbox_detach_start = 0;
-    uint64_t completion_inbox_detach_end = 0;
-    uint64_t completion_inbox_index = inbox_index;
-    bool completion_inbox_stolen = false;
     if (aicore_gm_load_v0(inbox->head) != AICORE_COMPLETION_INBOX_EMPTY_V1) {
-        completion_inbox_detach_start = trace_enabled ? aicore_scheduler_cycles_v1() : 0;
         task_id = aicore_gm_exchange_v0(inbox->head, AICORE_COMPLETION_INBOX_EMPTY_V1);
-        completion_inbox_detach_end = trace_enabled ? aicore_scheduler_cycles_v1() : 0;
     }
     if (task_id == AICORE_COMPLETION_INBOX_EMPTY_V1 && resolver_count > 1) {
         uint64_t victim = *victim_cursor % resolver_count;
@@ -987,16 +958,12 @@ inline __aicore__ bool aicore_service_completion_inboxes_v1(
         }
         inbox = aicore_completion_inbox_at_v1(sidecar_base, context, victim);
         completion_inbox_probe_start = trace_enabled ? aicore_scheduler_cycles_v1() : 0;
-        completion_inbox_index = victim;
         if (aicore_gm_load_v0(inbox->head) != AICORE_COMPLETION_INBOX_EMPTY_V1) {
-            completion_inbox_detach_start = trace_enabled ? aicore_scheduler_cycles_v1() : 0;
             task_id = aicore_gm_exchange_v0(inbox->head, AICORE_COMPLETION_INBOX_EMPTY_V1);
-            completion_inbox_detach_end = trace_enabled ? aicore_scheduler_cycles_v1() : 0;
         }
         if (task_id != AICORE_COMPLETION_INBOX_EMPTY_V1 && completion_stats != nullptr) {
             ++completion_stats->steal_count;
         }
-        completion_inbox_stolen = task_id != AICORE_COMPLETION_INBOX_EMPTY_V1;
     }
     if (task_id == AICORE_COMPLETION_INBOX_EMPTY_V1) return true;
     if (completion_stats != nullptr) ++completion_stats->batch_count;
@@ -1008,18 +975,15 @@ inline __aicore__ bool aicore_service_completion_inboxes_v1(
             );
             return false;
         }
-        const uint64_t completion_node_start = trace_enabled ? aicore_scheduler_cycles_v1() : 0;
+        const uint64_t completion_prepare_start =
+            completion_inbox_probe_start != 0 ? completion_inbox_probe_start
+                                              : (trace_enabled ? aicore_scheduler_cycles_v1() : 0);
         __gm__ AicoreTaskTraceCellV1 *completion_trace = nullptr;
         if (trace_enabled) {
             __gm__ AicoreTaskTraceCellV1 *trace_cells =
                 aicore_sidecar_at_v1<AicoreTaskTraceCellV1>(sidecar_base, context->trace_cells_offset);
             completion_trace = &trace_cells[task_id];
-            completion_trace->completion_inbox_probe_start_cycles = completion_inbox_probe_start;
-            completion_trace->completion_inbox_detach_start_cycles = completion_inbox_detach_start;
-            completion_trace->completion_inbox_detach_end_cycles = completion_inbox_detach_end;
-            completion_trace->completion_node_start_cycles = completion_node_start;
-            completion_trace->completion_inbox_index = completion_inbox_index;
-            completion_trace->completion_inbox_stolen = completion_inbox_stolen ? 1 : 0;
+            completion_trace->completion_prepare_start_cycles = completion_prepare_start;
             completion_trace->refill_resolver_worker_id = context->worker_index;
         }
         __gm__ AicoreTaskControlV1 *control = aicore_task_control_at_v1(sidecar_base, context, task_id);
@@ -1051,7 +1015,7 @@ inline __aicore__ bool aicore_service_completion_inboxes_v1(
             return false;
         }
         if (completion_trace != nullptr) {
-            aicore_publish_cache_line_v0(&completion_trace->completion_inbox_probe_start_cycles);
+            aicore_publish_cache_line_v0(&completion_trace->completion_prepare_start_cycles);
         }
         if (!aicore_resolve_completion_v1(
                 graph, sidecar_base, context, run_control, task_id, wake_stats, completion_stats, trace_enabled
@@ -1061,9 +1025,6 @@ inline __aicore__ bool aicore_service_completion_inboxes_v1(
         ++batch_count;
         task_id = next;
         completion_inbox_probe_start = 0;
-        completion_inbox_detach_start = 0;
-        completion_inbox_detach_end = 0;
-        completion_inbox_stolen = false;
     }
     if (completion_stats != nullptr) completion_stats->resolve_count += batch_count;
     aicore_gm_fetch_add_v0(run_control->resolved_task_count, batch_count);

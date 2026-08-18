@@ -124,43 +124,28 @@ publish_worker_stats(__gm__ AicoreWorkerContextV1 *context, const AicoreWorkerSt
 
 __aicore__ __attribute__((always_inline)) void commit_task_trace(
     __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *context, const AicorePendingSlotV1 &pending,
-    uint64_t pending_wait_end, uint64_t ready_scan_start, uint64_t ready_observe, uint64_t payload_start,
-    uint64_t kernel_start, uint64_t kernel_end, uint64_t completion_end, uint64_t completion_bookkeeping_end,
-    uint64_t previous_trace_commit_end, uint64_t payload_base_load_start, uint64_t payload_cache_control_end,
-    uint64_t payload_cache_invalidate_end, uint64_t payload_observe_end, uint64_t inter_task_poll_cycles,
-    uint64_t inter_task_publication_poll_cycles, uint64_t inter_task_backoff_cycles
+    uint64_t pending_wait_end, uint64_t ready_scan_start, uint64_t ready_observe, uint64_t kernel_start,
+    uint64_t kernel_end, uint64_t completion_end, uint64_t completion_bookkeeping_end,
+    uint64_t previous_trace_commit_end
 ) {
     __gm__ AicoreTaskTraceCellV1 *trace_cells =
         aicore_sidecar_at_v1<AicoreTaskTraceCellV1>(sidecar_base, context->trace_cells_offset);
     __gm__ AicoreTaskTraceCellV1 *trace = &trace_cells[pending.task_id];
-    aicore_observe_cache_line_v0(&trace->completion_bookkeeping_end_cycles);
-    trace->valid = 0;
     trace->claim_kind = static_cast<uint64_t>(pending.claim_kind);
     trace->worker_id = context->worker_index;
-    trace->core_type = static_cast<uint64_t>(context->core_type);
     trace->task_id = static_cast<uint64_t>(pending.task_id);
-    trace->stream_index = pending.stream_index;
+    trace->claim_worker_id = pending.claim_worker_id;
     trace->claim_start_cycles = pending.claim_start_cycles;
     trace->claim_end_cycles = pending.claim_end_cycles;
+    trace->previous_trace_commit_end_cycles = previous_trace_commit_end;
     trace->pending_wait_start_cycles = pending.pending_wait_start_cycles;
     trace->pending_wait_end_cycles = pending_wait_end;
-    trace->payload_start_cycles = payload_start;
     trace->kernel_start_cycles = kernel_start;
     trace->kernel_end_cycles = kernel_end;
     trace->completion_end_cycles = completion_end;
     trace->ready_scan_start_cycles = ready_scan_start;
     trace->ready_observe_cycles = ready_observe;
     trace->completion_bookkeeping_end_cycles = completion_bookkeeping_end;
-    trace->payload_base_load_start_cycles = payload_base_load_start;
-    trace->inter_task_publication_poll_cycles = inter_task_publication_poll_cycles;
-    trace->previous_trace_commit_end_cycles = previous_trace_commit_end;
-    trace->payload_cache_control_end_cycles = payload_cache_control_end;
-    trace->payload_cache_invalidate_end_cycles = payload_cache_invalidate_end;
-    trace->payload_observe_end_cycles = payload_observe_end;
-    trace->inter_task_poll_cycles = inter_task_poll_cycles;
-    trace->inter_task_backoff_cycles = inter_task_backoff_cycles;
-    aicore_publish_cache_line_v0(&trace->completion_bookkeeping_end_cycles);
-    aicore_publish_cache_line_v0(&trace->aicore_entry_cycles);
     aicore_publish_cache_line_v0(&trace->pending_wait_start_cycles);
     trace->valid = 1;
     aicore_publish_cache_line_v0(trace);
@@ -300,9 +285,6 @@ __aicore__ bool run_offloaded_dispatch_loop(
     bool retired[AICORE_PENDING_SLOT_COUNT_V1]{};
     uint64_t victim_cursor = resolver_worker ? (context->inbox_index + 1) % resolver_count : 0;
     uint64_t previous_trace_commit_end = 0;
-    uint64_t inter_task_poll_cycles = 0;
-    uint64_t inter_task_publication_poll_cycles = 0;
-    uint64_t inter_task_backoff_cycles = 0;
     uint32_t scan_start = 0;
     uint32_t backoff_iterations = kInitialBackoffIterations;
     uint32_t scheduler_error_poll_count = 0;
@@ -348,33 +330,27 @@ __aicore__ bool run_offloaded_dispatch_loop(
 
         int32_t ready_slot = -1;
         uint64_t ready_publication = 0;
-        uint64_t ready_scan_start = get_sys_cnt_aicore();
-        uint64_t scan_publication_poll_cycles = 0;
+        uint64_t ready_scan_start = trace_enabled ? get_sys_cnt_aicore() : 0;
         for (uint32_t offset = 0; offset < AICORE_PENDING_SLOT_COUNT_V1; ++offset) {
             uint32_t slot_index = (scan_start + offset) % AICORE_PENDING_SLOT_COUNT_V1;
             __gm__ AicoreDispatchSlotV1 *slot =
                 aicore_dispatch_slot_at_v1(sidecar_base, context, context->worker_index, slot_index);
-            uint64_t slot_poll_start = trace_enabled ? get_sys_cnt_aicore() : 0;
             uint64_t publication = aicore_gm_load_v0(slot->publication);
             ++stats->task_state_poll_count;
             if (publication == seen_publication[slot_index]) {
-                if (trace_enabled) scan_publication_poll_cycles += get_sys_cnt_aicore() - slot_poll_start;
                 continue;
             }
             AicoreDispatchPublicationV1 state = aicore_dispatch_state_v1(publication);
             if (state == AicoreDispatchPublicationV1::RETIRED) {
                 seen_publication[slot_index] = publication;
                 retired[slot_index] = true;
-                if (trace_enabled) scan_publication_poll_cycles += get_sys_cnt_aicore() - slot_poll_start;
                 continue;
             }
             if (state == AicoreDispatchPublicationV1::READY) {
                 ready_slot = static_cast<int32_t>(slot_index);
                 ready_publication = publication;
-                if (trace_enabled) scan_publication_poll_cycles += get_sys_cnt_aicore() - slot_poll_start;
                 break;
             }
-            if (trace_enabled) scan_publication_poll_cycles += get_sys_cnt_aicore() - slot_poll_start;
         }
 
         if (ready_slot >= 0) {
@@ -400,7 +376,7 @@ __aicore__ bool run_offloaded_dispatch_loop(
             pending.subtask_slot = slot->subtask_slot;
             pending.has_fanin = slot->has_fanin;
             pending.payload_needs_observe = 1;
-            pending.stream_index = slot->stream_index;
+            pending.claim_worker_id = slot->claim_worker_id;
             pending.claim_start_cycles = slot->claim_start_cycles;
             pending.claim_end_cycles = slot->claim_end_cycles;
             pending.pending_wait_start_cycles = slot->pending_wait_start_cycles;
@@ -411,18 +387,14 @@ __aicore__ bool run_offloaded_dispatch_loop(
             if (pending_wait_end != 0) {
                 stats->dependency_wait_cycles += pending_wait_end - pending.pending_wait_start_cycles;
             }
-            uint64_t payload_base_load_start = get_sys_cnt_aicore();
             __gm__ PTO2DispatchPayload *dispatch_payload = aicore_sidecar_at_v1<PTO2DispatchPayload>(
                 sidecar_base,
                 context->dispatch_payload_offset + static_cast<uint64_t>(slot_index) * sizeof(PTO2DispatchPayload)
             );
             uint64_t payload_start = get_sys_cnt_aicore();
             aicore_observe_dispatch_payload_control_v1(dispatch_payload);
-            uint64_t payload_cache_control_end = trace_enabled ? get_sys_cnt_aicore() : 0;
             aicore_observe_dispatch_payload_arguments_v1(dispatch_payload);
-            uint64_t payload_cache_invalidate_end = trace_enabled ? get_sys_cnt_aicore() : 0;
             aicore_observe_dispatch_payload_barrier_v1();
-            uint64_t payload_observe_end = trace_enabled ? get_sys_cnt_aicore() : 0;
             OUT_OF_ORDER_STORE_BARRIER();
 
             __gm__ ChipSwimlaneAicoreTaskRecord *profile_record =
@@ -475,26 +447,17 @@ __aicore__ bool run_offloaded_dispatch_loop(
                     trace->handshake_publish_cycles = handshake_publish_cycles;
                     trace->register_release_cycles = register_release_cycles;
                     trace->descriptor_cache_observed_cycles = descriptor_cache_observed_cycles;
+                    aicore_publish_cache_line_v0(&trace->initialize_end_cycles);
                 }
                 uint64_t bookkeeping_end = get_sys_cnt_aicore();
                 commit_task_trace(
-                    sidecar_base, context, pending, pending_wait_end, ready_scan_start, ready_observe, payload_start,
-                    kernel_start, kernel_end, completion_end, bookkeeping_end, previous_trace_commit_end,
-                    payload_base_load_start, payload_cache_control_end, payload_cache_invalidate_end,
-                    payload_observe_end, inter_task_poll_cycles, inter_task_publication_poll_cycles,
-                    inter_task_backoff_cycles
+                    sidecar_base, context, pending, pending_wait_end, ready_scan_start, ready_observe, kernel_start,
+                    kernel_end, completion_end, bookkeeping_end, previous_trace_commit_end
                 );
                 previous_trace_commit_end = get_sys_cnt_aicore();
-                inter_task_poll_cycles = 0;
-                inter_task_publication_poll_cycles = 0;
-                inter_task_backoff_cycles = 0;
             }
             continue;
         }
-
-        uint64_t failed_scan_end = trace_enabled ? get_sys_cnt_aicore() : ready_scan_start;
-        inter_task_poll_cycles += failed_scan_end - ready_scan_start;
-        inter_task_publication_poll_cycles += scan_publication_poll_cycles;
 
         if (retired[0] && retired[1] && !executor_drained) {
             if (aicore_gm_load_v0(run_control->scheduler_error) != 0) return false;
@@ -516,7 +479,6 @@ __aicore__ bool run_offloaded_dispatch_loop(
         local_backoff(backoff_iterations);
         uint64_t backoff_end = get_sys_cnt_aicore();
         stats->backoff_cycles += backoff_end - backoff_start;
-        if (trace_enabled) inter_task_backoff_cycles += backoff_end - backoff_start;
         if (backoff_iterations < kMaximumBackoffIterations) backoff_iterations <<= 1;
     }
     return true;

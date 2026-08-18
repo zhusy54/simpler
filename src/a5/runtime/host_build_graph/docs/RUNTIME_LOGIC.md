@@ -154,7 +154,7 @@ Level-1 chip-swimlane capture exports `AICoreEntryToHandshake`,
 `DescriptorReadyToSeedClaim`, `SeedClaim`,
 `TicketClaim`, `PendingWait`, `Payload`, `Kernel`, `CompletionEnqueue`,
 `PostCompletion`, `CompletionService`, `TraceCommit`, scheduler-loop detail,
-`ReadyScan`, `ReadyToPayload`, `CompletionBatchClaim`, `WakeResolve`,
+`ReadyScan`, `CompletionBatchPrepare`, `SlotRefill`, `CompletionBatchClaim`, `WakeResolve`,
 `ReadyPublish`, `ExecutorDrainPublish`, `WaitForExit`, `FinalStatsPublish`,
 `ExitAckPublish`, and `Drain` AICore phases. Separate AICPU lifecycle lanes
 export global `WaitExecutors`, `WaitResolved`, and `CompletionDecision`, plus
