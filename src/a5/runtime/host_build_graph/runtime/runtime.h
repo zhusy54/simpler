@@ -143,7 +143,7 @@ public:
     // aicpu_thread_num is the total AICPU thread count launched on this run.
     // host_build_graph builds the task graph on the host, so there is no
     // on-device orchestrator. The highest-index thread supervises the AICore
-    // ticket-worker publication and waits for graph completion; other threads
+    // bootstrap publication and waits for graph completion; other threads
     // wait until teardown.
     int aicpu_thread_num;
 

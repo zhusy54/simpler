@@ -64,7 +64,7 @@ struct AicpuExecutor {
     std::atomic<int32_t> run_status_{0};
 
     // AICPU owns only the AICore launch/teardown lifecycle. AICore owns graph
-    // ticket ownership, private pending polling, and task execution.
+    // dependency resolution, Ready scheduling, and task execution.
     AicoreLifecycle aicore_lifecycle_;
 
     // ===== Methods =====
@@ -211,7 +211,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 runtime->aicore_sidecar_layout.aic_task_count + runtime->aicore_sidecar_layout.aiv_task_count;
             const bool trace_enabled = is_chip_swimlane_enabled();
             const uint64_t completion_wait_start_cycles = trace_enabled ? get_sys_cnt_aicpu() : 0;
-            uint64_t all_executors_drained_cycles = 0;
+            uint64_t bootstrap_complete_cycles = 0;
             uint64_t all_tasks_resolved_cycles = 0;
             uint64_t completion_poll_count = 0;
             uint64_t completion_poll_cycles = 0;
@@ -220,21 +220,20 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             while (true) {
                 const uint64_t poll_start = trace_enabled ? get_sys_cnt_aicpu() : 0;
                 cache_invalidate_range(reinterpret_cast<uint8_t *>(run_control) + 128, 128);
-                const bool executors_drained =
-                    run_control->executor_drained_worker_count == run_control->active_worker_count;
+                const bool bootstrap_complete = run_control->bootstrap_complete != 0;
                 const bool tasks_resolved = run_control->resolved_task_count == executable_task_count;
                 if (trace_enabled) {
                     const uint64_t poll_end = get_sys_cnt_aicpu();
                     ++completion_poll_count;
                     completion_poll_cycles += poll_end - poll_start;
-                    if (executors_drained && all_executors_drained_cycles == 0) {
-                        all_executors_drained_cycles = poll_end;
+                    if (bootstrap_complete && bootstrap_complete_cycles == 0) {
+                        bootstrap_complete_cycles = poll_end;
                     }
-                    if (executors_drained && tasks_resolved && all_tasks_resolved_cycles == 0) {
+                    if (bootstrap_complete && tasks_resolved && all_tasks_resolved_cycles == 0) {
                         all_tasks_resolved_cycles = poll_end;
                     }
                 }
-                if (executors_drained && tasks_resolved) {
+                if (bootstrap_complete && tasks_resolved) {
                     break;
                 }
                 if (++error_poll_count == 64) {
@@ -258,18 +257,18 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 );
                 supervisor_rc = -1;
             }
-            if (supervisor_rc == 0 && run_control->executed_task_count + run_control->inline_completed_count !=
+            if (supervisor_rc == 0 && run_control->resolved_task_count + run_control->inline_completed_count !=
                                           run_control->expected_task_count) {
                 LOG_ERROR(
-                    "A5 HBG AICore scheduler: count mismatch expected=%" PRIu64 " executed=%" PRIu64 " inline=%" PRIu64,
-                    run_control->expected_task_count, run_control->executed_task_count,
+                    "A5 HBG AICore scheduler: count mismatch expected=%" PRIu64 " resolved=%" PRIu64 " inline=%" PRIu64,
+                    run_control->expected_task_count, run_control->resolved_task_count,
                     run_control->inline_completed_count
                 );
                 supervisor_rc = -1;
             }
             if (trace_enabled) {
                 run_control->completion_wait_start_cycles = completion_wait_start_cycles;
-                run_control->all_executors_drained_cycles = all_executors_drained_cycles;
+                run_control->bootstrap_complete_cycles = bootstrap_complete_cycles;
                 run_control->all_tasks_resolved_cycles = all_tasks_resolved_cycles;
                 run_control->shutdown_ready_cycles = get_sys_cnt_aicpu();
                 run_control->completion_poll_count = completion_poll_count;

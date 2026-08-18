@@ -70,7 +70,6 @@
 #include "common/unified_log.h"
 #include "common/strace.h"
 #include "utils/device_arena.h"
-#include "aicore_ticket_stream_planner.h"
 #include "prepare_callable_common.h"
 
 extern "C" const PipelineContract *get_pipeline_contract(void) {
@@ -489,11 +488,10 @@ void release_aicore_sidecar(Runtime *runtime, const HostApi *api) {
 bool append_aicore_scheduler_trace(
     const Runtime *runtime, const AicoreRunControlV1 *run_control, const AicpuCoreLifecycleTraceV1 *lifecycle_traces,
     const AicoreTaskTraceCellV1 *traces, const AicoreTaskControlV1 *task_controls,
-    const AicoreTaskClaimBindingV1 *claim_bindings, const AicoreWorkerContextV1 *contexts
+    const AicoreWorkerContextV1 *contexts
 ) {
     if (runtime == nullptr || run_control == nullptr || lifecycle_traces == nullptr || traces == nullptr ||
-        task_controls == nullptr || claim_bindings == nullptr || contexts == nullptr ||
-        !runtime->aicore_scheduler_trace_enabled()) {
+        task_controls == nullptr || contexts == nullptr || !runtime->aicore_scheduler_trace_enabled()) {
         return true;
     }
     const std::filesystem::path path =
@@ -546,12 +544,9 @@ bool append_aicore_scheduler_trace(
         const uint64_t trace_core_type = trace.worker_id < static_cast<uint64_t>(runtime->worker_count)
                                              ? static_cast<uint64_t>(contexts[trace.worker_id].core_type)
                                              : UINT64_MAX;
-        const char *claim_phase = "TicketClaim";
-        if (trace.claim_kind == static_cast<uint64_t>(AicoreClaimKindV1::SEED)) claim_phase = "SeedClaim";
-        if (trace.claim_kind == static_cast<uint64_t>(AicoreClaimKindV1::PREFETCH)) claim_phase = "PrefetchClaim";
-        if (trace.claim_kind == static_cast<uint64_t>(AicoreClaimKindV1::REFILL_FALLBACK)) {
-            claim_phase = "RefillFallbackClaim";
-        }
+        const char *claim_phase = trace.ready_source == static_cast<uint64_t>(AicoreReadySourceV1::STOLEN) ?
+                                      "ReadySteal" :
+                                      "ReadyPop";
         uint64_t claim_core_type = trace_core_type;
         if (trace.claim_worker_id < static_cast<uint64_t>(runtime->worker_count)) {
             claim_core_type = static_cast<uint64_t>(contexts[trace.claim_worker_id].core_type);
@@ -560,7 +555,7 @@ bool append_aicore_scheduler_trace(
             trace.claim_worker_id, claim_core_type, trace.task_id, claim_phase, trace.claim_start_cycles,
             trace.claim_end_cycles
         );
-        if (trace.claim_kind == static_cast<uint64_t>(AicoreClaimKindV1::SEED)) {
+        if (trace.aicore_entry_cycles != 0) {
             emit(
                 trace.worker_id, trace_core_type, trace.task_id, "AICoreEntryToHandshake", trace.aicore_entry_cycles,
                 trace.handshake_publish_cycles
@@ -574,14 +569,10 @@ bool append_aicore_scheduler_trace(
                 trace.register_release_cycles, trace.descriptor_cache_observed_cycles
             );
             emit(
-                trace.worker_id, trace_core_type, trace.task_id, "DescriptorReadyToSeedClaim",
+                trace.worker_id, trace_core_type, trace.task_id, "DescriptorReadyToReadyClaim",
                 trace.descriptor_cache_observed_cycles, trace.claim_start_cycles
             );
         }
-        emit(
-            trace.worker_id, trace_core_type, trace.task_id, "PendingWait", trace.pending_wait_start_cycles,
-            trace.pending_wait_end_cycles
-        );
         emit(
             trace.worker_id, trace_core_type, trace.task_id, "Payload", trace.ready_observe_cycles,
             trace.kernel_start_cycles
@@ -603,7 +594,6 @@ bool append_aicore_scheduler_trace(
             trace.ready_observe_cycles
         );
         const AicoreTaskControlV1 &control = task_controls[task_id];
-        const AicoreTaskClaimBindingV1 &binding = claim_bindings[task_id];
         if (trace.completion_prepare_start_cycles != 0 &&
             trace.refill_resolver_worker_id < static_cast<uint64_t>(runtime->worker_count)) {
             const uint64_t resolver_worker_id = trace.refill_resolver_worker_id;
@@ -622,14 +612,6 @@ bool append_aicore_scheduler_trace(
                     trace.refill_start_cycles, trace.refill_end_cycles
                 );
             }
-        }
-        if (binding.root_prepare_start_cycles != 0 &&
-            binding.root_prepare_resolver_worker_id < static_cast<uint64_t>(runtime->worker_count)) {
-            const AicoreWorkerContextV1 &resolver = contexts[binding.root_prepare_resolver_worker_id];
-            emit(
-                binding.root_prepare_resolver_worker_id, static_cast<uint64_t>(resolver.core_type), trace.task_id,
-                "RootPrepare", binding.root_prepare_start_cycles, binding.root_prepare_end_cycles
-            );
         }
         if (control.completion_resolve_start_cycles != 0 &&
             control.resolver_worker_id < static_cast<uint64_t>(runtime->worker_count)) {
@@ -669,45 +651,15 @@ bool append_aicore_scheduler_trace(
                 );
                 scheduler_start = current.previous_trace_commit_end_cycles;
             }
-            const bool claimed_between_tasks = current.claim_kind == static_cast<uint64_t>(AicoreClaimKindV1::TICKET) &&
-                                               current.claim_start_cycles >= scheduler_start &&
-                                               current.claim_end_cycles >= current.claim_start_cycles &&
-                                               current.initialize_end_cycles >= current.claim_end_cycles &&
-                                               current.route_end_cycles >= current.initialize_end_cycles &&
-                                               current.ready_scan_start_cycles >= current.route_end_cycles;
-            if (claimed_between_tasks) {
-                emit(
-                    current.worker_id, current_core_type, current.task_id, "SchedulerToClaim", scheduler_start,
-                    current.claim_start_cycles
-                );
-                emit(
-                    current.worker_id, current_core_type, current.task_id, "TaskInitialize", current.claim_end_cycles,
-                    current.initialize_end_cycles
-                );
-                emit(
-                    current.worker_id, current_core_type, current.task_id, "TaskRoute", current.initialize_end_cycles,
-                    current.route_end_cycles
-                );
-                emit(
-                    current.worker_id, current_core_type, current.task_id, "SchedulerToReadyScan",
-                    current.route_end_cycles, current.ready_scan_start_cycles
-                );
-            } else {
-                if (current.ready_scan_start_cycles < scheduler_start) continue;
-                emit(
-                    current.worker_id, current_core_type, current.task_id, "InterTaskSchedule", scheduler_start,
-                    current.ready_scan_start_cycles
-                );
-            }
+            if (current.ready_scan_start_cycles < scheduler_start) continue;
+            emit(
+                current.worker_id, current_core_type, current.task_id, "InterTaskSchedule", scheduler_start,
+                current.ready_scan_start_cycles
+            );
         }
     }
     for (int32_t worker = 0; worker < runtime->worker_count; ++worker) {
         if (contexts[worker].active == 0) continue;
-        emit_termination(
-            contexts[worker].worker_index, static_cast<uint64_t>(contexts[worker].core_type), "ExecutorDrainPublish",
-            contexts[worker].executor_drain_publish_start_cycles, contexts[worker].executor_drain_publish_end_cycles, 2,
-            0, 0, 0
-        );
         emit_termination(
             contexts[worker].worker_index, static_cast<uint64_t>(contexts[worker].core_type), "WaitForExit",
             contexts[worker].exit_wait_start_cycles, contexts[worker].exit_observed_cycles, 0, 0, 0, 0
@@ -747,11 +699,11 @@ bool append_aicore_scheduler_trace(
     const uint64_t supervisor_thread =
         runtime->aicpu_thread_num > 0 ? static_cast<uint64_t>(runtime->aicpu_thread_num - 1) : 0;
     emit_aicpu(
-        UINT64_MAX, supervisor_thread, UINT64_MAX, "WaitExecutors", run_control->completion_wait_start_cycles,
-        run_control->all_executors_drained_cycles
+        UINT64_MAX, supervisor_thread, UINT64_MAX, "WaitBootstrap", run_control->completion_wait_start_cycles,
+        run_control->bootstrap_complete_cycles
     );
     emit_aicpu(
-        UINT64_MAX, supervisor_thread, UINT64_MAX, "WaitResolved", run_control->all_executors_drained_cycles,
+        UINT64_MAX, supervisor_thread, UINT64_MAX, "WaitResolved", run_control->bootstrap_complete_cycles,
         run_control->all_tasks_resolved_cycles, run_control->completion_poll_count, run_control->completion_poll_cycles,
         run_control->error_poll_count
     );
@@ -810,9 +762,10 @@ bool create_aicore_sidecar_v1(
         static_cast<uint64_t>(total_tasks),
         task_window_size - 1,
     };
-    std::vector<uint8_t> inline_completed_flags(static_cast<size_t>(total_tasks), 0);
     std::vector<int64_t> inline_completed_task_ids;
-    std::vector<AicoreTaskTicketV1> task_tickets(static_cast<size_t>(total_tasks));
+    std::vector<AicoreTaskMetadataV1> task_metadata(static_cast<size_t>(total_tasks));
+    uint64_t aic_task_count = 0;
+    uint64_t aiv_task_count = 0;
     for (int64_t task_id = 0; task_id < total_tasks; ++task_id) {
         PTO2TaskSlotState &slot = host_sm_handle.header->ring.get_slot_state_by_task_id(task_id);
         AicoreTaskInfoV0 task{};
@@ -825,7 +778,6 @@ bool create_aicore_sidecar_v1(
                                          slot.task_attrs.allow_early_resolve() &&
                                          !slot.task_attrs.requires_sync_start() && !slot.task_attrs.has_predicate();
             if (inline_completed_task) {
-                inline_completed_flags[static_cast<size_t>(task_id)] = 1;
                 inline_completed_task_ids.push_back(task_id);
                 continue;
             }
@@ -855,38 +807,30 @@ bool create_aicore_sidecar_v1(
             return false;
         }
         __gm__ uint8_t *payload = aicore_graph_payload_v0(host_graph, task_id);
-        task_tickets[static_cast<size_t>(task_id)] = aicore_task_ticket_make_v1(
-            static_cast<uint32_t>(task_id), static_cast<uint16_t>(task.kernel_id),
-            static_cast<uint8_t>(task.subtask_slot),
-            *reinterpret_cast<__gm__ int32_t *>(payload + AICORE_GRAPH_FANIN_COUNT_OFFSET_V0) != 0
-        );
-    }
-
-    AicoreTicketStreams streams;
-    {
-        STRACE("simpler_run.bind.ticket_stream_plan");
-        if (!build_aicore_ticket_streams(host_graph, inline_completed_flags, &streams)) {
-            LOG_ERROR("A5 HBG AICore scheduler: failed to build dependency-ordered typed streams");
+        int32_t fanin_count = *reinterpret_cast<__gm__ int32_t *>(payload + AICORE_GRAPH_FANIN_COUNT_OFFSET_V0);
+        if (fanin_count < 0) {
+            LOG_ERROR("A5 HBG AICore scheduler: task id=%" PRId64 " has invalid fanin count %d", task_id, fanin_count);
             return false;
         }
+        AicoreTaskMetadataV1 &metadata = task_metadata[static_cast<size_t>(task_id)];
+        metadata.kernel_id = static_cast<uint16_t>(task.kernel_id);
+        metadata.subtask_slot = static_cast<uint8_t>(task.subtask_slot);
+        metadata.flags = AICORE_TASK_EXECUTABLE_V1;
+        if (fanin_count != 0) metadata.flags |= AICORE_TASK_HAS_FANIN_V1;
+        if (task.subtask_slot == 0)
+            ++aic_task_count;
+        else
+            ++aiv_task_count;
     }
-    const uint64_t executable_task_count = streams.aic.size() + streams.aiv.size();
-    const uint64_t root_prepare_count = std::count_if(
-                                            streams.aic.begin(), streams.aic.end(),
-                                            [&](uint32_t task_id) {
-                                                return !aicore_task_ticket_has_fanin_v1(task_tickets[task_id]);
-                                            }
-                                        ) +
-                                        std::count_if(streams.aiv.begin(), streams.aiv.end(), [&](uint32_t task_id) {
-                                            return !aicore_task_ticket_has_fanin_v1(task_tickets[task_id]);
-                                        });
+
+    const uint64_t executable_task_count = aic_task_count + aiv_task_count;
     if (executable_task_count + inline_completed_task_ids.size() != static_cast<uint64_t>(total_tasks)) {
-        LOG_ERROR("A5 HBG AICore scheduler: typed streams do not cover the graph");
+        LOG_ERROR("A5 HBG AICore scheduler: task metadata does not cover the graph");
         return false;
     }
 
     AicoreExecutionSidecarLayoutV1 layout{};
-    if (!aicore_sidecar_plan_v1(static_cast<uint64_t>(total_tasks), streams.aic.size(), streams.aiv.size(), &layout) ||
+    if (!aicore_sidecar_plan_v1(static_cast<uint64_t>(total_tasks), aic_task_count, aiv_task_count, &layout) ||
         layout.total_size > std::numeric_limits<uint64_t>::max() - (AICORE_SIDECAR_ALIGNMENT_V1 - 1)) {
         LOG_ERROR("A5 HBG AICore scheduler: sidecar layout overflow");
         return false;
@@ -926,14 +870,8 @@ bool create_aicore_sidecar_v1(
                                           0 :
                                           runtime->get_function_bin_addr(static_cast<int32_t>(func_id)) +
                                               CoreCallable::binary_data_offset();
-    auto *aic_tickets = aicore_sidecar_at_v1<AicoreTaskTicketV1>(host_base, layout.aic_tickets_offset);
-    std::transform(streams.aic.begin(), streams.aic.end(), aic_tickets, [&](uint32_t task_id) {
-        return task_tickets[task_id];
-    });
-    auto *aiv_tickets = aicore_sidecar_at_v1<AicoreTaskTicketV1>(host_base, layout.aiv_tickets_offset);
-    std::transform(streams.aiv.begin(), streams.aiv.end(), aiv_tickets, [&](uint32_t task_id) {
-        return task_tickets[task_id];
-    });
+    auto *metadata = aicore_sidecar_at_v1<AicoreTaskMetadataV1>(host_base, layout.task_metadata_offset);
+    std::copy(task_metadata.begin(), task_metadata.end(), metadata);
 
     const pto2_sm_layout::PTO2RingSegmentOffsets device_segments =
         pto2_sm_layout::ring_segment_offsets(task_window_size);
@@ -942,8 +880,11 @@ bool create_aicore_sidecar_v1(
     run_control->expected_task_count = static_cast<uint64_t>(total_tasks);
     run_control->inline_completed_count = inline_completed_task_ids.size();
     run_control->claim_bindings_offset = layout.claim_bindings_offset;
-    run_control->expected_root_prepare_count = root_prepare_count;
     run_control->dispatch_payloads_offset = layout.dispatch_payloads_offset;
+    run_control->task_metadata_offset = layout.task_metadata_offset;
+    run_control->ready_inboxes_offset = layout.ready_inboxes_offset;
+    run_control->ready_directory_offset = layout.ready_directory_offset;
+    run_control->free_slot_directory_offset = layout.free_slot_directory_offset;
     run_control->error_task_id = UINT64_MAX;
     run_control->error_core_id = UINT64_MAX;
     run_control->error_core_type = UINT64_MAX;
@@ -960,15 +901,15 @@ bool create_aicore_sidecar_v1(
         context.run_control_offset = layout.run_control_offset;
         context.task_controls_offset = layout.task_controls_offset;
         context.completion_inboxes_offset = layout.completion_inboxes_offset;
-        context.root_prepare_inboxes_offset = layout.root_prepare_inboxes_offset;
+        context.task_metadata_offset = layout.task_metadata_offset;
+        context.ready_inboxes_offset = layout.ready_inboxes_offset;
+        context.ready_directory_offset = layout.ready_directory_offset;
+        context.free_slot_directory_offset = layout.free_slot_directory_offset;
         context.worker_contexts_offset = layout.worker_contexts_offset;
         context.dispatch_slots_offset = layout.dispatch_slots_offset;
-        context.claim_prefetches_offset = layout.claim_prefetches_offset;
         context.callable_addresses_offset = layout.callable_addresses_offset;
         context.runtime_worker_count = static_cast<uint64_t>(runtime->get_worker_count());
         context.bootstrap_done = 0;
-        context.aic_stream_offset = layout.aic_stream_offset;
-        context.aiv_stream_offset = layout.aiv_stream_offset;
         context.graph_descriptors_address = device_sm_address + device_segments.descriptors;
         context.graph_payloads_address = device_sm_address + device_segments.payloads;
         context.sidecar_base_address = aligned_address;
@@ -1541,11 +1482,14 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
             const auto *completion_inboxes = aicore_sidecar_at_v1<AicoreCompletionInboxV1>(
                 host_sidecar, runtime->aicore_sidecar_layout.completion_inboxes_offset
             );
-            const auto *root_prepare_inboxes = aicore_sidecar_at_v1<AicoreRootPrepareInboxV1>(
-                host_sidecar, runtime->aicore_sidecar_layout.root_prepare_inboxes_offset
+            const auto *ready_inboxes = aicore_sidecar_at_v1<AicoreReadyInboxV1>(
+                host_sidecar, runtime->aicore_sidecar_layout.ready_inboxes_offset
             );
-            const auto *claim_bindings = aicore_sidecar_at_v1<AicoreTaskClaimBindingV1>(
-                host_sidecar, runtime->aicore_sidecar_layout.claim_bindings_offset
+            const auto *ready_directory = aicore_sidecar_at_v1<AicoreReadyDirectoryV1>(
+                host_sidecar, runtime->aicore_sidecar_layout.ready_directory_offset
+            );
+            const auto *free_slot_directory = aicore_sidecar_at_v1<AicoreFreeSlotDirectoryV1>(
+                host_sidecar, runtime->aicore_sidecar_layout.free_slot_directory_offset
             );
             const auto *dispatch_slots = aicore_sidecar_at_v1<AicoreDispatchSlotV1>(
                 host_sidecar, runtime->aicore_sidecar_layout.dispatch_slots_offset
@@ -1555,9 +1499,16 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
             );
             uint64_t active_workers = 0;
             uint64_t worker_executed = 0;
-            uint64_t seeded = 0;
-            uint64_t ticket_claims = 0;
-            uint64_t ticket_exhaustions = 0;
+            uint64_t bootstrap_tasks = 0;
+            uint64_t ready_enqueues = 0;
+            uint64_t ready_batches = 0;
+            uint64_t ready_pops = 0;
+            uint64_t ready_steals = 0;
+            uint64_t ready_cas_retries = 0;
+            uint64_t ready_link_waits = 0;
+            uint64_t ready_link_wait_max = 0;
+            uint64_t free_slot_claims = 0;
+            uint64_t free_slot_stale = 0;
             uint64_t state_polls = 0;
             uint64_t fanin_loads = 0;
             uint64_t wake_registers = 0;
@@ -1575,17 +1526,8 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
             uint64_t completion_lag_max_cycles = 0;
             uint64_t ready_to_kernel_cycles = 0;
             uint64_t ready_to_kernel_max_cycles = 0;
-            uint64_t root_prepare_enqueues = 0;
-            uint64_t root_prepare_batches = 0;
-            uint64_t root_prepare_resolves = 0;
-            uint64_t root_prepare_steals = 0;
-            uint64_t root_prepare_link_waits = 0;
-            uint64_t root_prepare_link_wait_max = 0;
-            uint64_t root_prepare_cycles = 0;
             uint64_t idle_iterations = 0;
             uint64_t backoff_cycles = 0;
-            uint64_t claim_cycles = 0;
-            uint64_t dependency_wait_cycles = 0;
             uint64_t payload_cycles = 0;
             uint64_t kernel_cycles = 0;
             uint64_t completion_cycles = 0;
@@ -1594,9 +1536,16 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
             for (int32_t i = 0; i < runtime->worker_count; ++i) {
                 if (contexts[i].active != 0) ++active_workers;
                 worker_executed += contexts[i].executed_task_count;
-                seeded += contexts[i].seeded_task_count;
-                ticket_claims += contexts[i].ticket_claim_count;
-                ticket_exhaustions += contexts[i].ticket_exhaustion_count;
+                bootstrap_tasks += contexts[i].bootstrap_task_count;
+                ready_enqueues += contexts[i].ready_enqueue_count;
+                ready_batches += contexts[i].ready_batch_count;
+                ready_pops += contexts[i].ready_pop_count;
+                ready_steals += contexts[i].ready_steal_count;
+                ready_cas_retries += contexts[i].ready_cas_retry_count;
+                ready_link_waits += contexts[i].ready_link_wait_count;
+                ready_link_wait_max = std::max(ready_link_wait_max, contexts[i].ready_link_wait_max);
+                free_slot_claims += contexts[i].free_slot_claim_count;
+                free_slot_stale += contexts[i].free_slot_stale_count;
                 state_polls += contexts[i].task_state_poll_count;
                 fanin_loads += contexts[i].fanin_state_load_count;
                 wake_registers += contexts[i].wake_register_count;
@@ -1615,25 +1564,15 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
                 ready_to_kernel_cycles += contexts[i].ready_to_kernel_cycles;
                 ready_to_kernel_max_cycles =
                     std::max(ready_to_kernel_max_cycles, contexts[i].ready_to_kernel_max_cycles);
-                root_prepare_enqueues += contexts[i].root_prepare_enqueue_count;
-                root_prepare_batches += contexts[i].root_prepare_batch_count;
-                root_prepare_resolves += contexts[i].root_prepare_resolve_count;
-                root_prepare_steals += contexts[i].root_prepare_steal_count;
-                root_prepare_link_waits += contexts[i].root_prepare_link_wait_count;
-                root_prepare_link_wait_max =
-                    std::max(root_prepare_link_wait_max, contexts[i].root_prepare_link_wait_max);
-                root_prepare_cycles += contexts[i].root_prepare_cycles;
                 idle_iterations += contexts[i].idle_iteration_count;
                 backoff_cycles += contexts[i].backoff_cycles;
-                claim_cycles += contexts[i].claim_cycles;
-                dependency_wait_cycles += contexts[i].dependency_wait_cycles;
                 payload_cycles += contexts[i].payload_cycles;
                 kernel_cycles += contexts[i].kernel_cycles;
                 completion_cycles += contexts[i].completion_enqueue_cycles;
             }
             bool completion_inboxes_empty = true;
             for (uint64_t inbox = 0; inbox < control->aiv_active_worker_count; ++inbox) {
-                if (completion_inboxes[inbox].head != AICORE_COMPLETION_INBOX_EMPTY_V1) {
+                if (completion_inboxes[inbox].head != AICORE_INBOX_EMPTY_V1) {
                     LOG_ERROR(
                         "A5 HBG AICore scheduler: completion inbox=%" PRIu64 " not empty head=%" PRId64, inbox,
                         completion_inboxes[inbox].head
@@ -1642,16 +1581,24 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
                     break;
                 }
             }
-            bool root_prepare_inboxes_empty = true;
-            for (uint64_t inbox = 0; inbox < control->aiv_active_worker_count; ++inbox) {
-                if (root_prepare_inboxes[inbox].head != AICORE_ROOT_PREPARE_INBOX_EMPTY_V1) {
-                    LOG_ERROR(
-                        "A5 HBG AICore scheduler: root prepare inbox=%" PRIu64 " not empty head=%" PRId64, inbox,
-                        root_prepare_inboxes[inbox].head
-                    );
-                    root_prepare_inboxes_empty = false;
-                    break;
+            bool ready_inboxes_empty = true;
+            for (uint32_t type = 0; type < AICORE_CORE_TYPE_COUNT_V1 && ready_inboxes_empty; ++type) {
+                for (uint64_t inbox = 0; inbox < control->aiv_active_worker_count; ++inbox) {
+                    uint64_t linear = static_cast<uint64_t>(type) * AICORE_WORKER_CAPACITY_V1 + inbox;
+                    if (ready_inboxes[linear].head != AICORE_INBOX_EMPTY_V1) {
+                        LOG_ERROR(
+                            "A5 HBG AICore scheduler: ready type=%u inbox=%" PRIu64 " not empty head=%" PRId64,
+                            type, inbox, ready_inboxes[linear].head
+                        );
+                        ready_inboxes_empty = false;
+                        break;
+                    }
                 }
+            }
+            bool ready_directory_empty = true;
+            for (uint32_t type = 0; type < AICORE_CORE_TYPE_COUNT_V1; ++type) {
+                for (uint32_t word = 0; word < AICORE_READY_DIRECTORY_WORD_COUNT_V1; ++word)
+                    ready_directory_empty = ready_directory_empty && ready_directory->words[type][word] == 0;
             }
             bool task_controls_valid = true;
             for (int32_t task_id = 0; task_id < runtime->host_total_tasks; ++task_id) {
@@ -1665,60 +1612,63 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
                     break;
                 }
             }
-            bool dispatch_slots_retired = true;
-            for (int32_t worker = 0; worker < runtime->worker_count && dispatch_slots_retired; ++worker) {
+            bool dispatch_slots_free = true;
+            uint64_t expected_free_words[AICORE_CORE_TYPE_COUNT_V1][AICORE_FREE_SLOT_DIRECTORY_WORD_COUNT_V1]{};
+            for (int32_t worker = 0; worker < runtime->worker_count && dispatch_slots_free; ++worker) {
                 if (contexts[worker].active == 0) continue;
                 if (contexts[worker].bootstrap_done == 0) {
                     LOG_ERROR("A5 HBG AICore scheduler: worker=%d dispatch bootstrap incomplete", worker);
-                    dispatch_slots_retired = false;
+                    dispatch_slots_free = false;
                     break;
                 }
+                uint32_t type = contexts[worker].core_type == static_cast<int32_t>(CoreType::AIC) ? 0U : 1U;
                 for (uint32_t slot = 0; slot < AICORE_PENDING_SLOT_COUNT_V1; ++slot) {
+                    uint64_t linear = static_cast<uint64_t>(worker) * AICORE_PENDING_SLOT_COUNT_V1 + slot;
+                    expected_free_words[type][linear / 64] |= UINT64_C(1) << (linear % 64);
                     const AicoreDispatchSlotV1 &dispatch =
-                        dispatch_slots[static_cast<uint64_t>(worker) * AICORE_PENDING_SLOT_COUNT_V1 + slot];
+                        dispatch_slots[linear];
                     if (dispatch.task_id != AICORE_TASK_ID_INVALID_V1 ||
                         static_cast<AicoreDispatchPublicationV1>(dispatch.publication & UINT64_C(0xff)) !=
-                            AicoreDispatchPublicationV1::RETIRED) {
+                            AicoreDispatchPublicationV1::FREE) {
                         LOG_ERROR(
-                            "A5 HBG AICore scheduler: worker=%d slot=%u not retired task=%" PRId64
+                            "A5 HBG AICore scheduler: worker=%d slot=%u not free task=%" PRId64
                             " publication=%" PRIu64,
                             worker, slot, dispatch.task_id, dispatch.publication
                         );
-                        dispatch_slots_retired = false;
+                        dispatch_slots_free = false;
                         break;
                     }
                 }
             }
-            const auto *aic_stream = aicore_sidecar_at_v1<AicoreTaskStreamV1>(
-                host_sidecar, runtime->aicore_sidecar_layout.aic_stream_offset
-            );
-            const auto *aiv_stream = aicore_sidecar_at_v1<AicoreTaskStreamV1>(
-                host_sidecar, runtime->aicore_sidecar_layout.aiv_stream_offset
-            );
+            bool free_directory_exact = true;
+            for (uint32_t type = 0; type < AICORE_CORE_TYPE_COUNT_V1; ++type) {
+                for (uint32_t word = 0; word < AICORE_FREE_SLOT_DIRECTORY_WORD_COUNT_V1; ++word) {
+                    free_directory_exact = free_directory_exact &&
+                                           free_slot_directory->words[type][word] == expected_free_words[type][word];
+                }
+            }
             if (control->scheduler_error != 0 ||
                 control->expected_task_count != static_cast<uint64_t>(runtime->host_total_tasks) ||
-                worker_executed != executable_task_count || control->executed_task_count != executable_task_count ||
-                seeded + ticket_claims != executable_task_count ||
+                worker_executed != executable_task_count || bootstrap_tasks != executable_task_count ||
                 worker_executed + control->inline_completed_count != control->expected_task_count ||
                 active_workers != control->active_worker_count ||
-                control->executor_drained_worker_count != control->active_worker_count ||
+                control->bootstrap_arrived_count != control->aiv_active_worker_count ||
+                control->bootstrap_complete == 0 ||
                 control->resolved_task_count != executable_task_count || wake_closes != executable_task_count ||
                 wake_registers != wake_migrations || completion_enqueues != executable_task_count ||
-                completion_resolves != executable_task_count || aic_stream->next_index < aic_stream->task_count ||
-                aiv_stream->next_index < aiv_stream->task_count || root_prepare_enqueues != 0 ||
-                root_prepare_resolves != control->expected_root_prepare_count || !task_controls_valid ||
-                !completion_inboxes_empty || !root_prepare_inboxes_empty || !dispatch_slots_retired) {
+                completion_resolves != executable_task_count || ready_enqueues != executable_task_count ||
+                ready_pops != executable_task_count || !task_controls_valid || !completion_inboxes_empty ||
+                !ready_inboxes_empty || !ready_directory_empty || !dispatch_slots_free || !free_directory_exact) {
                 LOG_ERROR(
                     "A5 HBG AICore scheduler: invalid final state expected=%" PRIu64 " executed=%" PRIu64
-                    " executable=%" PRIu64 " inline=%" PRIu64 " active=%" PRIu64 " executor_drained=%" PRIu64
+                    " executable=%" PRIu64 " inline=%" PRIu64 " active=%" PRIu64 " bootstrap=%" PRIu64
                     " resolved=%" PRIu64 " wake_registers=%" PRIu64 " wake_migrations=%" PRIu64 " wake_closes=%" PRIu64
-                    " enqueues=%" PRIu64 " resolver_tasks=%" PRIu64 " root_expected=%" PRIu64 " root_enqueues=%" PRIu64
-                    " root_resolves=%" PRIu64 " error=%" PRIu64,
+                    " completion_enqueues=%" PRIu64 " completion_resolves=%" PRIu64
+                    " ready_enqueues=%" PRIu64 " ready_pops=%" PRIu64 " error=%" PRIu64,
                     control->expected_task_count, worker_executed, executable_task_count,
-                    control->inline_completed_count, active_workers, control->executor_drained_worker_count,
+                    control->inline_completed_count, active_workers, bootstrap_tasks,
                     control->resolved_task_count, wake_registers, wake_migrations, wake_closes, completion_enqueues,
-                    completion_resolves, control->expected_root_prepare_count, root_prepare_enqueues,
-                    root_prepare_resolves, control->scheduler_error
+                    completion_resolves, ready_enqueues, ready_pops, control->scheduler_error
                 );
                 if (control->scheduler_error != 0) {
                     LOG_ERROR(
@@ -1733,33 +1683,33 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
                 rc = -1;
             } else if (control->expected_task_count != 0) {
                 LOG_INFO(
-                    "A5 HBG AICore scheduler HOST TIMING: claim=%" PRIu64 " dependency_wait=%" PRIu64
-                    " payload=%" PRIu64 " kernel=%" PRIu64 " completion=%" PRIu64 " backoff=%" PRIu64 " cycles",
-                    claim_cycles, dependency_wait_cycles, payload_cycles, kernel_cycles, completion_cycles,
-                    backoff_cycles
+                    "A5 HBG AICore scheduler HOST TIMING: payload=%" PRIu64 " kernel=%" PRIu64
+                    " completion=%" PRIu64 " backoff=%" PRIu64 " cycles",
+                    payload_cycles, kernel_cycles, completion_cycles, backoff_cycles
                 );
                 LOG_INFO(
-                    "A5 HBG AICore scheduler COUNTERS: seeded=%" PRIu64 " ticket_claims=%" PRIu64
-                    " exhaustions=%" PRIu64 " state_polls=%" PRIu64 " fanin_loads=%" PRIu64 " wake_registers=%" PRIu64
+                    "A5 HBG AICore scheduler COUNTERS: bootstrap_tasks=%" PRIu64 " ready_enqueues=%" PRIu64
+                    " ready_batches=%" PRIu64 " ready_pops=%" PRIu64 " ready_steals=%" PRIu64
+                    " ready_cas_retries=%" PRIu64 " ready_link_waits=%" PRIu64
+                    " ready_link_wait_max=%" PRIu64 " free_slot_claims=%" PRIu64
+                    " free_slot_stale=%" PRIu64 " state_polls=%" PRIu64 " fanin_loads=%" PRIu64 " wake_registers=%" PRIu64
                     " wake_cas_retries=%" PRIu64 " wake_closed_retries=%" PRIu64 " wake_migrations=%" PRIu64
                     " wake_closes=%" PRIu64 " completion_enqueues=%" PRIu64 " completion_batches=%" PRIu64
                     " completion_resolves=%" PRIu64 " completion_steals=%" PRIu64 " completion_link_waits=%" PRIu64
                     " completion_link_wait_max=%" PRIu64 " completion_lag_cycles=%" PRIu64
                     " completion_lag_max=%" PRIu64 " ready_to_kernel_cycles=%" PRIu64 " ready_to_kernel_max=%" PRIu64
-                    " root_prepare_enqueues=%" PRIu64 " root_prepare_batches=%" PRIu64 " root_prepare_resolves=%" PRIu64
-                    " root_prepare_steals=%" PRIu64 " root_prepare_link_waits=%" PRIu64
-                    " root_prepare_link_wait_max=%" PRIu64 " root_prepare_cycles=%" PRIu64 " idle_iterations=%" PRIu64,
-                    seeded, ticket_claims, ticket_exhaustions, state_polls, fanin_loads, wake_registers,
+                    " idle_iterations=%" PRIu64,
+                    bootstrap_tasks, ready_enqueues, ready_batches, ready_pops, ready_steals, ready_cas_retries,
+                    ready_link_waits, ready_link_wait_max, free_slot_claims, free_slot_stale, state_polls, fanin_loads,
+                    wake_registers,
                     wake_cas_retries, wake_closed_retries, wake_migrations, wake_closes, completion_enqueues,
                     completion_batches, completion_resolves, completion_steals, completion_link_waits,
                     completion_link_wait_max, completion_lag_cycles, completion_lag_max_cycles, ready_to_kernel_cycles,
-                    ready_to_kernel_max_cycles, root_prepare_enqueues, root_prepare_batches, root_prepare_resolves,
-                    root_prepare_steals, root_prepare_link_waits, root_prepare_link_wait_max, root_prepare_cycles,
-                    idle_iterations
+                    ready_to_kernel_max_cycles, idle_iterations
                 );
             }
             if (!append_aicore_scheduler_trace(
-                    runtime, control, lifecycle_traces, traces, task_controls, claim_bindings, contexts
+                    runtime, control, lifecycle_traces, traces, task_controls, contexts
                 ))
                 rc = -1;
         }

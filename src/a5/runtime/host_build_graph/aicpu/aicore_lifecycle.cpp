@@ -118,17 +118,9 @@ int32_t AicoreLifecycle::post_handshake_init(Runtime *runtime) {
     auto *lifecycle_traces = aicore_sidecar_at_v1<AicpuCoreLifecycleTraceV1>(
         runtime->aicore_sidecar_base, runtime->aicore_sidecar_layout.aicpu_lifecycle_traces_offset
     );
-    auto *aic_stream = aicore_sidecar_at_v1<AicoreTaskStreamV1>(
-        runtime->aicore_sidecar_base, runtime->aicore_sidecar_layout.aic_stream_offset
-    );
-    auto *aiv_stream = aicore_sidecar_at_v1<AicoreTaskStreamV1>(
-        runtime->aicore_sidecar_base, runtime->aicore_sidecar_layout.aiv_stream_offset
-    );
     cache_invalidate_range(run_control, sizeof(*run_control));
     cache_invalidate_range(contexts, static_cast<size_t>(core_count_) * sizeof(*contexts));
     cache_invalidate_range(lifecycle_traces, static_cast<size_t>(core_count_) * sizeof(*lifecycle_traces));
-    cache_invalidate_range(aic_stream, sizeof(*aic_stream));
-    cache_invalidate_range(aiv_stream, sizeof(*aiv_stream));
 
     int32_t aic_count = 0;
     int32_t aiv_count = 0;
@@ -179,19 +171,14 @@ int32_t AicoreLifecycle::post_handshake_init(Runtime *runtime) {
         contexts[i].inbox_index =
             is_aiv && contexts[i].active != 0 ? static_cast<uint64_t>(contexts[i].type_rank) : UINT64_MAX;
     }
-    aic_stream->initial_ticket_count = static_cast<uint64_t>(active_aic);
-    aic_stream->next_index = static_cast<uint64_t>(active_aic);
-    aiv_stream->initial_ticket_count = static_cast<uint64_t>(active_aiv_executors);
-    aiv_stream->next_index = static_cast<uint64_t>(active_aiv_executors);
     run_control->active_worker_count = static_cast<uint64_t>(active_aic) + static_cast<uint64_t>(active_aiv);
     run_control->aic_active_worker_count = static_cast<uint64_t>(active_aic);
     run_control->aiv_active_worker_count = static_cast<uint64_t>(active_aiv);
+    if (executable_task_count == 0) run_control->bootstrap_complete = 1;
 
     if (is_pmu_enabled()) pmu_aicpu_init(physical_core_ids_, core_count_);
     cache_flush_range(contexts, static_cast<size_t>(core_count_) * sizeof(*contexts));
     cache_flush_range(lifecycle_traces, static_cast<size_t>(core_count_) * sizeof(*lifecycle_traces));
-    cache_flush_range(aic_stream, sizeof(*aic_stream));
-    cache_flush_range(aiv_stream, sizeof(*aiv_stream));
     cache_flush_range(run_control, sizeof(*run_control));
     wmb();
     return 0;

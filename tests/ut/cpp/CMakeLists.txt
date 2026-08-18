@@ -783,13 +783,7 @@ target_sources(test_hbg_submit_poison PRIVATE
     ${HBG_RUNTIME_DIR}/shared/runtime.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
 )
-add_a5_hbg_runtime_test(test_a5_hbg_ticket_scheduler a5/test_aicore_ticket_scheduler_v1.cpp)
-target_sources(test_a5_hbg_ticket_scheduler PRIVATE
-    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/host_build_graph/host/aicore_ticket_stream_planner.cpp
-)
-target_include_directories(test_a5_hbg_ticket_scheduler PRIVATE
-    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/host_build_graph/host
-)
+add_a5_hbg_runtime_test(test_a5_hbg_ready_scheduler a5/test_aicore_ready_scheduler_v1.cpp)
 add_a2a3_hbg_runtime_test(test_graph_cache a2a3/test_graph_cache.cpp)
 target_sources(test_graph_cache PRIVATE
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/host_build_graph/runtime/scheduler/graph_execution.cpp

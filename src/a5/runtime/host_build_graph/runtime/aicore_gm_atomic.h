@@ -224,3 +224,35 @@ inline __aicore__ uint64_t aicore_gm_compare_exchange_v0(
     return observed;
 #endif
 }
+
+inline __aicore__ uint64_t
+aicore_gm_fetch_or_v0(__gm__ volatile uint64_t &value, uint64_t bits, int order = __ATOMIC_ACQ_REL) {
+#if defined(__CCE_AICORE__)
+    (void)order;
+    uint64_t observed = aicore_gm_load_v0(value);
+    while ((observed & bits) != bits) {
+        uint64_t actual = aicore_gm_compare_exchange_v0(value, observed, observed | bits);
+        if (actual == observed) break;
+        observed = actual;
+    }
+    return observed;
+#else
+    return __atomic_fetch_or(&value, bits, order);
+#endif
+}
+
+inline __aicore__ uint64_t
+aicore_gm_fetch_and_v0(__gm__ volatile uint64_t &value, uint64_t bits, int order = __ATOMIC_ACQ_REL) {
+#if defined(__CCE_AICORE__)
+    (void)order;
+    uint64_t observed = aicore_gm_load_v0(value);
+    while ((observed & bits) != observed) {
+        uint64_t actual = aicore_gm_compare_exchange_v0(value, observed, observed & bits);
+        if (actual == observed) break;
+        observed = actual;
+    }
+    return observed;
+#else
+    return __atomic_fetch_and(&value, bits, order);
+#endif
+}
