@@ -371,9 +371,14 @@ TEST(AicoreTicketSchedulerV1, CompletionRefillConsumesPrefetchAndPublishesExecut
     ));
     ASSERT_EQ(binding.dispatch_payload_offset, target.dispatch_payload_offset);
     ASSERT_EQ(route, AicoreRouteResultV1::READY_TO_PUBLISH);
+    const uint64_t bound_callable_address = binding.callable_address;
+    callable_addresses[1] = UINT64_C(0xdeadbeef);
     ASSERT_TRUE(
         aicore_publish_prepared_dispatch_v1(graph, sidecar.base(), &resolver, &run_control, binding, true, &root_stats)
     );
+    const auto *payload =
+        aicore_sidecar_at_v1<PTO2DispatchPayload>(sidecar.base(), binding.dispatch_payload_offset);
+    EXPECT_EQ(payload->function_bin_addr, bound_callable_address);
     auto *slot = aicore_dispatch_slot_at_v1(sidecar.base(), &resolver, target.worker_index, 0);
     ASSERT_EQ(aicore_dispatch_state_v1(slot->publication), AicoreDispatchPublicationV1::READY);
     EXPECT_EQ(slot->task_id, 0);

@@ -15,14 +15,29 @@
 
 #include "aicore_execution_sidecar_v1.h"
 
-inline __aicore__ void aicore_publish_cache_line_v0(__gm__ void *address) {
+inline __aicore__ void aicore_writeback_cache_line_v0(__gm__ void *address) {
 #if defined(__CCE_AICORE__)
     dcci(address, SINGLE_CACHE_LINE, CACHELINE_OUT);
-    dsb((mem_dsb_t)0);
 #else
     (void)address;
+#endif
+}
+
+inline __aicore__ void aicore_writeback_cache_line_v0(volatile __gm__ void *address) {
+    aicore_writeback_cache_line_v0(const_cast<__gm__ void *>(address));
+}
+
+inline __aicore__ void aicore_cache_barrier_v0() {
+#if defined(__CCE_AICORE__)
+    dsb((mem_dsb_t)0);
+#else
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
 #endif
+}
+
+inline __aicore__ void aicore_publish_cache_line_v0(__gm__ void *address) {
+    aicore_writeback_cache_line_v0(address);
+    aicore_cache_barrier_v0();
 }
 
 inline __aicore__ void aicore_publish_cache_line_v0(volatile __gm__ void *address) {

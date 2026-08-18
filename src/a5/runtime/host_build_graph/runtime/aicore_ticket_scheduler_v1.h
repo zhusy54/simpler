@@ -204,7 +204,7 @@ inline __host__ __aicore__ AicoreTaskClaimBindingV1 aicore_make_claim_binding_v1
     return binding;
 }
 
-inline __aicore__ void aicore_publish_claim_binding_v1(
+inline __aicore__ void aicore_write_claim_binding_v1(
     __gm__ void *sidecar_base, __gm__ AicoreRunControlV1 *run_control, const AicoreTaskClaimBindingV1 &binding
 ) {
     __gm__ AicoreTaskClaimBindingV1 *destination =
@@ -220,7 +220,14 @@ inline __aicore__ void aicore_publish_claim_binding_v1(
     destination->root_prepare_end_cycles = 0;
     destination->root_prepare_resolver_worker_id = UINT64_MAX;
     destination->task_id = binding.task_id;
-    aicore_publish_cache_line_v0(destination);
+    aicore_writeback_cache_line_v0(destination);
+}
+
+inline __aicore__ void aicore_publish_claim_binding_v1(
+    __gm__ void *sidecar_base, __gm__ AicoreRunControlV1 *run_control, const AicoreTaskClaimBindingV1 &binding
+) {
+    aicore_write_claim_binding_v1(sidecar_base, run_control, binding);
+    aicore_cache_barrier_v0();
 }
 
 inline __aicore__ bool aicore_observe_claim_binding_v1(
@@ -431,13 +438,8 @@ inline __aicore__ bool aicore_materialize_claim_payload_v1(
     };
     __gm__ PTO2DispatchPayload *payload =
         aicore_sidecar_at_v1<PTO2DispatchPayload>(sidecar_base, binding.dispatch_payload_offset);
-    __gm__ uint64_t *callable_addresses =
-        aicore_sidecar_at_v1<uint64_t>(sidecar_base, context->callable_addresses_offset);
-    aicore_observe_cache_line_v0(&callable_addresses[binding.kernel_id]);
-    const uint64_t resolved_address = callable_addresses[binding.kernel_id];
-    const uint64_t function_bin_address = resolved_address == 0 ? binding.callable_address : resolved_address;
     AicoreRootStatusV0 status =
-        aicore_materialize_task_payload_resolved_v0(graph, task, function_bin_address, payload);
+        aicore_materialize_task_payload_resolved_v0(graph, task, binding.callable_address, payload);
     if (status != AicoreRootStatusV0::OK) {
         aicore_record_scheduler_error_v1(run_control, binding.task_id, status, &graph, context, UINT64_C(4));
         return false;
@@ -599,7 +601,8 @@ inline __aicore__ bool aicore_prepare_dispatch_binding_v1(
     __gm__ AicoreRunControlV1 *run_control, __gm__ AicoreWorkerContextV1 *target, uint64_t target_worker_index,
     uint32_t pending_slot, const AicoreTaskTicketV1 &ticket, uint64_t stream_index, AicoreClaimKindV1 claim_kind,
     uint64_t claim_start_cycles, uint64_t claim_end_cycles, uint64_t claim_worker_id, AicoreWakeStatsV1 *wake_stats,
-    AicoreTaskClaimBindingV1 *binding, AicoreRouteResultV1 *route, bool trace_enabled = false
+    AicoreTaskClaimBindingV1 *binding, AicoreRouteResultV1 *route, bool trace_enabled = false,
+    bool slot_already_observed = false
 ) {
     if (target == nullptr || binding == nullptr || route == nullptr || pending_slot >= AICORE_PENDING_SLOT_COUNT_V1) {
         return false;
@@ -611,7 +614,7 @@ inline __aicore__ bool aicore_prepare_dispatch_binding_v1(
     }
     __gm__ AicoreDispatchSlotV1 *slot =
         aicore_dispatch_slot_at_v1(sidecar_base, resolver, target_worker_index, pending_slot);
-    aicore_observe_cache_line_v0(slot);
+    if (!slot_already_observed) aicore_observe_cache_line_v0(slot);
     uint32_t generation = slot->generation + 1;
     if (generation == 0) generation = 1;
     const uint16_t kernel_id = aicore_task_ticket_kernel_id_v1(ticket);
@@ -639,7 +642,7 @@ inline __aicore__ bool aicore_prepare_dispatch_binding_v1(
     slot->claim_kind = static_cast<uint8_t>(claim_kind);
     slot->pending_slot = static_cast<uint8_t>(pending_slot);
     slot->generation = generation;
-    aicore_publish_cache_line_v0(slot);
+    aicore_writeback_cache_line_v0(slot);
 
     binding->task_id = task_id;
     binding->callable_address = callable_address;
@@ -653,20 +656,21 @@ inline __aicore__ bool aicore_prepare_dispatch_binding_v1(
     binding->root_prepare_start_cycles = 0;
     binding->root_prepare_end_cycles = 0;
     binding->root_prepare_resolver_worker_id = 0;
-    aicore_publish_claim_binding_v1(sidecar_base, run_control, *binding);
+    aicore_write_claim_binding_v1(sidecar_base, run_control, *binding);
+    __gm__ AicoreTaskTraceCellV1 *trace = nullptr;
     if (trace_enabled) {
         __gm__ AicoreTaskTraceCellV1 *trace_cells =
             aicore_sidecar_at_v1<AicoreTaskTraceCellV1>(sidecar_base, resolver->trace_cells_offset);
-        __gm__ AicoreTaskTraceCellV1 *trace = &trace_cells[task_id];
+        trace = &trace_cells[task_id];
         trace->claim_kind = static_cast<uint64_t>(claim_kind);
         trace->stream_index = stream_index;
         trace->claim_start_cycles = claim_start_cycles;
         trace->claim_end_cycles = claim_end_cycles;
-        aicore_publish_cache_line_v0(trace);
-        trace->initialize_end_cycles = aicore_scheduler_cycles_v1();
         trace->claim_worker_id = claim_worker_id;
-        aicore_publish_cache_line_v0(&trace->initialize_end_cycles);
+        aicore_writeback_cache_line_v0(trace);
     }
+    aicore_cache_barrier_v0();
+    if (trace != nullptr) trace->initialize_end_cycles = aicore_scheduler_cycles_v1();
 
     if (slot->has_fanin == 0) {
         *route = AicoreRouteResultV1::READY_TO_PUBLISH;
@@ -792,7 +796,7 @@ inline __aicore__ bool aicore_refill_completed_slot_v1(
     if (!aicore_prepare_dispatch_binding_v1(
             graph, sidecar_base, resolver, run_control, target, completed_binding.owner_worker_id,
             completed_binding.pending_slot, ticket, stream_index, claim_kind, claim_start, claim_end, claim_worker_id,
-            wake_stats, &binding, &route, trace_enabled
+            wake_stats, &binding, &route, trace_enabled, true
         )) {
         return false;
     }
