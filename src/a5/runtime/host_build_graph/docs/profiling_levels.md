@@ -53,6 +53,10 @@ Supported AICore phase names are `AICoreEntryToHandshake`,
 `CompletionService`, `TraceCommit`, `SchedulerToClaim`, `TaskInitialize`, `TaskRoute`,
 `SchedulerToReadyScan`, `InterTaskSchedule`, `ReadyScan`, `ReadyToPayload`,
 `CompletionBatchClaim`, `WakeResolve`, `ReadyPublish`, `ExecutorDrainPublish`,
+`CompletionInboxProbe`, `CompletionInboxDetach`, `CompletionInboxStealProbe`,
+`CompletionInboxStealDetach`, `CompletionBatchWalk`, `CompletionLinkObserve`,
+`SlotRefillObserve`, `SlotRefillTakePrefetch`, `SlotRefillBind`, `SlotRefillRoute`, `SlotRefillBindRoute`,
+`SlotRefillPayloadPublish`, `SlotRefillNextPrefetch`,
 `WaitForExit`, `FinalStatsPublish`, `ExitAckPublish`, and `Drain`. The swimlane converter renders
 them on per-worker `Scheduler` lanes. Each `Kernel` phase also carries
 the resolved function name and serves as the task/dependency-flow anchor; the
@@ -88,6 +92,15 @@ covers local selection through payload materialization start. A task without a
 Only AIV workers emit `CompletionService`, `CompletionBatchClaim`, and
 `WakeResolve`: completion inbox service and dependency resolution are not
 performed by AIC workers.
+
+Completion refill tracing follows a successfully claimed inbox head through
+slot reuse. `CompletionInbox*Probe` covers the successful head observation,
+`CompletionInbox*Detach` covers the atomic exchange, `CompletionBatchWalk` and
+`CompletionLinkObserve` cover entry into the detached completion chain. The
+`SlotRefill*` phases then split binding/slot observation, prefetched-ticket
+consumption, binding and dependency routing, payload/READY publication, and
+replenishing the next prefetched ticket. Refill phases use the newly assigned
+task ID, while inbox phases use the completed task ID.
 
 The termination tail is split across AICore and AICPU lanes.
 `ExecutorDrainPublish` covers the shared `executed_task_count` and

@@ -159,11 +159,11 @@ aicore_classify_single_root_v0(const AicoreReadonlyGraphV0 &graph, AicoreRootInf
     return aicore_classify_task_v0(graph, 0, root);
 }
 
-inline __host__ __aicore__ AicoreRootStatusV0 aicore_materialize_task_payload_v0(
-    const AicoreReadonlyGraphV0 &graph, const AicoreTaskInfoV0 &task, uint64_t callable_address,
+inline __host__ __aicore__ AicoreRootStatusV0 aicore_materialize_task_payload_resolved_v0(
+    const AicoreReadonlyGraphV0 &graph, const AicoreTaskInfoV0 &task, uint64_t function_bin_address,
     __gm__ PTO2DispatchPayload *dispatch_payload
 ) {
-    if (dispatch_payload == nullptr || callable_address == 0 || task.task_id < 0) {
+    if (dispatch_payload == nullptr || function_bin_address == 0 || task.task_id < 0) {
         return AicoreRootStatusV0::INVALID_CALLABLE;
     }
     __gm__ uint8_t *payload = aicore_graph_payload_v0(graph, task.task_id);
@@ -174,10 +174,7 @@ inline __host__ __aicore__ AicoreRootStatusV0 aicore_materialize_task_payload_v0
         return AicoreRootStatusV0::INVALID_ARGUMENTS;
     }
 
-    __gm__ uint8_t *callable = reinterpret_cast<__gm__ uint8_t *>(callable_address);
-    dispatch_payload->function_bin_addr =
-        *reinterpret_cast<__gm__ uint64_t *>(callable + AICORE_CORE_CALLABLE_RESOLVED_ADDR_OFFSET_V0);
-    if (dispatch_payload->function_bin_addr == 0) return AicoreRootStatusV0::INVALID_CALLABLE;
+    dispatch_payload->function_bin_addr = function_bin_address;
 
     int32_t n = 0;
     for (int32_t i = 0; i < tensor_count; ++i) {
@@ -198,6 +195,17 @@ inline __host__ __aicore__ AicoreRootStatusV0 aicore_materialize_task_payload_v0
         reinterpret_cast<uint64_t>(&dispatch_payload->global_context);
     dispatch_payload->global_context.sub_block_id = task.subtask_slot == 2 ? 1 : 0;
     return AicoreRootStatusV0::OK;
+}
+
+inline __host__ __aicore__ AicoreRootStatusV0 aicore_materialize_task_payload_v0(
+    const AicoreReadonlyGraphV0 &graph, const AicoreTaskInfoV0 &task, uint64_t callable_address,
+    __gm__ PTO2DispatchPayload *dispatch_payload
+) {
+    if (callable_address == 0) return AicoreRootStatusV0::INVALID_CALLABLE;
+    __gm__ uint8_t *callable = reinterpret_cast<__gm__ uint8_t *>(callable_address);
+    const uint64_t function_bin_address =
+        *reinterpret_cast<__gm__ uint64_t *>(callable + AICORE_CORE_CALLABLE_RESOLVED_ADDR_OFFSET_V0);
+    return aicore_materialize_task_payload_resolved_v0(graph, task, function_bin_address, dispatch_payload);
 }
 
 inline __host__ __aicore__ AicoreRootStatusV0 aicore_materialize_root_payload_v0(

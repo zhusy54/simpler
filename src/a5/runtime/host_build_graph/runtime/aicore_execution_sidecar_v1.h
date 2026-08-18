@@ -31,6 +31,7 @@
 inline constexpr uint64_t AICORE_SIDECAR_ALIGNMENT_V1 = 128;
 inline constexpr uint64_t AICORE_WORKER_CAPACITY_V1 = 108;
 inline constexpr uint32_t AICORE_PENDING_SLOT_COUNT_V1 = 2;
+inline constexpr uint32_t AICORE_CALLABLE_CAPACITY_V1 = 1024;
 inline constexpr int64_t AICORE_TASK_ID_INVALID_V1 = -1;
 inline constexpr int64_t AICORE_WAKE_LIST_OPEN_V1 = -1;
 inline constexpr int64_t AICORE_WAKE_LIST_CLOSED_V1 = -2;
@@ -48,6 +49,22 @@ enum class AicoreTaskStateV1 : int64_t {
 enum class AicoreClaimKindV1 : uint64_t {
     SEED = 0,
     TICKET = 1,
+    PREFETCH = 2,
+    REFILL_FALLBACK = 3,
+};
+
+enum class AicoreDispatchPublicationV1 : uint8_t {
+    EMPTY = 0,
+    READY = 1,
+    RETIRED = 2,
+};
+
+enum class AicoreClaimPrefetchStateV1 : uint64_t {
+    EMPTY = 0,
+    FILLING = 1,
+    VALID = 2,
+    CONSUMING = 3,
+    EXHAUSTED = 4,
 };
 
 struct alignas(128) AicoreTaskControlV1 {
@@ -90,47 +107,98 @@ struct alignas(64) AicoreTaskClaimBindingV1 {
     uint16_t kernel_id;
     uint8_t subtask_slot;
     uint8_t pending_slot;
-    uint32_t reserved0;
+    uint32_t dispatch_generation;
     uint64_t root_prepare_start_cycles;
     uint64_t root_prepare_end_cycles;
     uint64_t root_prepare_resolver_worker_id;
 };
 
+// Resolver-owned metadata for one physical Executor payload slot.  The second
+// cache line is the only field polled by the Executor.  A resolver publishes
+// metadata and payload first, then atomically publishes READY/RETIRED here.
+struct alignas(128) AicoreDispatchSlotV1 {
+    int64_t task_id;
+    uint64_t stream_index;
+    uint64_t claim_start_cycles;
+    uint64_t claim_end_cycles;
+    uint64_t pending_wait_start_cycles;
+    uint64_t claim_worker_id;
+    uint16_t kernel_id;
+    uint8_t subtask_slot;
+    uint8_t has_fanin;
+    uint8_t claim_kind;
+    uint8_t pending_slot;
+    uint16_t reserved0;
+    uint32_t generation;
+    uint32_t reserved1;
+
+    volatile uint64_t publication;
+    uint8_t publication_padding[56];
+};
+
+// One-ticket lookahead per worker.  Normal operation consumes VALID on
+// Complete and immediately refills it for the following Complete.  All
+// resolvers may access it, so state transitions are atomic.
+struct alignas(128) AicoreClaimPrefetchV1 {
+    uint64_t ticket_task_id;
+    uint16_t ticket_kernel_id;
+    uint8_t ticket_subtask_slot;
+    uint8_t ticket_flags;
+    uint32_t ticket_reserved;
+    uint64_t stream_index;
+    uint64_t claim_start_cycles;
+    uint64_t claim_end_cycles;
+    uint64_t claim_worker_id;
+    uint8_t metadata_padding[16];
+
+    volatile uint64_t state;
+    uint8_t state_padding[56];
+};
+
 struct alignas(8) AicoreTaskTicketV1 {
-    // Eight tickets fit exactly in one A5 64-byte data-cache line. The full
+    // Four tickets fit exactly in one A5 64-byte data-cache line. The full
     // fanin count stays in the graph payload; the ticket only distinguishes
     // the zero-fanin local-ready path from dependency-routed work.
-    uint64_t packed;
+    uint64_t task_id;
+    uint16_t kernel_id;
+    uint8_t subtask_slot;
+    uint8_t flags;
+    uint32_t reserved;
 };
 
 inline __host__ __aicore__ AicoreTaskTicketV1
 aicore_task_ticket_make_v1(uint32_t task_id, uint16_t kernel_id, uint8_t subtask_slot, bool has_fanin) {
     return {
-        static_cast<uint64_t>(task_id) | (static_cast<uint64_t>(kernel_id) << 32) |
-            (static_cast<uint64_t>(subtask_slot) << 48) | (static_cast<uint64_t>(has_fanin ? 1 : 0) << 56),
+        task_id,
+        kernel_id,
+        subtask_slot,
+        static_cast<uint8_t>(has_fanin ? 1 : 0),
+        0,
     };
 }
 
-inline __host__ __aicore__ uint32_t aicore_task_ticket_task_id_v1(const AicoreTaskTicketV1 &ticket) {
-    return static_cast<uint32_t>(ticket.packed);
+inline __host__ __aicore__ uint64_t aicore_task_ticket_task_id_v1(const AicoreTaskTicketV1 &ticket) {
+    return ticket.task_id;
 }
 
 inline __host__ __aicore__ bool aicore_task_ticket_has_fanin_v1(const AicoreTaskTicketV1 &ticket) {
-    return ((ticket.packed >> 56) & UINT64_C(1)) != 0;
+    return (ticket.flags & UINT8_C(1)) != 0;
 }
 
 inline __host__ __aicore__ uint16_t aicore_task_ticket_kernel_id_v1(const AicoreTaskTicketV1 &ticket) {
-    return static_cast<uint16_t>(ticket.packed >> 32);
+    return ticket.kernel_id;
 }
 
 inline __host__ __aicore__ uint8_t aicore_task_ticket_subtask_slot_v1(const AicoreTaskTicketV1 &ticket) {
-    return static_cast<uint8_t>(ticket.packed >> 48);
+    return ticket.subtask_slot;
 }
+
+static_assert(sizeof(AicoreTaskTicketV1) == 16, "ticket must remain two 64-bit words");
 
 struct alignas(128) AicoreTaskStreamV1 {
     uint64_t tickets_offset;
     uint64_t task_count;
-    uint64_t initial_ticket_count;
+    volatile uint64_t initial_ticket_count;
     uint8_t metadata_padding[104];
 
     volatile uint64_t next_index;
@@ -146,7 +214,8 @@ struct alignas(128) AicoreRunControlV1 {
     uint64_t aiv_active_worker_count;
     uint64_t claim_bindings_offset;
     uint64_t expected_root_prepare_count;
-    uint64_t config_reserved[7];
+    volatile uint64_t dispatch_payloads_offset;
+    uint64_t config_reserved[6];
 
     volatile uint64_t executed_task_count;
     volatile uint64_t executor_drained_worker_count;
@@ -184,32 +253,38 @@ struct alignas(128) AicpuCoreLifecycleTraceV1 {
 };
 
 struct alignas(128) AicoreWorkerContextV1 {
-    int32_t core_type;
+    volatile int32_t core_type;
     int32_t physical_core_id;
-    int32_t type_rank;
-    int32_t active;
-    uint64_t run_control_offset;
-    uint64_t task_controls_offset;
-    uint64_t aic_stream_offset;
-    uint64_t aiv_stream_offset;
-    uint64_t graph_descriptors_address;
-    uint64_t graph_payloads_address;
-    uint64_t sidecar_base_address;
-    uint64_t dispatch_payload_offset;
-    uint64_t trace_cells_offset;
-    uint64_t task_window_mask;
-    uint64_t graph_task_count;
-    uint64_t worker_index;
-    uint64_t completion_inboxes_offset;
-    uint64_t inbox_index;
+    volatile int32_t type_rank;
+    volatile int32_t active;
+    volatile uint64_t run_control_offset;
+    volatile uint64_t task_controls_offset;
+    volatile uint64_t aic_stream_offset;
+    volatile uint64_t aiv_stream_offset;
+    volatile uint64_t graph_descriptors_address;
+    volatile uint64_t graph_payloads_address;
+    volatile uint64_t sidecar_base_address;
+    volatile uint64_t dispatch_payload_offset;
+    volatile uint64_t trace_cells_offset;
+    volatile uint64_t task_window_mask;
+    volatile uint64_t graph_task_count;
+    volatile uint64_t worker_index;
+    volatile uint64_t completion_inboxes_offset;
+    volatile uint64_t inbox_index;
 
     int64_t pending_task_id[AICORE_PENDING_SLOT_COUNT_V1];
     int32_t pending_next_fanin[AICORE_PENDING_SLOT_COUNT_V1];
     int32_t pending_waiting_producer[AICORE_PENDING_SLOT_COUNT_V1];
     uint64_t cursor_exhausted;
     uint64_t lifecycle_state;
-    uint64_t root_prepare_inboxes_offset;
-    uint8_t debug_padding[72];
+    volatile uint64_t root_prepare_inboxes_offset;
+    volatile uint64_t worker_contexts_offset;
+    volatile uint64_t dispatch_slots_offset;
+    volatile uint64_t claim_prefetches_offset;
+    volatile uint64_t callable_addresses_offset;
+    volatile uint64_t runtime_worker_count;
+    volatile uint64_t bootstrap_done;
+    uint8_t debug_padding[24];
 
     uint64_t seeded_task_count;
     uint64_t ticket_claim_count;
@@ -280,17 +355,37 @@ struct alignas(128) AicoreTaskTraceCellV1 {
     uint64_t ready_scan_start_cycles;
     uint64_t ready_observe_cycles;
     uint64_t completion_bookkeeping_end_cycles;
-    uint64_t completion_service_start_cycles;
-    uint64_t completion_service_end_cycles;
+    uint64_t payload_base_load_start_cycles;
+    uint64_t inter_task_publication_poll_cycles;
     uint64_t previous_trace_commit_end_cycles;
     uint64_t initialize_end_cycles;
     uint64_t route_end_cycles;
-    uint64_t startup_reserved[2];
+    uint64_t claim_worker_id;
+    uint64_t payload_cache_control_end_cycles;
     uint64_t aicore_entry_cycles;
     uint64_t handshake_publish_cycles;
     uint64_t register_release_cycles;
     uint64_t descriptor_cache_observed_cycles;
-    uint64_t reserved[4];
+    uint64_t payload_cache_invalidate_end_cycles;
+    uint64_t payload_observe_end_cycles;
+    uint64_t inter_task_poll_cycles;
+    uint64_t inter_task_backoff_cycles;
+    uint64_t completion_inbox_probe_start_cycles;
+    uint64_t completion_inbox_detach_start_cycles;
+    uint64_t completion_inbox_detach_end_cycles;
+    uint64_t completion_node_start_cycles;
+    uint64_t completion_inbox_index;
+    uint64_t completion_inbox_stolen;
+    uint64_t refill_resolver_worker_id;
+    uint64_t refill_reserved;
+    uint64_t refill_start_cycles;
+    uint64_t refill_observe_end_cycles;
+    uint64_t refill_prefetch_take_end_cycles;
+    uint64_t refill_bind_route_end_cycles;
+    uint64_t refill_payload_publish_end_cycles;
+    uint64_t refill_next_prefetch_end_cycles;
+    uint64_t refill_end_cycles;
+    uint64_t refill_task_id;
 };
 
 struct AicoreExecutionSidecarLayoutV1 {
@@ -302,7 +397,10 @@ struct AicoreExecutionSidecarLayoutV1 {
     uint64_t aicpu_lifecycle_traces_offset;
     uint64_t worker_contexts_offset;
     uint64_t dispatch_payloads_offset;
+    uint64_t dispatch_slots_offset;
+    uint64_t claim_prefetches_offset;
     uint64_t claim_bindings_offset;
+    uint64_t callable_addresses_offset;
     uint64_t task_controls_offset;
     uint64_t completion_inboxes_offset;
     uint64_t root_prepare_inboxes_offset;
@@ -325,7 +423,11 @@ static_assert(sizeof(AicoreRootPrepareInboxV1) == 128, "root prepare inbox layou
 static_assert(alignof(AicoreRootPrepareInboxV1) == 128, "root prepare inbox alignment changed");
 static_assert(sizeof(AicoreTaskClaimBindingV1) == 64, "claim binding must occupy one cache line");
 static_assert(alignof(AicoreTaskClaimBindingV1) == 64, "claim binding must be cache-line aligned");
-static_assert(sizeof(AicoreTaskTicketV1) == 8, "task ticket layout changed");
+static_assert(sizeof(AicoreDispatchSlotV1) == 128, "dispatch slot must occupy two cache lines");
+static_assert(offsetof(AicoreDispatchSlotV1, publication) == 64, "dispatch publication needs its own line");
+static_assert(sizeof(AicoreClaimPrefetchV1) == 128, "claim prefetch must occupy two cache lines");
+static_assert(offsetof(AicoreClaimPrefetchV1, state) == 64, "prefetch state needs its own line");
+static_assert(sizeof(AicoreTaskTicketV1) == 16, "task ticket layout changed");
 static_assert(alignof(AicoreTaskTicketV1) == 8, "task tickets must not straddle 8-byte boundaries");
 static_assert(sizeof(AicoreTaskStreamV1) == 256, "task stream layout changed");
 static_assert(offsetof(AicoreTaskStreamV1, next_index) == 128, "ticket cursor must have its own line");
@@ -342,12 +444,17 @@ static_assert(
     offsetof(AicoreWorkerContextV1, executor_drain_publish_start_cycles) == 512,
     "worker termination trace offset changed"
 );
-static_assert(sizeof(AicoreTaskTraceCellV1) == 256, "task trace layout changed");
+static_assert(sizeof(AicoreTaskTraceCellV1) == 384, "task trace layout changed");
 static_assert(
     offsetof(AicoreTaskTraceCellV1, completion_bookkeeping_end_cycles) == 128,
     "post-completion trace needs its own line"
 );
 static_assert(offsetof(AicoreTaskTraceCellV1, aicore_entry_cycles) == 192, "startup trace needs its own line");
+static_assert(
+    offsetof(AicoreTaskTraceCellV1, completion_inbox_probe_start_cycles) == 256,
+    "completion inbox trace needs its own line"
+);
+static_assert(offsetof(AicoreTaskTraceCellV1, refill_start_cycles) == 320, "slot refill trace needs its own line");
 
 #if !defined(__CCE_AICORE__)
 #include <type_traits>
@@ -359,6 +466,10 @@ static_assert(std::is_standard_layout_v<AicoreRootPrepareInboxV1>);
 static_assert(std::is_trivially_copyable_v<AicoreRootPrepareInboxV1>);
 static_assert(std::is_standard_layout_v<AicoreTaskClaimBindingV1>);
 static_assert(std::is_trivially_copyable_v<AicoreTaskClaimBindingV1>);
+static_assert(std::is_standard_layout_v<AicoreDispatchSlotV1>);
+static_assert(std::is_trivially_copyable_v<AicoreDispatchSlotV1>);
+static_assert(std::is_standard_layout_v<AicoreClaimPrefetchV1>);
+static_assert(std::is_trivially_copyable_v<AicoreClaimPrefetchV1>);
 static_assert(std::is_standard_layout_v<AicoreTaskTicketV1>);
 static_assert(std::is_trivially_copyable_v<AicoreTaskTicketV1>);
 static_assert(std::is_standard_layout_v<AicoreTaskStreamV1>);
@@ -432,8 +543,16 @@ inline bool aicore_sidecar_plan_v1(
             AICORE_WORKER_CAPACITY_V1 * AICORE_PENDING_SLOT_COUNT_V1, sizeof(PTO2DispatchPayload), &bytes
         ) ||
         !aicore_sidecar_reserve_v1(&cursor, bytes, alignof(PTO2DispatchPayload), &next.dispatch_payloads_offset) ||
+        !aicore_sidecar_checked_mul_v1(
+            AICORE_WORKER_CAPACITY_V1 * AICORE_PENDING_SLOT_COUNT_V1, sizeof(AicoreDispatchSlotV1), &bytes
+        ) ||
+        !aicore_sidecar_reserve_v1(&cursor, bytes, alignof(AicoreDispatchSlotV1), &next.dispatch_slots_offset) ||
+        !aicore_sidecar_checked_mul_v1(AICORE_WORKER_CAPACITY_V1, sizeof(AicoreClaimPrefetchV1), &bytes) ||
+        !aicore_sidecar_reserve_v1(&cursor, bytes, alignof(AicoreClaimPrefetchV1), &next.claim_prefetches_offset) ||
         !aicore_sidecar_checked_mul_v1(task_count, sizeof(AicoreTaskClaimBindingV1), &bytes) ||
         !aicore_sidecar_reserve_v1(&cursor, bytes, alignof(AicoreTaskClaimBindingV1), &next.claim_bindings_offset) ||
+        !aicore_sidecar_checked_mul_v1(AICORE_CALLABLE_CAPACITY_V1, sizeof(uint64_t), &bytes) ||
+        !aicore_sidecar_reserve_v1(&cursor, bytes, alignof(uint64_t), &next.callable_addresses_offset) ||
         !aicore_sidecar_checked_mul_v1(task_count, sizeof(AicoreTaskControlV1), &bytes) ||
         !aicore_sidecar_reserve_v1(&cursor, bytes, alignof(AicoreTaskControlV1), &next.task_controls_offset) ||
         !aicore_sidecar_checked_mul_v1(AICORE_WORKER_CAPACITY_V1, sizeof(AicoreCompletionInboxV1), &bytes) ||
@@ -482,6 +601,20 @@ inline bool aicore_sidecar_init_v1(void *base, const AicoreExecutionSidecarLayou
         controls[i].next_fanin_index = 0;
         controls[i].waiting_producer = static_cast<int32_t>(AICORE_TASK_ID_INVALID_V1);
         controls[i].completion_next = AICORE_COMPLETION_LINK_UNPUBLISHED_V1;
+    }
+    auto *dispatch_slots = aicore_sidecar_at_v1<AicoreDispatchSlotV1>(base, layout.dispatch_slots_offset);
+    for (uint64_t i = 0; i < AICORE_WORKER_CAPACITY_V1 * AICORE_PENDING_SLOT_COUNT_V1; ++i) {
+        dispatch_slots[i].task_id = AICORE_TASK_ID_INVALID_V1;
+        dispatch_slots[i].publication = 0;
+    }
+    auto *prefetches = aicore_sidecar_at_v1<AicoreClaimPrefetchV1>(base, layout.claim_prefetches_offset);
+    for (uint64_t i = 0; i < AICORE_WORKER_CAPACITY_V1; ++i) {
+        prefetches[i].ticket_task_id = UINT64_MAX;
+        prefetches[i].ticket_kernel_id = UINT16_MAX;
+        prefetches[i].ticket_subtask_slot = UINT8_MAX;
+        prefetches[i].ticket_flags = UINT8_MAX;
+        prefetches[i].ticket_reserved = 0;
+        prefetches[i].state = static_cast<uint64_t>(AicoreClaimPrefetchStateV1::EMPTY);
     }
     auto *inboxes = aicore_sidecar_at_v1<AicoreCompletionInboxV1>(base, layout.completion_inboxes_offset);
     for (uint64_t i = 0; i < AICORE_WORKER_CAPACITY_V1; ++i)

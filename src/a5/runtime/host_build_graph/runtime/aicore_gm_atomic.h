@@ -25,6 +25,10 @@ inline __aicore__ void aicore_publish_cache_line_v0(__gm__ void *address) {
 #endif
 }
 
+inline __aicore__ void aicore_publish_cache_line_v0(volatile __gm__ void *address) {
+    aicore_publish_cache_line_v0(const_cast<__gm__ void *>(address));
+}
+
 inline __aicore__ void aicore_observe_cache_line_v0(__gm__ void *address) {
 #if defined(__CCE_AICORE__)
     dcci(address, SINGLE_CACHE_LINE);
@@ -33,6 +37,10 @@ inline __aicore__ void aicore_observe_cache_line_v0(__gm__ void *address) {
     (void)address;
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
 #endif
+}
+
+inline __aicore__ void aicore_observe_cache_line_v0(volatile __gm__ void *address) {
+    aicore_observe_cache_line_v0(const_cast<__gm__ void *>(address));
 }
 
 inline __aicore__ void aicore_observe_data_cache_v0(__gm__ void *address) {
@@ -57,16 +65,36 @@ inline __aicore__ void aicore_publish_dispatch_payload_v1(__gm__ PTO2DispatchPay
 #endif
 }
 
-inline __aicore__ void aicore_observe_dispatch_payload_v1(__gm__ PTO2DispatchPayload *payload) {
+inline __aicore__ void aicore_observe_dispatch_payload_control_v1(__gm__ PTO2DispatchPayload *payload) {
 #if defined(__CCE_AICORE__)
-    for (uint64_t offset = 0; offset < sizeof(PTO2DispatchPayload); offset += 64) {
-        dcci(reinterpret_cast<__gm__ uint8_t *>(payload) + offset, SINGLE_CACHE_LINE);
-    }
-    dsb((mem_dsb_t)0);
+    dcci(payload, SINGLE_CACHE_LINE);
 #else
     (void)payload;
+#endif
+}
+
+inline __aicore__ void aicore_observe_dispatch_payload_arguments_v1(__gm__ PTO2DispatchPayload *payload) {
+#if defined(__CCE_AICORE__)
+    for (uint64_t offset = 64; offset < sizeof(PTO2DispatchPayload); offset += 64) {
+        dcci(reinterpret_cast<__gm__ uint8_t *>(payload) + offset, SINGLE_CACHE_LINE);
+    }
+#else
+    (void)payload;
+#endif
+}
+
+inline __aicore__ void aicore_observe_dispatch_payload_barrier_v1() {
+#if defined(__CCE_AICORE__)
+    dsb((mem_dsb_t)0);
+#else
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
 #endif
+}
+
+inline __aicore__ void aicore_observe_dispatch_payload_v1(__gm__ PTO2DispatchPayload *payload) {
+    aicore_observe_dispatch_payload_control_v1(payload);
+    aicore_observe_dispatch_payload_arguments_v1(payload);
+    aicore_observe_dispatch_payload_barrier_v1();
 }
 
 // These wrappers are a runtime-local subset of simpler-dist FDWIC's validated
