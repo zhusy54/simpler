@@ -355,6 +355,154 @@ def test_aicore_ticket_scheduler_phases_replace_common_anchors_and_render_once(t
     }
 
 
+def test_hbg_startup_phase_separates_execution_start_from_first_task_claim(tmp_path):
+    input_path = tmp_path / "chip_swimlane_records.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "chip_swimlane_level": 1,
+                "metadata": {"clock_freq_hz": 1_000_000, "num_cores": 2, "core_types": ["aic", "aiv"]},
+                "aicore_tasks": [],
+                "aicpu_tasks": [],
+                "aicore_scheduler_phases": [
+                    {
+                        "worker_id": 0,
+                        "core_type": 0,
+                        "task_id": 1,
+                        "phase": "DescriptorReadyToReadyClaim",
+                        "start_cycles": 100,
+                        "end_cycles": 200,
+                    },
+                    {
+                        "worker_id": 1,
+                        "core_type": 1,
+                        "task_id": 2,
+                        "phase": "DescriptorReadyToReadyClaim",
+                        "start_cycles": 110,
+                        "end_cycles": 500,
+                    },
+                    {
+                        "worker_id": 0,
+                        "core_type": 0,
+                        "task_id": 1,
+                        "phase": "Kernel",
+                        "start_cycles": 220,
+                        "end_cycles": 230,
+                    },
+                    {
+                        "worker_id": 1,
+                        "core_type": 1,
+                        "task_id": 2,
+                        "phase": "Kernel",
+                        "start_cycles": 520,
+                        "end_cycles": 530,
+                    },
+                ],
+            }
+        )
+    )
+
+    parsed = sc.read_perf_data(input_path)
+    startup = [
+        phase
+        for phase in parsed["aicore_scheduler_phases"]
+        if phase["phase"] in {"DescriptorReadyToReadyClaim", "ExecutionStartToFirstReadyClaim"}
+    ]
+
+    assert [(phase["core_id"], phase["phase"], phase["start_time_us"], phase["end_time_us"]) for phase in startup] == [
+        (0, "DescriptorReadyToReadyClaim", 0.0, 100.0),
+        (1, "DescriptorReadyToReadyClaim", 10.0, 100.0),
+        (0, "ExecutionStartToFirstReadyClaim", 100.0, 100.0),
+        (1, "ExecutionStartToFirstReadyClaim", 100.0, 400.0),
+    ]
+
+
+def test_hbg_detailed_startup_phases_are_not_resplit(tmp_path):
+    input_path = tmp_path / "chip_swimlane_records.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "chip_swimlane_level": 1,
+                "metadata": {"clock_freq_hz": 1_000_000, "num_cores": 1, "core_types": ["aiv"]},
+                "aicore_tasks": [],
+                "aicpu_tasks": [],
+                "aicore_scheduler_phases": [
+                    {
+                        "worker_id": 0,
+                        "core_type": 1,
+                        "task_id": 7,
+                        "phase": "DescriptorReadyToReadyClaim",
+                        "start_cycles": 100,
+                        "end_cycles": 200,
+                    },
+                    {
+                        "worker_id": 0,
+                        "core_type": 1,
+                        "task_id": 7,
+                        "phase": "ExecutionStartToFirstReady",
+                        "start_cycles": 200,
+                        "end_cycles": 350,
+                    },
+                    {
+                        "worker_id": 0,
+                        "core_type": 1,
+                        "task_id": 7,
+                        "phase": "FirstReadyToReadyClaim",
+                        "start_cycles": 350,
+                        "end_cycles": 400,
+                    },
+                ],
+            }
+        )
+    )
+
+    phases = sc.read_perf_data(input_path)["aicore_scheduler_phases"]
+    assert [phase["phase"] for phase in phases] == [
+        "DescriptorReadyToReadyClaim",
+        "ExecutionStartToFirstReady",
+        "FirstReadyToReadyClaim",
+    ]
+
+
+def test_hbg_completion_enqueue_preserves_completion_shard_metadata(tmp_path):
+    input_path = tmp_path / "chip_swimlane_records.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "chip_swimlane_level": 1,
+                "metadata": {"clock_freq_hz": 1_000_000, "num_cores": 1, "core_types": ["aic"]},
+                "aicore_tasks": [],
+                "aicpu_tasks": [],
+                "aicore_scheduler_phases": [
+                    {
+                        "worker_id": 0,
+                        "core_type": 0,
+                        "task_id": 1176,
+                        "phase": "CompletionEnqueue",
+                        "start_cycles": 100,
+                        "end_cycles": 120,
+                        "completion_id": 84,
+                        "inbox_index": 28,
+                    }
+                ],
+            }
+        )
+    )
+
+    parsed = sc.read_perf_data(input_path)
+    phase = parsed["aicore_scheduler_phases"][0]
+    assert phase["completion_id"] == 84
+    assert phase["inbox_index"] == 28
+    output_path = tmp_path / "trace.json"
+    sc.generate_chrome_trace_json(
+        parsed["tasks"], str(output_path), aicore_scheduler_phases=parsed["aicore_scheduler_phases"]
+    )
+    events = json.loads(output_path.read_text())["traceEvents"]
+    event = next(event for event in events if event.get("name") == "CompletionEnqueue(t1176)")
+    assert event["args"]["completion_id"] == 84
+    assert event["args"]["inbox_index"] == 28
+
+
 def test_level_one_scheduler_tasks_join_dependency_graph_and_kernel_names(tmp_path):
     input_path = tmp_path / "chip_swimlane_records.json"
     input_path.write_text(

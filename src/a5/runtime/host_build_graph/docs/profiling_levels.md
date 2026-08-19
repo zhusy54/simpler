@@ -3,7 +3,7 @@
 A5 `host_build_graph` supports chip-swimlane levels 0 and 1 only:
 
 | `enable_chip_swimlane` | Behavior |
-| --- | --- |
+| ---------------------- | -------- |
 | `0` | Disabled |
 | `1` | Kernel records plus Ready/Completion scheduler phases |
 | `2`–`4` | Rejected before device launch |
@@ -24,9 +24,14 @@ A successful level-1 run writes
 The AICore phases are:
 
 - startup: `AICoreEntryToHandshake`, `HandshakeToRegisterRelease`,
-  `RegisterReleaseToDescriptorReady`, `DescriptorReadyToReadyClaim`;
-- scheduling: `ReadyPop`, `ReadySteal`, `InterTaskSchedule`, `ReadyScan`,
-  `ReadyPublish`, `SlotRefill`;
+  `RegisterReleaseToDescriptorReady`, `DescriptorReadyToReadyClaim`,
+  `ExecutionStartToFirstReady`, `FirstReadyToReadyClaim`,
+  `BootstrapGraphScan`, `BootstrapBarrier`, and the
+  `Bootstrap{AIC,AIV}{ReadyClaim,SlotFill,FreeAdvertise,Other}` breakdown;
+- scheduling: `ReadyPop`, `ReadySteal`, `ReadyScan`, `ReadyPublish`,
+  `SlotRefill`, and the
+  `InterTask{CompletionService,DispatchAIC,DispatchAIV,ReadyPoll,Backoff,Other}`
+  breakdown;
 - execution: `Payload`, `Kernel`, `CompletionEnqueue`, `PostCompletion`;
 - resolution: `CompletionBatchPrepare`, `CompletionBatchClaim`, `WakeResolve`;
 - teardown: `TraceCommit`, `WaitForExit`, `FinalStatsPublish`,
@@ -37,6 +42,25 @@ task; `Kernel` executes on the target slot's worker. Only AIV resolvers emit
 completion-resolution phases. Payload construction remains part of the
 resolver refill path, while `Payload` on the executor measures observing the
 published dispatch payload before kernel entry.
+
+All `DescriptorReadyToReadyClaim` spans end at the earliest first-task claim,
+which is the global execution start. `ExecutionStartToFirstReady` measures
+dependency/bootstrap delay until that worker's first task enters Ready state;
+`FirstReadyToReadyClaim` measures the subsequent Ready-inbox and placement
+delay. Resolver bootstrap phases independently show graph scan, the global
+barrier, and target-slot initialization. Per-target component durations are
+accumulated on device and rendered contiguously, so their widths are exact but
+their display order does not represent individual slot-operation order.
+
+Long inter-task gaps are split by accumulated time in completion service,
+AIC/AIV overflow dispatch, unsuccessful slot polling, and idle backoff. The
+residual `InterTaskOther` contains loop control and instrumentation overhead.
+Old traces without these counters retain the aggregate `InterTaskSchedule`.
+
+`CompletionEnqueue` records include `completion_id` and `inbox_index`. The ID
+is based on per-worker execution order rather than graph task ID, so Ready
+partitioning cannot force the corresponding completions back into the same
+resolver shard.
 
 AICPU lifecycle phases are global `WaitBootstrap`, `WaitResolved`, and
 `CompletionDecision`, plus per-core `RegisterRelease` and `ExitSignalToAck`.

@@ -212,6 +212,34 @@ def _collect_graph_execution_instances(tasks, scheduler_phases):  # noqa: PLR091
     return instances
 
 
+def _split_hbg_first_claim_startup(phases):
+    """Separate global scheduler startup from each core's first-task wait."""
+    startup = [phase for phase in phases if phase["phase"] == "DescriptorReadyToReadyClaim"]
+    detailed = {"ExecutionStartToFirstReady", "FirstReadyToReadyClaim"}
+    if (
+        not startup
+        or any(phase["phase"] == "ExecutionStartToFirstReadyClaim" for phase in phases)
+        or any(phase["phase"] in detailed for phase in phases)
+    ):
+        return
+
+    all_descriptors_ready_us = max(phase["start_time_us"] for phase in startup)
+    first_claim_us = min(phase["end_time_us"] for phase in startup)
+    execution_start_us = max(all_descriptors_ready_us, first_claim_us)
+    first_claim_waits = []
+    for phase in startup:
+        worker_first_claim_us = max(execution_start_us, phase["end_time_us"])
+        phase["end_time_us"] = execution_start_us
+        phase["duration_us"] = execution_start_us - phase["start_time_us"]
+        first_claim_wait = dict(phase)
+        first_claim_wait["phase"] = "ExecutionStartToFirstReadyClaim"
+        first_claim_wait["start_time_us"] = execution_start_us
+        first_claim_wait["end_time_us"] = worker_first_claim_us
+        first_claim_wait["duration_us"] = worker_first_claim_us - execution_start_us
+        first_claim_waits.append(first_claim_wait)
+    phases.extend(first_claim_waits)
+
+
 def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
     """Read performance data from a swimlane JSON file.
 
@@ -451,7 +479,7 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
             "end_time_us": end_us,
             "duration_us": end_us - start_us,
         }
-        for field in ("atomic_count", "poll_count"):
+        for field in ("atomic_count", "poll_count", "completion_id", "inbox_index"):
             if field in phase:
                 converted[field] = int(phase[field])
         poll_time_us = int(phase.get("poll_cycles", 0)) * cycles_to_us_factor
@@ -485,6 +513,7 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
             )
     if level == 1 and scheduler_tasks:
         tasks = scheduler_tasks
+    _split_hbg_first_claim_startup(aicore_scheduler_phases)
     aicore_scheduler_phases.sort(key=lambda phase: (phase["start_time_us"], phase["core_id"]))
 
     aicpu_lifecycle_phases = []
@@ -1539,6 +1568,17 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         "SeedClaim": "thread_state_running",
         "TicketClaim": "thread_state_runnable",
         "PendingWait": "thread_state_iowait",
+        "ExecutionStartToFirstReadyClaim": "thread_state_iowait",
+        "ExecutionStartToFirstReady": "thread_state_iowait",
+        "FirstReadyToReadyClaim": "thread_state_runnable",
+        "BootstrapGraphScan": "cq_build_running",
+        "BootstrapBarrier": "thread_state_iowait",
+        "InterTaskCompletionService": "cq_build_running",
+        "InterTaskDispatchAIC": "thread_state_running",
+        "InterTaskDispatchAIV": "thread_state_runnable",
+        "InterTaskReadyPoll": "thread_state_iowait",
+        "InterTaskBackoff": "thread_state_iowait",
+        "InterTaskOther": "generic_work",
         "RootPrepare": "cq_build_running",
         "Payload": "cq_build_running",
         "Kernel": "good",
@@ -1558,6 +1598,9 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             "taskId": task_id,
             "duration-us": phase["duration_us"],
         }
+        for field in ("completion_id", "inbox_index"):
+            if field in phase:
+                phase_args[field] = phase[field]
         for field in (
             "atomic_count",
             "poll_count",

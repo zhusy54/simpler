@@ -21,12 +21,20 @@ The host publishes immutable metadata indexed by task ID: kernel ID, subtask
 slot, executable flag, and zero/nonzero-fanin flag. It does not construct or
 order task streams.
 
-With `R` active AIV resolvers, resolver `r` scans task IDs
-`r, r + R, r + 2R, ...`. It uses the existing wake-list registration protocol:
-a blocked consumer registers on its first incomplete producer; a dependency-free
-task is appended to the resolver's local typed Ready batch. Execution starts
-only after all `R` scans finish. This preserves a simple full-bootstrap barrier;
-overlapping bootstrap with execution is a later optimization.
+With `R` active AIV resolvers, the graph is divided into `R` contiguous ranges.
+This keeps immutable metadata and payload reads local and avoids aliasing a
+periodic task pattern with the resolver count. A bootstrap-only route registers
+each blocked consumer on its first executable producer with one wake-head
+exchange. Inline-completed producers are skipped from immutable metadata.
+
+Each resolver links dependency-free tasks into private typed Ready batches,
+writes back all waiter links, and executes one cache barrier before directly
+publishing its initially empty inbox heads. Resolver-local Ready-type flags are
+stored contiguously beside the Ready directory. The last resolver aggregates
+those flags into the directory and releases the bootstrap barrier. Execution
+cannot start before that release, which makes the bootstrap-specific exchange
+and batched publication safe; steady-state routing retains the full CAS-based
+close-race protocol.
 
 ## Ready inboxes and stealing
 
@@ -75,7 +83,16 @@ materializes and publishes the payload, then publishes the slot as `READY`.
 ## Completion and WakeResolve
 
 After a kernel returns, the executor publishes task state `DONE` and pushes the
-task to `task_id % resolver_count` in the Completion Inbox. The resolver:
+task using a per-executor completion ID:
+
+```text
+completion_id = local_completion_index * runtime_worker_count + worker_id
+inbox_index = completion_id % resolver_count
+```
+
+The local completion index is the executor's existing successful-enqueue
+counter. This keeps the ID unique without a contended global atomic and avoids
+correlating Ready ownership with graph task IDs. The resolver:
 
 1. confirms the binding and releases the exact slot to private `FREE`;
 2. closes the producer wake list;

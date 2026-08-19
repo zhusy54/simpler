@@ -39,13 +39,16 @@ private:
 
 class GraphBuffer {
 public:
-    explicit GraphBuffer(size_t task_count) : task_count_(task_count) {
-        while (capacity_ < std::max<size_t>(task_count, 1)) capacity_ <<= 1;
+    explicit GraphBuffer(size_t task_count) :
+        task_count_(task_count) {
+        while (capacity_ < std::max<size_t>(task_count, 1))
+            capacity_ <<= 1;
         descriptors_ = std::make_unique<PTO2TaskDescriptor[]>(capacity_);
         payloads_ = std::make_unique<PTO2TaskPayload[]>(capacity_);
         for (size_t task = 0; task < capacity_; ++task) {
             descriptors_[task].task_id = PTO2TaskId::make(0, static_cast<int64_t>(task));
-            for (int slot = 0; slot < 3; ++slot) descriptors_[task].kernel_id[slot] = INVALID_KERNEL_ID;
+            for (int slot = 0; slot < 3; ++slot)
+                descriptors_[task].kernel_id[slot] = INVALID_KERNEL_ID;
         }
     }
 
@@ -79,8 +82,7 @@ struct FixtureStorage {
         EXPECT_TRUE(aicore_sidecar_plan_v1(task_count, task_count, 0, &layout));
         sidecar = std::make_unique<SidecarBuffer>(layout);
         run_control = aicore_sidecar_at_v1<AicoreRunControlV1>(sidecar->base(), layout.run_control_offset);
-        contexts =
-            aicore_sidecar_at_v1<AicoreWorkerContextV1>(sidecar->base(), layout.worker_contexts_offset);
+        contexts = aicore_sidecar_at_v1<AicoreWorkerContextV1>(sidecar->base(), layout.worker_contexts_offset);
         run_control->claim_bindings_offset = layout.claim_bindings_offset;
         run_control->aiv_active_worker_count = workers;
         for (uint64_t worker = 0; worker < workers; ++worker) {
@@ -96,8 +98,8 @@ struct FixtureStorage {
             context.worker_contexts_offset = layout.worker_contexts_offset;
             context.dispatch_slots_offset = layout.dispatch_slots_offset;
             context.callable_addresses_offset = layout.callable_addresses_offset;
-            context.dispatch_payload_offset = layout.dispatch_payloads_offset +
-                                              worker * AICORE_PENDING_SLOT_COUNT_V1 * sizeof(PTO2DispatchPayload);
+            context.dispatch_payload_offset =
+                layout.dispatch_payloads_offset + worker * AICORE_PENDING_SLOT_COUNT_V1 * sizeof(PTO2DispatchPayload);
             context.graph_task_count = task_count;
             context.runtime_worker_count = workers;
             context.worker_index = worker;
@@ -139,11 +141,88 @@ TEST(AicoreReadySidecarV1, PlansAndInitializesReadyState) {
         EXPECT_EQ(ready[inbox].head, AICORE_INBOX_EMPTY_V1);
 }
 
+TEST(AicoreBootstrapV1, RegistersOnlyOnFirstExecutableProducer) {
+    FixtureStorage storage(4, 2);
+    GraphBuffer graph(4);
+    graph.executable(0, 0);
+    graph.executable(1, 1, {0});
+    graph.executable(3, 1, {2, 1});
+    storage.metadata[1].subtask_slot = 1;
+    storage.metadata[1].flags |= AICORE_TASK_HAS_FANIN_V1;
+    storage.metadata[2].flags = 0;
+    storage.metadata[3].subtask_slot = 1;
+    storage.metadata[3].flags |= AICORE_TASK_HAS_FANIN_V1;
+    auto *controls =
+        aicore_sidecar_at_v1<AicoreTaskControlV1>(storage.sidecar->base(), storage.layout.task_controls_offset);
+    controls[2].state = static_cast<int64_t>(AicoreTaskStateV1::DONE);
+    controls[2].wake_list_head = AICORE_WAKE_LIST_CLOSED_V1;
+
+    AicoreWakeStatsV1 stats{};
+    EXPECT_EQ(
+        aicore_bootstrap_route_task_v1(
+            graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 1, &stats
+        ),
+        AicoreRouteResultV1::WAITING
+    );
+    EXPECT_EQ(controls[0].wake_list_head, 1);
+    EXPECT_EQ(controls[1].next_waiter, AICORE_WAKE_LIST_OPEN_V1);
+    EXPECT_EQ(controls[1].waiting_producer, 0);
+
+    EXPECT_EQ(
+        aicore_bootstrap_route_task_v1(
+            graph.graph(), storage.sidecar->base(), &storage.contexts[1], storage.run_control, 3, &stats
+        ),
+        AicoreRouteResultV1::WAITING
+    );
+    EXPECT_EQ(controls[1].wake_list_head, 3);
+    EXPECT_EQ(controls[3].next_fanin_index, 1);
+    EXPECT_EQ(controls[3].waiting_producer, 1);
+    EXPECT_EQ(stats.wake_register_count, 2u);
+    EXPECT_EQ(stats.fanin_state_load_count, 0u);
+    EXPECT_EQ(stats.wake_cas_retry_count, 0u);
+}
+
+TEST(AicoreBootstrapV1, PublishesExclusiveInboxAndAggregatesDirectory) {
+    FixtureStorage storage(2, 2);
+    GraphBuffer graph(2);
+    graph.executable(0, 0);
+    graph.executable(1, 0);
+    storage.contexts[0].inbox_index = 1;
+    storage.contexts[1].inbox_index = 0;
+    AicoreReadyBatchV1 batch{};
+    AicoreReadyStatsV1 stats{};
+    ASSERT_TRUE(
+        aicore_bootstrap_ready_batch_append_v1(storage.sidecar->base(), &storage.contexts[1], 0, &batch, &stats)
+    );
+    ASSERT_TRUE(
+        aicore_bootstrap_ready_batch_append_v1(storage.sidecar->base(), &storage.contexts[1], 1, &batch, &stats)
+    );
+    aicore_cache_barrier_v0();
+    uint64_t ready_types = 0;
+    ASSERT_TRUE(aicore_bootstrap_ready_batch_publish_v1(
+        storage.sidecar->base(), &storage.contexts[1], 0, 0, &batch, &stats, &ready_types
+    ));
+    auto *directory = aicore_ready_directory_at_v1(storage.sidecar->base(), &storage.contexts[1]);
+    directory->bootstrap_ready_types[0] = ready_types;
+    aicore_bootstrap_ready_directory_publish_v1(storage.sidecar->base(), &storage.contexts[1], 2);
+
+    auto *controls =
+        aicore_sidecar_at_v1<AicoreTaskControlV1>(storage.sidecar->base(), storage.layout.task_controls_offset);
+    EXPECT_EQ(controls[1].next_waiter, 0);
+    EXPECT_EQ(controls[0].next_waiter, AICORE_INBOX_EMPTY_V1);
+    EXPECT_EQ(aicore_ready_inbox_at_v1(storage.sidecar->base(), &storage.contexts[1], 0, 0)->head, 1);
+    EXPECT_EQ(directory->words[0][0], 1u);
+    EXPECT_EQ(directory->words[1][0], 0u);
+    EXPECT_EQ(stats.enqueue_count, 2u);
+    EXPECT_EQ(stats.batch_count, 1u);
+}
+
 TEST(AicoreReadyInboxV1, BatchPushAndPerTaskPopMaintainDirectory) {
     constexpr uint64_t kTasks = 4;
     FixtureStorage storage(kTasks, 1);
     GraphBuffer graph(kTasks);
-    for (uint64_t task = 0; task < kTasks; ++task) graph.executable(task, 0);
+    for (uint64_t task = 0; task < kTasks; ++task)
+        graph.executable(task, 0);
     AicoreReadyBatchV1 batch{};
     AicoreReadyStatsV1 stats{};
     for (uint64_t task = 0; task < kTasks; ++task)
@@ -184,8 +263,7 @@ TEST(AicoreReadyInboxV1, StealsOnlyFromMarkedVictim) {
     uint64_t cursor = 1;
     AicoreReadyClaimV1 claim{};
     ASSERT_TRUE(aicore_claim_ready_for_slot_v1(
-        graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 2, 0, &cursor, &stats,
-        &claim
+        graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 2, 0, &cursor, &stats, &claim
     ));
     EXPECT_EQ(claim.task_id, 0);
     EXPECT_EQ(claim.inbox_index, 1u);
@@ -210,8 +288,8 @@ TEST(AicoreReadyInboxV1, ConcurrentConsumersNeverDuplicateTask) {
         while (claimed.load(std::memory_order_relaxed) < kTasks) {
             int64_t task = AICORE_TASK_ID_INVALID_V1;
             if (!aicore_ready_pop_from_inbox_v1(
-                    graph.graph(), storage.sidecar->base(), &storage.contexts[worker], storage.run_control, 0, 0,
-                    &task, nullptr
+                    graph.graph(), storage.sidecar->base(), &storage.contexts[worker], storage.run_control, 0, 0, &task,
+                    nullptr
                 ))
                 return;
             if (task >= 0) {
@@ -223,10 +301,13 @@ TEST(AicoreReadyInboxV1, ConcurrentConsumersNeverDuplicateTask) {
     };
     std::vector<std::thread> consumers;
     consumers.reserve(kConsumerCount);
-    for (uint64_t worker = 0; worker < kConsumerCount; ++worker) consumers.emplace_back(consume, worker);
-    for (auto &consumer : consumers) consumer.join();
+    for (uint64_t worker = 0; worker < kConsumerCount; ++worker)
+        consumers.emplace_back(consume, worker);
+    for (auto &consumer : consumers)
+        consumer.join();
     EXPECT_EQ(claimed.load(), kTasks);
-    for (const auto &count : seen) EXPECT_EQ(count.load(), 1u);
+    for (const auto &count : seen)
+        EXPECT_EQ(count.load(), 1u);
 }
 
 TEST(AicoreReadyWakeV1, WakeResolvePublishesConsumerToResolverLocalInbox) {
@@ -239,15 +320,16 @@ TEST(AicoreReadyWakeV1, WakeResolvePublishesConsumerToResolverLocalInbox) {
     AicoreReadyStatsV1 ready{};
     AicoreCompletionStatsV1 completion{};
     EXPECT_EQ(
-        aicore_route_task_v1(graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 1, &wake),
+        aicore_route_task_v1(
+            graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 1, &wake
+        ),
         AicoreRouteResultV1::WAITING
     );
     auto *controls =
         aicore_sidecar_at_v1<AicoreTaskControlV1>(storage.sidecar->base(), storage.layout.task_controls_offset);
     controls[0].state = static_cast<int64_t>(AicoreTaskStateV1::DONE);
     ASSERT_TRUE(aicore_resolve_completion_v1(
-        graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 0, &wake, &ready,
-        &completion
+        graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 0, &wake, &ready, &completion
     ));
     int64_t task = AICORE_TASK_ID_INVALID_V1;
     ASSERT_TRUE(aicore_ready_pop_from_inbox_v1(
@@ -273,7 +355,7 @@ TEST(AicoreReadyInboxV1, ReadyAndCompletionUseIndependentLinks) {
     ASSERT_EQ(control->next_waiter, AICORE_INBOX_EMPTY_V1);
     ASSERT_EQ(control->inbox_next, AICORE_INBOX_LINK_UNPUBLISHED_V1);
     ASSERT_TRUE(aicore_enqueue_completion_v1(
-        graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 1, 0, nullptr
+        graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 1, 0, 0, nullptr
     ));
     auto *completion = aicore_completion_inbox_at_v1(storage.sidecar->base(), &storage.contexts[0], 0);
     EXPECT_EQ(completion->head, 0);
@@ -295,11 +377,12 @@ TEST(AicoreCompletionInboxV1, ConcurrentPublishAndDetachNeverExposeUnpublishedLi
     std::atomic<bool> invalid_link{false};
 
     auto produce = [&](uint64_t producer) {
-        while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+        while (!start.load(std::memory_order_acquire))
+            std::this_thread::yield();
         for (uint64_t task = producer; task < kTasks; task += kProducerCount) {
             if (!aicore_enqueue_completion_v1(
                     graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 1,
-                    static_cast<int64_t>(task), nullptr
+                    static_cast<int64_t>(task), task, nullptr
                 )) {
                 invalid_link.store(true, std::memory_order_release);
                 break;
@@ -334,15 +417,53 @@ TEST(AicoreCompletionInboxV1, ConcurrentPublishAndDetachNeverExposeUnpublishedLi
 
     std::vector<std::thread> producers;
     producers.reserve(kProducerCount);
-    for (uint64_t producer = 0; producer < kProducerCount; ++producer) producers.emplace_back(produce, producer);
+    for (uint64_t producer = 0; producer < kProducerCount; ++producer)
+        producers.emplace_back(produce, producer);
     std::thread consumer(consume);
     start.store(true, std::memory_order_release);
-    for (auto &producer : producers) producer.join();
+    for (auto &producer : producers)
+        producer.join();
     consumer.join();
 
     EXPECT_FALSE(invalid_link.load());
     EXPECT_EQ(consumed.load(), kTasks);
-    for (const auto &count : seen) EXPECT_EQ(count.load(), 1u);
+    for (const auto &count : seen)
+        EXPECT_EQ(count.load(), 1u);
+}
+
+TEST(AicoreCompletionInboxV1, PerWorkerCompletionIdRotatesInitialAicWaveAcrossResolvers) {
+    constexpr uint64_t kRuntimeWorkers = 84;
+    constexpr uint64_t kResolvers = 56;
+    constexpr uint64_t kAicWorkers = 28;
+    std::vector<uint64_t> inbox_counts(kResolvers, 0);
+    AicoreWorkerContextV1 context{};
+    context.runtime_worker_count = kRuntimeWorkers;
+    for (uint64_t worker = 0; worker < kAicWorkers; ++worker) {
+        context.worker_index = worker;
+        for (uint64_t local_completion = 0; local_completion < 2; ++local_completion) {
+            uint64_t completion_id = aicore_completion_id_v1(&context, local_completion);
+            EXPECT_EQ(completion_id, worker + local_completion * kRuntimeWorkers);
+            ++inbox_counts[aicore_completion_inbox_index_v1(&context, kResolvers, local_completion)];
+        }
+    }
+    for (uint64_t count : inbox_counts)
+        EXPECT_EQ(count, 1u);
+}
+
+TEST(AicoreCompletionInboxV1, EnqueueUsesPerWorkerCompletionOrderInsteadOfTaskId) {
+    FixtureStorage storage(2, 56);
+    GraphBuffer graph(2);
+    graph.executable(0, 0);
+    graph.executable(1, 0);
+    storage.contexts[0].runtime_worker_count = 84;
+    ASSERT_TRUE(aicore_enqueue_completion_v1(
+        graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 56, 0, 0, nullptr
+    ));
+    ASSERT_TRUE(aicore_enqueue_completion_v1(
+        graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 56, 1, 1, nullptr
+    ));
+    EXPECT_EQ(aicore_completion_inbox_at_v1(storage.sidecar->base(), &storage.contexts[0], 0)->head, 0);
+    EXPECT_EQ(aicore_completion_inbox_at_v1(storage.sidecar->base(), &storage.contexts[0], 28)->head, 1);
 }
 
 TEST(AicoreFreeSlotDirectoryV1, ClaimIsUniqueAndGenerationChecked) {

@@ -33,8 +33,7 @@ inline constexpr uint64_t AICORE_WORKER_CAPACITY_V1 = 108;
 inline constexpr uint32_t AICORE_PENDING_SLOT_COUNT_V1 = 2;
 inline constexpr uint32_t AICORE_CALLABLE_CAPACITY_V1 = 1024;
 inline constexpr uint32_t AICORE_CORE_TYPE_COUNT_V1 = 2;
-inline constexpr uint32_t AICORE_READY_DIRECTORY_WORD_COUNT_V1 =
-    (AICORE_WORKER_CAPACITY_V1 + 63) / 64;
+inline constexpr uint32_t AICORE_READY_DIRECTORY_WORD_COUNT_V1 = (AICORE_WORKER_CAPACITY_V1 + 63) / 64;
 inline constexpr uint32_t AICORE_FREE_SLOT_DIRECTORY_WORD_COUNT_V1 =
     (AICORE_WORKER_CAPACITY_V1 * AICORE_PENDING_SLOT_COUNT_V1 + 63) / 64;
 inline constexpr int64_t AICORE_TASK_ID_INVALID_V1 = -1;
@@ -113,7 +112,8 @@ struct alignas(128) AicoreReadyInboxV1 {
 
 struct alignas(128) AicoreReadyDirectoryV1 {
     volatile uint64_t words[AICORE_CORE_TYPE_COUNT_V1][AICORE_READY_DIRECTORY_WORD_COUNT_V1];
-    uint8_t padding[96];
+    uint8_t bootstrap_flags_alignment[32];
+    volatile uint64_t bootstrap_ready_types[AICORE_WORKER_CAPACITY_V1];
 };
 
 struct alignas(128) AicoreFreeSlotDirectoryV1 {
@@ -236,7 +236,13 @@ struct alignas(128) AicoreWorkerContextV1 {
     volatile uint64_t callable_addresses_offset;
     volatile uint64_t runtime_worker_count;
     volatile uint64_t bootstrap_done;
-    uint64_t runtime_reserved[7];
+    uint64_t bootstrap_scan_end_cycles;
+    uint64_t target_bootstrap_start_cycles;
+    uint64_t target_bootstrap_end_cycles;
+    uint64_t bootstrap_target_aic_cycles;
+    uint64_t bootstrap_target_aiv_cycles;
+    uint64_t bootstrap_ready_claim_aic_cycles;
+    uint64_t bootstrap_ready_claim_aiv_cycles;
 
     uint64_t bootstrap_task_count;
     uint64_t ready_enqueue_count;
@@ -282,7 +288,11 @@ struct alignas(128) AicoreWorkerContextV1 {
     uint64_t final_stats_publish_start_cycles;
     uint64_t final_stats_publish_end_cycles;
     uint64_t exit_ack_publish_cycles;
-    uint64_t termination_reserved[6];
+    uint64_t bootstrap_slot_fill_aic_cycles;
+    uint64_t bootstrap_slot_fill_aiv_cycles;
+    uint64_t bootstrap_free_advertise_aic_cycles;
+    uint64_t bootstrap_free_advertise_aiv_cycles;
+    uint64_t termination_reserved[2];
 };
 
 struct alignas(128) AicoreTaskTraceCellV1 {
@@ -301,23 +311,26 @@ struct alignas(128) AicoreTaskTraceCellV1 {
     uint64_t ready_scan_start_cycles;
     uint64_t ready_observe_cycles;
     uint64_t completion_bookkeeping_end_cycles;
-    uint64_t ready_publish_cycles;
-    uint64_t execution_reserved;
+    uint64_t completion_id;
+    uint64_t completion_inbox_index;
 
-    uint64_t initialize_end_cycles;
-    uint64_t payload_publish_end_cycles;
+    uint64_t ready_transition_cycles;
+    uint64_t inter_task_completion_service_cycles;
+    uint64_t inter_task_dispatch_aic_cycles;
+    uint64_t inter_task_dispatch_aiv_cycles;
+    uint64_t inter_task_ready_poll_cycles;
+    uint64_t inter_task_backoff_cycles;
     uint64_t aicore_entry_cycles;
     uint64_t handshake_publish_cycles;
+
     uint64_t register_release_cycles;
     uint64_t descriptor_cache_observed_cycles;
-    uint64_t scheduler_reserved[2];
-
     uint64_t completion_prepare_start_cycles;
     uint64_t refill_resolver_worker_id;
     uint64_t refill_start_cycles;
     uint64_t refill_end_cycles;
     uint64_t refill_task_id;
-    uint64_t completion_refill_reserved[3];
+    uint64_t completion_refill_reserved;
 };
 
 struct AicoreExecutionSidecarLayoutV1 {
@@ -347,7 +360,8 @@ static_assert(offsetof(AicoreTaskControlV1, next_waiter) == 64, "waiter metadata
 static_assert(offsetof(AicoreTaskControlV1, inbox_next) == 80, "inbox link offset changed");
 static_assert(sizeof(AicoreCompletionInboxV1) == 128, "completion inbox layout changed");
 static_assert(sizeof(AicoreReadyInboxV1) == 128, "ready inbox layout changed");
-static_assert(sizeof(AicoreReadyDirectoryV1) == 128, "ready directory layout changed");
+static_assert(offsetof(AicoreReadyDirectoryV1, bootstrap_ready_types) == 64, "bootstrap flags must be cache aligned");
+static_assert(sizeof(AicoreReadyDirectoryV1) == 1024, "ready directory layout changed");
 static_assert(sizeof(AicoreFreeSlotDirectoryV1) == 128, "free-slot directory layout changed");
 static_assert(sizeof(AicoreTaskClaimBindingV1) == 64, "claim binding must occupy one cache line");
 static_assert(sizeof(AicoreDispatchSlotV1) == 128, "dispatch slot must occupy two cache lines");
@@ -367,11 +381,19 @@ static_assert(sizeof(AicoreTaskTraceCellV1) == 256, "task trace layout changed")
 #include <type_traits>
 static_assert(std::is_standard_layout_v<AicoreTaskMetadataV1> && std::is_trivially_copyable_v<AicoreTaskMetadataV1>);
 static_assert(std::is_standard_layout_v<AicoreTaskControlV1> && std::is_trivially_copyable_v<AicoreTaskControlV1>);
-static_assert(std::is_standard_layout_v<AicoreCompletionInboxV1> && std::is_trivially_copyable_v<AicoreCompletionInboxV1>);
+static_assert(
+    std::is_standard_layout_v<AicoreCompletionInboxV1> && std::is_trivially_copyable_v<AicoreCompletionInboxV1>
+);
 static_assert(std::is_standard_layout_v<AicoreReadyInboxV1> && std::is_trivially_copyable_v<AicoreReadyInboxV1>);
-static_assert(std::is_standard_layout_v<AicoreReadyDirectoryV1> && std::is_trivially_copyable_v<AicoreReadyDirectoryV1>);
-static_assert(std::is_standard_layout_v<AicoreFreeSlotDirectoryV1> && std::is_trivially_copyable_v<AicoreFreeSlotDirectoryV1>);
-static_assert(std::is_standard_layout_v<AicoreTaskClaimBindingV1> && std::is_trivially_copyable_v<AicoreTaskClaimBindingV1>);
+static_assert(
+    std::is_standard_layout_v<AicoreReadyDirectoryV1> && std::is_trivially_copyable_v<AicoreReadyDirectoryV1>
+);
+static_assert(
+    std::is_standard_layout_v<AicoreFreeSlotDirectoryV1> && std::is_trivially_copyable_v<AicoreFreeSlotDirectoryV1>
+);
+static_assert(
+    std::is_standard_layout_v<AicoreTaskClaimBindingV1> && std::is_trivially_copyable_v<AicoreTaskClaimBindingV1>
+);
 static_assert(std::is_standard_layout_v<AicoreDispatchSlotV1> && std::is_trivially_copyable_v<AicoreDispatchSlotV1>);
 static_assert(std::is_standard_layout_v<AicoreRunControlV1> && std::is_trivially_copyable_v<AicoreRunControlV1>);
 static_assert(std::is_standard_layout_v<AicoreWorkerContextV1> && std::is_trivially_copyable_v<AicoreWorkerContextV1>);
@@ -420,22 +442,35 @@ inline bool aicore_sidecar_plan_v1(
     next.aiv_task_count = aiv_task_count;
     uint64_t cursor = 0;
     uint64_t bytes = 0;
-#define AICORE_RESERVE_ARRAY(count, type, field)                                                                      \
-    (aicore_sidecar_checked_mul_v1((count), sizeof(type), &bytes) &&                                                  \
+#define AICORE_RESERVE_ARRAY(count, type, field)                     \
+    (aicore_sidecar_checked_mul_v1((count), sizeof(type), &bytes) && \
      aicore_sidecar_reserve_v1(&cursor, bytes, alignof(type), &next.field))
-    if (!aicore_sidecar_reserve_v1(&cursor, sizeof(AicoreRunControlV1), alignof(AicoreRunControlV1), &next.run_control_offset) ||
+    if (!aicore_sidecar_reserve_v1(
+            &cursor, sizeof(AicoreRunControlV1), alignof(AicoreRunControlV1), &next.run_control_offset
+        ) ||
         !AICORE_RESERVE_ARRAY(AICORE_WORKER_CAPACITY_V1, AicpuCoreLifecycleTraceV1, aicpu_lifecycle_traces_offset) ||
         !AICORE_RESERVE_ARRAY(AICORE_WORKER_CAPACITY_V1, AicoreWorkerContextV1, worker_contexts_offset) ||
-        !AICORE_RESERVE_ARRAY(AICORE_WORKER_CAPACITY_V1 * AICORE_PENDING_SLOT_COUNT_V1, PTO2DispatchPayload, dispatch_payloads_offset) ||
-        !AICORE_RESERVE_ARRAY(AICORE_WORKER_CAPACITY_V1 * AICORE_PENDING_SLOT_COUNT_V1, AicoreDispatchSlotV1, dispatch_slots_offset) ||
+        !AICORE_RESERVE_ARRAY(
+            AICORE_WORKER_CAPACITY_V1 * AICORE_PENDING_SLOT_COUNT_V1, PTO2DispatchPayload, dispatch_payloads_offset
+        ) ||
+        !AICORE_RESERVE_ARRAY(
+            AICORE_WORKER_CAPACITY_V1 * AICORE_PENDING_SLOT_COUNT_V1, AicoreDispatchSlotV1, dispatch_slots_offset
+        ) ||
         !AICORE_RESERVE_ARRAY(task_count, AicoreTaskClaimBindingV1, claim_bindings_offset) ||
         !AICORE_RESERVE_ARRAY(AICORE_CALLABLE_CAPACITY_V1, uint64_t, callable_addresses_offset) ||
         !AICORE_RESERVE_ARRAY(task_count, AicoreTaskMetadataV1, task_metadata_offset) ||
         !AICORE_RESERVE_ARRAY(task_count, AicoreTaskControlV1, task_controls_offset) ||
         !AICORE_RESERVE_ARRAY(AICORE_WORKER_CAPACITY_V1, AicoreCompletionInboxV1, completion_inboxes_offset) ||
-        !AICORE_RESERVE_ARRAY(AICORE_CORE_TYPE_COUNT_V1 * AICORE_WORKER_CAPACITY_V1, AicoreReadyInboxV1, ready_inboxes_offset) ||
-        !aicore_sidecar_reserve_v1(&cursor, sizeof(AicoreReadyDirectoryV1), alignof(AicoreReadyDirectoryV1), &next.ready_directory_offset) ||
-        !aicore_sidecar_reserve_v1(&cursor, sizeof(AicoreFreeSlotDirectoryV1), alignof(AicoreFreeSlotDirectoryV1), &next.free_slot_directory_offset) ||
+        !AICORE_RESERVE_ARRAY(
+            AICORE_CORE_TYPE_COUNT_V1 * AICORE_WORKER_CAPACITY_V1, AicoreReadyInboxV1, ready_inboxes_offset
+        ) ||
+        !aicore_sidecar_reserve_v1(
+            &cursor, sizeof(AicoreReadyDirectoryV1), alignof(AicoreReadyDirectoryV1), &next.ready_directory_offset
+        ) ||
+        !aicore_sidecar_reserve_v1(
+            &cursor, sizeof(AicoreFreeSlotDirectoryV1), alignof(AicoreFreeSlotDirectoryV1),
+            &next.free_slot_directory_offset
+        ) ||
         !AICORE_RESERVE_ARRAY(task_count, AicoreTaskTraceCellV1, trace_cells_offset) ||
         !aicore_sidecar_checked_align_v1(cursor, AICORE_SIDECAR_ALIGNMENT_V1, &next.total_size)) {
 #undef AICORE_RESERVE_ARRAY
@@ -452,8 +487,7 @@ inline __host__ __aicore__ __gm__ T *aicore_sidecar_at_v1(__gm__ void *base, uin
 }
 
 inline bool aicore_sidecar_init_v1(void *base, const AicoreExecutionSidecarLayoutV1 &layout) {
-    if (base == nullptr || (reinterpret_cast<uintptr_t>(base) & (AICORE_SIDECAR_ALIGNMENT_V1 - 1)) != 0)
-        return false;
+    if (base == nullptr || (reinterpret_cast<uintptr_t>(base) & (AICORE_SIDECAR_ALIGNMENT_V1 - 1)) != 0) return false;
     __builtin_memset(base, 0, static_cast<size_t>(layout.total_size));
     auto *bindings = aicore_sidecar_at_v1<AicoreTaskClaimBindingV1>(base, layout.claim_bindings_offset);
     for (uint64_t i = 0; i < layout.task_count; ++i)
