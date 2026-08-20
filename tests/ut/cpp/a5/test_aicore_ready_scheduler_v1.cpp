@@ -157,6 +157,13 @@ TEST(AicoreReadySidecarV1, PlansAndInitializesReadyState) {
     auto *ready = aicore_sidecar_at_v1<AicoreReadyInboxV1>(storage.base(), layout.ready_inboxes_offset);
     for (uint64_t inbox = 0; inbox < AICORE_CORE_TYPE_COUNT_V1 * AICORE_WORKER_CAPACITY_V1; ++inbox)
         EXPECT_EQ(ready[inbox].head, AICORE_INBOX_EMPTY_V1);
+
+    auto *directory = aicore_sidecar_at_v1<AicoreReadyDirectoryV1>(storage.base(), layout.ready_directory_offset);
+    auto shard0 = reinterpret_cast<uintptr_t>(&directory->core_types[0][0]);
+    auto shard1 = reinterpret_cast<uintptr_t>(&directory->core_types[0][1]);
+    auto aiv_shard0 = reinterpret_cast<uintptr_t>(&directory->core_types[1][0]);
+    EXPECT_EQ(shard1 - shard0, 64u);
+    EXPECT_EQ(aiv_shard0 - shard0, AICORE_READY_DIRECTORY_SHARD_COUNT_V1 * 64u);
 }
 
 TEST(AicoreClusterTopologyV1, UsesMixedKernelLaunchCoordinate) {
@@ -438,8 +445,8 @@ TEST(AicoreBootstrapV1, PublishesExclusiveInboxAndAggregatesDirectory) {
     EXPECT_EQ(controls[1].next_waiter, 0);
     EXPECT_EQ(controls[0].next_waiter, AICORE_INBOX_EMPTY_V1);
     EXPECT_EQ(aicore_ready_inbox_at_v1(storage.sidecar->base(), &storage.contexts[1], 0, 0)->head, 1);
-    EXPECT_EQ(directory->words[0][0], 1u);
-    EXPECT_EQ(directory->words[1][0], 0u);
+    EXPECT_EQ(directory->core_types[0][0].bits, 1u);
+    EXPECT_EQ(directory->core_types[1][0].bits, 0u);
     EXPECT_EQ(stats.enqueue_count, 2u);
     EXPECT_EQ(stats.batch_count, 1u);
 }
@@ -458,7 +465,7 @@ TEST(AicoreReadyInboxV1, BatchPushAndPerTaskPopMaintainDirectory) {
 
     auto *directory =
         aicore_sidecar_at_v1<AicoreReadyDirectoryV1>(storage.sidecar->base(), storage.layout.ready_directory_offset);
-    EXPECT_NE(directory->words[0][0] & 1, 0u);
+    EXPECT_NE(directory->core_types[0][0].bits & 1, 0u);
     std::vector<bool> seen(kTasks, false);
     for (uint64_t index = 0; index < kTasks; ++index) {
         int64_t task = AICORE_TASK_ID_INVALID_V1;
@@ -474,7 +481,7 @@ TEST(AicoreReadyInboxV1, BatchPushAndPerTaskPopMaintainDirectory) {
         graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 0, 0, &task, &stats
     ));
     EXPECT_EQ(task, AICORE_TASK_ID_INVALID_V1);
-    EXPECT_EQ(directory->words[0][0] & 1, 0u);
+    EXPECT_EQ(directory->core_types[0][0].bits & 1, 0u);
     EXPECT_EQ(stats.pop_count, kTasks);
 }
 
@@ -496,6 +503,91 @@ TEST(AicoreReadyInboxV1, StealsOnlyFromMarkedVictim) {
     EXPECT_EQ(claim.inbox_index, 1u);
     EXPECT_EQ(claim.source, AicoreReadySourceV1::STOLEN);
     EXPECT_EQ(stats.steal_count, 1u);
+}
+
+TEST(AicoreReadyInboxV1, DirectoryShardIgnoresResolverTail) {
+    FixtureStorage storage(1, 9);
+    auto *directory = aicore_ready_directory_at_v1(storage.sidecar->base(), &storage.contexts[0]);
+    directory->core_types[0][1].bits = UINT64_C(1) << 6;
+    EXPECT_EQ(aicore_load_ready_directory_shard_v1(directory, 9, 0, 7), 0u);
+
+    directory->core_types[0][1].bits = UINT64_C(1) << 1;
+    EXPECT_EQ(aicore_load_ready_directory_shard_v1(directory, 9, 0, 7), UINT64_C(1) << 1);
+}
+
+TEST(AicoreReadyInboxV1, BootstrapPublishesIndependentDirectoryShards) {
+    FixtureStorage storage(1, 14);
+    auto *directory = aicore_ready_directory_at_v1(storage.sidecar->base(), &storage.contexts[0]);
+    directory->bootstrap_ready_types[0] = UINT64_C(1) << 0;
+    directory->bootstrap_ready_types[6] = UINT64_C(1) << 0;
+    directory->bootstrap_ready_types[7] = UINT64_C(1) << 1;
+    directory->bootstrap_ready_types[13] = (UINT64_C(1) << 0) | (UINT64_C(1) << 1);
+
+    aicore_bootstrap_ready_directory_publish_v1(storage.sidecar->base(), &storage.contexts[0], 14);
+
+    EXPECT_EQ(directory->core_types[0][0].bits, (UINT64_C(1) << 0) | (UINT64_C(1) << 6));
+    EXPECT_EQ(directory->core_types[1][0].bits, 0u);
+    EXPECT_EQ(directory->core_types[0][1].bits, UINT64_C(1) << 6);
+    EXPECT_EQ(directory->core_types[1][1].bits, (UINT64_C(1) << 0) | (UINT64_C(1) << 6));
+}
+
+TEST(AicoreReadyInboxV1, SparseDirectoryWrapsWithinShard) {
+    FixtureStorage storage(2, 14);
+    GraphBuffer graph(2);
+    graph.executable(0, 0);
+    graph.executable(1, 0);
+    AicoreReadyStatsV1 stats{};
+    AicoreReadyBatchV1 high_batch{};
+    AicoreReadyBatchV1 low_batch{};
+    ASSERT_TRUE(aicore_ready_batch_append_v1(storage.sidecar->base(), &storage.contexts[13], 0, &high_batch, &stats));
+    ASSERT_TRUE(aicore_ready_batch_push_v1(storage.sidecar->base(), &storage.contexts[13], 0, 13, &high_batch, &stats));
+    ASSERT_TRUE(aicore_ready_batch_append_v1(storage.sidecar->base(), &storage.contexts[8], 1, &low_batch, &stats));
+    ASSERT_TRUE(aicore_ready_batch_push_v1(storage.sidecar->base(), &storage.contexts[8], 0, 8, &low_batch, &stats));
+
+    uint64_t cursor = 12;
+    AicoreReadyClaimV1 claim{};
+    ASSERT_TRUE(aicore_claim_ready_for_slot_v1(
+        graph.graph(), storage.sidecar->base(), &storage.contexts[7], storage.run_control, 14, 0, &cursor, &stats,
+        &claim
+    ));
+    EXPECT_EQ(claim.task_id, 0);
+    EXPECT_EQ(claim.inbox_index, 13u);
+    EXPECT_EQ(cursor, 7u);
+
+    ASSERT_TRUE(aicore_claim_ready_for_slot_v1(
+        graph.graph(), storage.sidecar->base(), &storage.contexts[7], storage.run_control, 14, 0, &cursor, &stats,
+        &claim
+    ));
+    EXPECT_EQ(claim.task_id, 1);
+    EXPECT_EQ(claim.inbox_index, 8u);
+    EXPECT_EQ(cursor, 9u);
+}
+
+TEST(AicoreReadyInboxV1, DoesNotStealAcrossDirectoryShards) {
+    FixtureStorage storage(1, 14);
+    GraphBuffer graph(1);
+    graph.executable(0, 0);
+    AicoreReadyBatchV1 batch{};
+    AicoreReadyStatsV1 stats{};
+    ASSERT_TRUE(aicore_ready_batch_append_v1(storage.sidecar->base(), &storage.contexts[8], 0, &batch, &stats));
+    ASSERT_TRUE(aicore_ready_batch_push_v1(storage.sidecar->base(), &storage.contexts[8], 0, 8, &batch, &stats));
+
+    uint64_t cursor = 1;
+    AicoreReadyClaimV1 claim{};
+    ASSERT_TRUE(aicore_claim_ready_for_slot_v1(
+        graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 14, 0, &cursor, &stats,
+        &claim
+    ));
+    EXPECT_EQ(claim.task_id, AICORE_TASK_ID_INVALID_V1);
+
+    cursor = 8;
+    ASSERT_TRUE(aicore_claim_ready_for_slot_v1(
+        graph.graph(), storage.sidecar->base(), &storage.contexts[7], storage.run_control, 14, 0, &cursor, &stats,
+        &claim
+    ));
+    EXPECT_EQ(claim.task_id, 0);
+    EXPECT_EQ(claim.inbox_index, 8u);
+    EXPECT_EQ(claim.source, AicoreReadySourceV1::STOLEN);
 }
 
 TEST(AicoreReadyInboxV1, ConcurrentConsumersNeverDuplicateTask) {

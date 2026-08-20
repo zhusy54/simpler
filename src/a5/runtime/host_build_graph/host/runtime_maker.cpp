@@ -1784,8 +1784,9 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
             }
             bool ready_directory_empty = true;
             for (uint32_t type = 0; type < AICORE_CORE_TYPE_COUNT_V1; ++type) {
-                for (uint32_t word = 0; word < AICORE_READY_DIRECTORY_WORD_COUNT_V1; ++word)
-                    ready_directory_empty = ready_directory_empty && ready_directory->words[type][word] == 0;
+                for (uint32_t shard = 0; shard < AICORE_READY_DIRECTORY_SHARD_COUNT_V1; ++shard)
+                    ready_directory_empty =
+                        ready_directory_empty && ready_directory->core_types[type][shard].bits == 0;
             }
             bool task_controls_valid = true;
             for (int32_t task_id = 0; task_id < runtime->host_total_tasks; ++task_id) {

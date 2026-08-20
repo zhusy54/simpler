@@ -35,7 +35,10 @@ inline constexpr uint32_t AICORE_CALLABLE_CAPACITY_V1 = 1024;
 inline constexpr uint32_t AICORE_CORE_TYPE_COUNT_V1 = 2;
 inline constexpr uint32_t AICORE_CLUSTER_CAPACITY_V1 = AICORE_WORKER_CAPACITY_V1 / 3;
 inline constexpr uint32_t AICORE_GANG_COHORT_COUNT_V1 = 2;
-inline constexpr uint32_t AICORE_READY_DIRECTORY_WORD_COUNT_V1 = (AICORE_WORKER_CAPACITY_V1 + 63) / 64;
+inline constexpr uint32_t AICORE_READY_DIRECTORY_RESOLVERS_PER_SHARD_V1 = 7;
+inline constexpr uint32_t AICORE_READY_DIRECTORY_SHARD_COUNT_V1 =
+    (AICORE_CLUSTER_CAPACITY_V1 + AICORE_READY_DIRECTORY_RESOLVERS_PER_SHARD_V1 - 1) /
+    AICORE_READY_DIRECTORY_RESOLVERS_PER_SHARD_V1;
 inline constexpr uint32_t AICORE_FREE_SLOT_DIRECTORY_WORD_COUNT_V1 =
     (AICORE_WORKER_CAPACITY_V1 * AICORE_PENDING_SLOT_COUNT_V1 + 63) / 64;
 inline constexpr int64_t AICORE_TASK_ID_INVALID_V1 = -1;
@@ -227,9 +230,14 @@ struct alignas(128) AicoreGangCommandV1 {
     uint8_t padding[96];
 };
 
+struct alignas(64) AicoreReadyDirectoryShardV1 {
+    volatile uint64_t bits;
+    uint8_t cache_line_padding[64 - sizeof(uint64_t)];
+};
+
 struct alignas(128) AicoreReadyDirectoryV1 {
-    volatile uint64_t words[AICORE_CORE_TYPE_COUNT_V1][AICORE_READY_DIRECTORY_WORD_COUNT_V1];
-    uint8_t bootstrap_flags_alignment[32];
+    AicoreReadyDirectoryShardV1
+        core_types[AICORE_CORE_TYPE_COUNT_V1][AICORE_READY_DIRECTORY_SHARD_COUNT_V1];
     volatile uint64_t bootstrap_ready_types[AICORE_WORKER_CAPACITY_V1];
 };
 
@@ -515,8 +523,19 @@ static_assert(
 static_assert(sizeof(AicoreGangCohortV1) == 128, "gang cohort layout changed");
 static_assert(sizeof(AicoreGangParticipantV1) == 128, "gang participant layout changed");
 static_assert(sizeof(AicoreGangCommandV1) == 128, "gang command layout changed");
-static_assert(offsetof(AicoreReadyDirectoryV1, bootstrap_ready_types) == 64, "bootstrap flags must be cache aligned");
-static_assert(sizeof(AicoreReadyDirectoryV1) == 1024, "ready directory layout changed");
+static_assert(sizeof(AicoreReadyDirectoryShardV1) == 64, "ready directory shard must occupy one cache line");
+static_assert(
+    offsetof(AicoreReadyDirectoryV1, bootstrap_ready_types) ==
+        AICORE_CORE_TYPE_COUNT_V1 * AICORE_READY_DIRECTORY_SHARD_COUNT_V1 * 64,
+    "bootstrap flags must follow the ready directory shards"
+);
+static_assert(
+    sizeof(AicoreReadyDirectoryV1) ==
+        ((offsetof(AicoreReadyDirectoryV1, bootstrap_ready_types) +
+          AICORE_WORKER_CAPACITY_V1 * sizeof(uint64_t) + 127) /
+         128 * 128),
+    "ready directory layout changed"
+);
 static_assert(sizeof(AicoreFreeSlotDirectoryV1) == 128, "free-slot directory layout changed");
 static_assert(sizeof(AicoreTaskClaimBindingV1) == 64, "claim binding must occupy one cache line");
 static_assert(sizeof(AicoreDispatchSlotV1) == 128, "dispatch slot must occupy two cache lines");

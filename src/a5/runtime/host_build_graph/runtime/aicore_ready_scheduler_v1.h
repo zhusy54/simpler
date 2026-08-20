@@ -417,24 +417,29 @@ inline __aicore__ bool aicore_bootstrap_ready_batch_publish_v1(
 inline __aicore__ void aicore_bootstrap_ready_directory_publish_v1(
     __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *context, uint64_t resolver_count
 ) {
-    uint64_t words[AICORE_CORE_TYPE_COUNT_V1][AICORE_READY_DIRECTORY_WORD_COUNT_V1]{};
     __gm__ AicoreReadyDirectoryV1 *directory = aicore_ready_directory_at_v1(sidecar_base, context);
     for (uint64_t inbox_index = 0; inbox_index < resolver_count; inbox_index += 8)
         aicore_invalidate_cache_line_v0(&directory->bootstrap_ready_types[inbox_index]);
     aicore_cache_barrier_v0();
-    for (uint64_t inbox_index = 0; inbox_index < resolver_count; ++inbox_index) {
-        uint64_t ready_types = directory->bootstrap_ready_types[inbox_index];
-        uint64_t word = inbox_index / 64;
-        uint64_t bit = UINT64_C(1) << (inbox_index % 64);
-        for (uint32_t type = 0; type < AICORE_CORE_TYPE_COUNT_V1; ++type) {
-            if ((ready_types & (UINT64_C(1) << type)) != 0) words[type][word] |= bit;
+    uint32_t shard_count = static_cast<uint32_t>(
+        (resolver_count + AICORE_READY_DIRECTORY_RESOLVERS_PER_SHARD_V1 - 1) /
+        AICORE_READY_DIRECTORY_RESOLVERS_PER_SHARD_V1
+    );
+    for (uint32_t type = 0; type < AICORE_CORE_TYPE_COUNT_V1; ++type) {
+        for (uint32_t shard = 0; shard < shard_count; ++shard) {
+            uint64_t bits = 0;
+            uint64_t shard_begin = static_cast<uint64_t>(shard) * AICORE_READY_DIRECTORY_RESOLVERS_PER_SHARD_V1;
+            uint64_t shard_end = shard_begin + AICORE_READY_DIRECTORY_RESOLVERS_PER_SHARD_V1;
+            if (shard_end > resolver_count) shard_end = resolver_count;
+            for (uint64_t inbox_index = shard_begin; inbox_index < shard_end; ++inbox_index) {
+                uint64_t ready_types = directory->bootstrap_ready_types[inbox_index];
+                if ((ready_types & (UINT64_C(1) << type)) != 0)
+                    bits |= UINT64_C(1) << (inbox_index - shard_begin);
+            }
+            directory->core_types[type][shard].bits = bits;
+            aicore_publish_cache_line_v0(&directory->core_types[type][shard]);
         }
     }
-    for (uint32_t type = 0; type < AICORE_CORE_TYPE_COUNT_V1; ++type) {
-        for (uint32_t word = 0; word < AICORE_READY_DIRECTORY_WORD_COUNT_V1; ++word)
-            directory->words[type][word] = words[type][word];
-    }
-    aicore_publish_cache_line_v0(directory);
 }
 
 inline __aicore__ bool aicore_ready_batch_append_v1(
@@ -468,20 +473,20 @@ inline __aicore__ bool aicore_ready_batch_append_v1(
 inline __aicore__ void aicore_ready_directory_set_v1(
     __gm__ AicoreReadyDirectoryV1 *directory, uint32_t core_type_index, uint64_t inbox_index
 ) {
-    uint64_t word = inbox_index / 64;
-    uint64_t bit = UINT64_C(1) << (inbox_index % 64);
-    aicore_gm_fetch_or_v0(directory->words[core_type_index][word], bit);
+    uint64_t shard = inbox_index / AICORE_READY_DIRECTORY_RESOLVERS_PER_SHARD_V1;
+    uint64_t bit = UINT64_C(1) << (inbox_index % AICORE_READY_DIRECTORY_RESOLVERS_PER_SHARD_V1);
+    aicore_gm_fetch_or_v0(directory->core_types[core_type_index][shard].bits, bit);
 }
 
 inline __aicore__ void aicore_ready_directory_clear_and_recheck_v1(
     __gm__ AicoreReadyDirectoryV1 *directory, __gm__ AicoreReadyInboxV1 *inbox, uint32_t core_type_index,
     uint64_t inbox_index
 ) {
-    uint64_t word = inbox_index / 64;
-    uint64_t bit = UINT64_C(1) << (inbox_index % 64);
-    aicore_gm_fetch_and_v0(directory->words[core_type_index][word], ~bit);
+    uint64_t shard = inbox_index / AICORE_READY_DIRECTORY_RESOLVERS_PER_SHARD_V1;
+    uint64_t bit = UINT64_C(1) << (inbox_index % AICORE_READY_DIRECTORY_RESOLVERS_PER_SHARD_V1);
+    aicore_gm_fetch_and_v0(directory->core_types[core_type_index][shard].bits, ~bit);
     if (aicore_gm_load_v0(inbox->head) != AICORE_INBOX_EMPTY_V1)
-        aicore_gm_fetch_or_v0(directory->words[core_type_index][word], bit);
+        aicore_gm_fetch_or_v0(directory->core_types[core_type_index][shard].bits, bit);
 }
 
 inline __aicore__ bool aicore_ready_batch_push_v1(
@@ -579,6 +584,54 @@ inline __aicore__ bool aicore_ready_pop_from_inbox_v1(
     return true;
 }
 
+inline __aicore__ uint64_t aicore_load_ready_directory_shard_v1(
+    __gm__ AicoreReadyDirectoryV1 *directory, uint64_t resolver_count, uint32_t core_type_index,
+    uint64_t inbox_index
+) {
+    uint64_t shard = inbox_index / AICORE_READY_DIRECTORY_RESOLVERS_PER_SHARD_V1;
+    uint64_t shard_begin = shard * AICORE_READY_DIRECTORY_RESOLVERS_PER_SHARD_V1;
+    uint64_t shard_end = shard_begin + AICORE_READY_DIRECTORY_RESOLVERS_PER_SHARD_V1;
+    if (shard_end > resolver_count) shard_end = resolver_count;
+    uint64_t valid_bits = shard_end > shard_begin ? (UINT64_C(1) << (shard_end - shard_begin)) - 1 : 0;
+    return aicore_gm_load_v0(directory->core_types[core_type_index][shard].bits) & valid_bits;
+}
+
+static __attribute__((noinline)) __aicore__ bool aicore_steal_ready_from_shard_v1(
+    const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *context,
+    __gm__ AicoreRunControlV1 *run_control, uint32_t core_type_index, uint64_t shard_begin, uint64_t shard_end,
+    uint64_t start, uint64_t *victim_cursor, uint64_t bits, AicoreReadyStatsV1 *stats, AicoreReadyClaimV1 *claim
+) {
+    int64_t task_id = AICORE_TASK_ID_INVALID_V1;
+    bits &= ~(UINT64_C(1) << (context->inbox_index - shard_begin));
+    for (uint32_t pass = 0; pass < 2; ++pass) {
+        uint64_t range_begin = pass == 0 ? start : shard_begin;
+        uint64_t range_end = pass == 0 ? shard_end : start;
+        if (range_begin == range_end) continue;
+        uint32_t lower_bit = static_cast<uint32_t>(range_begin - shard_begin);
+        uint32_t upper_bit = static_cast<uint32_t>(range_end - shard_begin);
+        uint64_t candidates = bits & (((UINT64_C(1) << upper_bit) - 1) & ~((UINT64_C(1) << lower_bit) - 1));
+        while (candidates != 0) {
+            uint32_t bit_index = static_cast<uint32_t>(__builtin_ctzll(candidates));
+            candidates &= candidates - 1;
+            uint64_t victim = shard_begin + bit_index;
+            *victim_cursor = victim + 1 == shard_end ? shard_begin : victim + 1;
+            if (!aicore_ready_pop_from_inbox_v1(
+                    graph, sidecar_base, context, run_control, core_type_index, victim, &task_id, stats
+                ))
+                return false;
+            if (task_id >= 0) {
+                claim->task_id = task_id;
+                claim->inbox_index = victim;
+                claim->source = AicoreReadySourceV1::STOLEN;
+                claim->claim_end_cycles = aicore_scheduler_cycles_v1();
+                if (stats != nullptr) ++stats->steal_count;
+                return true;
+            }
+        }
+    }
+    return true;
+}
+
 inline __aicore__ bool aicore_claim_ready_for_slot_v1(
     const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *context,
     __gm__ AicoreRunControlV1 *run_control, uint64_t resolver_count, uint32_t core_type_index, uint64_t *victim_cursor,
@@ -600,40 +653,33 @@ inline __aicore__ bool aicore_claim_ready_for_slot_v1(
     }
 
     __gm__ AicoreReadyDirectoryV1 *directory = aicore_ready_directory_at_v1(sidecar_base, context);
-    uint64_t masks[AICORE_READY_DIRECTORY_WORD_COUNT_V1]{};
-    for (uint32_t word = 0; word < AICORE_READY_DIRECTORY_WORD_COUNT_V1; ++word)
-        masks[word] = aicore_gm_load_v0(directory->words[core_type_index][word]);
-    uint64_t start = *victim_cursor % resolver_count;
-    for (uint64_t offset = 0; offset < resolver_count; ++offset) {
-        uint64_t victim = (start + offset) % resolver_count;
-        if (victim == context->inbox_index || (masks[victim / 64] & (UINT64_C(1) << (victim % 64))) == 0) continue;
-        *victim_cursor = (victim + 1) % resolver_count;
-        if (!aicore_ready_pop_from_inbox_v1(
-                graph, sidecar_base, context, run_control, core_type_index, victim, &task_id, stats
-            ))
-            return false;
-        if (task_id >= 0) {
-            claim->task_id = task_id;
-            claim->inbox_index = victim;
-            claim->source = AicoreReadySourceV1::STOLEN;
-            claim->claim_end_cycles = aicore_scheduler_cycles_v1();
-            if (stats != nullptr) ++stats->steal_count;
-            return true;
-        }
-    }
-    *victim_cursor = (start + 1) % resolver_count;
+    uint64_t shard_begin = context->inbox_index / AICORE_READY_DIRECTORY_RESOLVERS_PER_SHARD_V1 *
+                           AICORE_READY_DIRECTORY_RESOLVERS_PER_SHARD_V1;
+    uint64_t shard_end = shard_begin + AICORE_READY_DIRECTORY_RESOLVERS_PER_SHARD_V1;
+    if (shard_end > resolver_count) shard_end = resolver_count;
+    uint64_t start = *victim_cursor;
+    if (start < shard_begin || start >= shard_end) start = shard_begin;
+    uint64_t bits = aicore_load_ready_directory_shard_v1(
+        directory, resolver_count, core_type_index, context->inbox_index
+    );
+    if (bits != 0 && !aicore_steal_ready_from_shard_v1(
+                         graph, sidecar_base, context, run_control, core_type_index, shard_begin, shard_end, start,
+                         victim_cursor, bits, stats, claim
+                     ))
+        return false;
+    if (claim->task_id >= 0) return true;
+    *victim_cursor = start + 1 == shard_end ? shard_begin : start + 1;
     claim->claim_end_cycles = aicore_scheduler_cycles_v1();
     return true;
 }
 
 inline __aicore__ bool aicore_ready_directory_nonempty_v1(
-    __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *context, uint32_t core_type_index
+    __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *context, uint64_t resolver_count, uint32_t core_type_index
 ) {
     __gm__ AicoreReadyDirectoryV1 *directory = aicore_ready_directory_at_v1(sidecar_base, context);
-    for (uint32_t word = 0; word < AICORE_READY_DIRECTORY_WORD_COUNT_V1; ++word) {
-        if (aicore_gm_load_v0(directory->words[core_type_index][word]) != 0) return true;
-    }
-    return false;
+    return aicore_load_ready_directory_shard_v1(
+               directory, resolver_count, core_type_index, context->inbox_index
+           ) != 0;
 }
 
 inline __aicore__ void aicore_advertise_free_slot_v1(
@@ -1135,7 +1181,7 @@ inline __aicore__ bool aicore_dispatch_one_overflow_v1(
     AicoreFreeSlotStatsV1 *free_stats, bool *made_progress, bool trace_enabled = false
 ) {
     if (made_progress != nullptr) *made_progress = false;
-    if (!aicore_ready_directory_nonempty_v1(sidecar_base, resolver, core_type_index)) return true;
+    if (!aicore_ready_directory_nonempty_v1(sidecar_base, resolver, resolver_count, core_type_index)) return true;
     AicoreFreeSlotClaimV1 slot_claim{};
     if (!aicore_try_claim_free_slot_v1(
             graph, sidecar_base, resolver, run_control, core_type_index, free_slot_cursor, free_stats, &slot_claim
