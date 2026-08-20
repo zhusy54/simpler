@@ -69,6 +69,7 @@
 #include "common/chip_swimlane_policy.h"
 #include "common/unified_log.h"
 #include "common/strace.h"
+#include "host/platform_compile_info.h"
 #include "utils/device_arena.h"
 #include "prepare_callable_common.h"
 
@@ -882,10 +883,15 @@ bool create_aicore_sidecar_v1(
     std::vector<AicoreTaskMetadataV1> task_metadata(static_cast<size_t>(total_tasks));
     uint64_t aic_task_count = 0;
     uint64_t aiv_task_count = 0;
+    uint64_t executable_task_count = 0;
+    uint64_t executable_subtask_count = 0;
+    uint64_t gang_task_count = 0;
+    uint64_t aic_worker_demand = 0;
+    uint64_t aiv_worker_demand = 0;
     for (int64_t task_id = 0; task_id < total_tasks; ++task_id) {
         PTO2TaskSlotState &slot = host_sm_handle.header->ring.get_slot_state_by_task_id(task_id);
-        AicoreTaskInfoV0 task{};
-        AicoreRootStatusV0 status = aicore_classify_task_v0(host_graph, task_id, &task);
+        AicoreTaskShapeV1 shape{};
+        AicoreRootStatusV0 status = aicore_classify_task_shape_v1(host_graph, task_id, &shape);
         if (status != AicoreRootStatusV0::OK) {
             bool inline_completed_task = status == AicoreRootStatusV0::UNSUPPORTED_SHAPE &&
                                          slot.active_mask.raw() == 0 && slot.logical_block_num == 1 &&
@@ -903,24 +909,44 @@ bool create_aicore_sidecar_v1(
             );
             return false;
         }
-        uint8_t expected_mask = static_cast<uint8_t>(1u << task.subtask_slot);
-        if (slot.active_mask.raw() != expected_mask || slot.logical_block_num != 1 ||
-            slot.total_required_subtasks != 1 || slot.task_state.load(std::memory_order_acquire) != PTO2_TASK_PENDING ||
-            slot.task_attrs.allow_early_resolve() || slot.task_attrs.requires_sync_start() ||
-            slot.task_attrs.has_predicate()) {
+        const uint8_t active_mask = shape.active_mask;
+        const uint32_t active_subtasks = static_cast<uint32_t>(__builtin_popcount(active_mask));
+        if (slot.logical_block_num <= 0) {
+            LOG_ERROR("A5 HBG AICore scheduler: task id=%" PRId64 " has invalid block_num=%d", task_id,
+                      slot.logical_block_num);
+            return false;
+        }
+        const uint32_t logical_block_num = static_cast<uint32_t>(slot.logical_block_num);
+        if (logical_block_num > UINT16_MAX / active_subtasks) {
             LOG_ERROR(
-                "A5 HBG AICore scheduler: v0 task id=%" PRId64
-                " must be pending, single-slot, block_num=1, and ungated",
+                "A5 HBG AICore scheduler: task id=%" PRId64 " block/subtask product exceeds sidecar capacity",
                 task_id
             );
             return false;
         }
-        if (task.kernel_id >= RUNTIME_MAX_FUNC_ID || runtime->get_function_bin_addr(task.kernel_id) == 0) {
+        const uint32_t expected_subtasks = logical_block_num * active_subtasks;
+        if (slot.active_mask.raw() != active_mask || expected_subtasks > UINT16_MAX ||
+            slot.total_required_subtasks != expected_subtasks ||
+            slot.task_state.load(std::memory_order_acquire) != PTO2_TASK_PENDING ||
+            slot.task_attrs.allow_early_resolve() || slot.task_attrs.has_predicate()) {
             LOG_ERROR(
-                "A5 HBG AICore scheduler: task id=%" PRId64 " kernel id %d has no registered callable", task_id,
-                task.kernel_id
+                "A5 HBG AICore scheduler: task id=%" PRId64
+                " has inconsistent shape/state or uses predicate/early-resolve",
+                task_id
             );
             return false;
+        }
+        for (uint32_t subtask_slot = 0; subtask_slot < 3; ++subtask_slot) {
+            if ((active_mask & (1U << subtask_slot)) == 0) continue;
+            const int32_t kernel_id = shape.kernel_ids[subtask_slot];
+            if (kernel_id < 0 || kernel_id >= RUNTIME_MAX_FUNC_ID ||
+                runtime->get_function_bin_addr(kernel_id) == 0) {
+                LOG_ERROR(
+                    "A5 HBG AICore scheduler: task id=%" PRId64 " kernel id %d has no registered callable",
+                    task_id, kernel_id
+                );
+                return false;
+            }
         }
         __gm__ uint8_t *payload = aicore_graph_payload_v0(host_graph, task_id);
         int32_t fanin_count = *reinterpret_cast<__gm__ int32_t *>(payload + AICORE_GRAPH_FANIN_COUNT_OFFSET_V0);
@@ -929,15 +955,37 @@ bool create_aicore_sidecar_v1(
             return false;
         }
         AicoreTaskMetadataV1 &metadata = task_metadata[static_cast<size_t>(task_id)];
-        metadata.kernel_id = static_cast<uint16_t>(task.kernel_id);
-        metadata.subtask_slot = static_cast<uint8_t>(task.subtask_slot);
+        for (uint32_t subtask_slot = 0; subtask_slot < 3; ++subtask_slot) {
+            metadata.kernel_ids[subtask_slot] = (active_mask & (1U << subtask_slot)) != 0 ?
+                                                    static_cast<uint16_t>(shape.kernel_ids[subtask_slot]) :
+                                                    UINT16_MAX;
+        }
+        metadata.active_mask = active_mask;
         metadata.flags = AICORE_TASK_EXECUTABLE_V1;
+        metadata.logical_block_num = static_cast<uint16_t>(logical_block_num);
+        metadata.total_required_subtasks = static_cast<uint16_t>(expected_subtasks);
         if (fanin_count != 0) metadata.flags |= AICORE_TASK_HAS_FANIN_V1;
-        if (task.subtask_slot == 0) ++aic_task_count;
-        else ++aiv_task_count;
+        if (active_subtasks > 1) metadata.flags |= AICORE_TASK_MIX_V1;
+        if (logical_block_num > 1) metadata.flags |= AICORE_TASK_SPMD_V1;
+        if (slot.task_attrs.requires_sync_start()) metadata.flags |= AICORE_TASK_SYNC_START_V1;
+        if (aicore_task_requires_sync_start_v1(metadata.flags) && logical_block_num == 1) {
+            LOG_ERROR("A5 HBG AICore scheduler: sync-start task id=%" PRId64 " must have block_num > 1", task_id);
+            return false;
+        }
+        if ((active_mask & 1U) != 0) {
+            ++aic_task_count;
+            aic_worker_demand = std::max<uint64_t>(aic_worker_demand, logical_block_num);
+        }
+        const uint32_t active_aiv_subtasks = active_subtasks - ((active_mask & 1U) != 0 ? 1U : 0U);
+        if (active_aiv_subtasks != 0) {
+            ++aiv_task_count;
+            aiv_worker_demand = std::max<uint64_t>(aiv_worker_demand, logical_block_num * active_aiv_subtasks);
+        }
+        if (aicore_task_is_gang_v1(metadata.flags)) ++gang_task_count;
+        executable_subtask_count += expected_subtasks;
+        ++executable_task_count;
     }
 
-    const uint64_t executable_task_count = aic_task_count + aiv_task_count;
     if (executable_task_count + inline_completed_task_ids.size() != static_cast<uint64_t>(total_tasks)) {
         LOG_ERROR("A5 HBG AICore scheduler: task metadata does not cover the graph");
         return false;
@@ -949,6 +997,11 @@ bool create_aicore_sidecar_v1(
         LOG_ERROR("A5 HBG AICore scheduler: sidecar layout overflow");
         return false;
     }
+    layout.executable_task_count = executable_task_count;
+    layout.executable_subtask_count = executable_subtask_count;
+    layout.gang_task_count = gang_task_count;
+    layout.aic_worker_demand = aic_worker_demand;
+    layout.aiv_worker_demand = aiv_worker_demand;
 
     const uint64_t allocation_size = layout.total_size + AICORE_SIDECAR_ALIGNMENT_V1 - 1;
     void *allocation = api->device_malloc(static_cast<size_t>(allocation_size));
@@ -979,11 +1032,15 @@ bool create_aicore_sidecar_v1(
         AICORE_CALLABLE_CAPACITY_V1 == RUNTIME_MAX_FUNC_ID, "sidecar callable table must cover the runtime table"
     );
     auto *callable_addresses = aicore_sidecar_at_v1<uint64_t>(host_base, layout.callable_addresses_offset);
-    for (uint32_t func_id = 0; func_id < AICORE_CALLABLE_CAPACITY_V1; ++func_id)
-        callable_addresses[func_id] =
-            runtime->get_function_bin_addr(static_cast<int32_t>(func_id)) == 0 ?
-                0 :
-                runtime->get_function_bin_addr(static_cast<int32_t>(func_id)) + CoreCallable::binary_data_offset();
+    const bool cpu_sim = std::strcmp(get_platform(), "a5sim") == 0;
+    for (uint32_t func_id = 0; func_id < AICORE_CALLABLE_CAPACITY_V1; ++func_id) {
+        const uint64_t callable_address = runtime->get_function_bin_addr(static_cast<int32_t>(func_id));
+        callable_addresses[func_id] = callable_address == 0 ?
+                                          0 :
+                                          (cpu_sim ? reinterpret_cast<const CoreCallable *>(callable_address)
+                                                         ->resolved_addr() :
+                                                     callable_address + CoreCallable::binary_data_offset());
+    }
     auto *metadata = aicore_sidecar_at_v1<AicoreTaskMetadataV1>(host_base, layout.task_metadata_offset);
     std::copy(task_metadata.begin(), task_metadata.end(), metadata);
 
@@ -999,9 +1056,14 @@ bool create_aicore_sidecar_v1(
     run_control->ready_inboxes_offset = layout.ready_inboxes_offset;
     run_control->ready_directory_offset = layout.ready_directory_offset;
     run_control->free_slot_directory_offset = layout.free_slot_directory_offset;
+    run_control->gang_coordinator_offset = layout.gang_coordinator_offset;
+    run_control->gang_cohorts_offset = layout.gang_cohorts_offset;
     run_control->error_task_id = UINT64_MAX;
     run_control->error_core_id = UINT64_MAX;
     run_control->error_core_type = UINT64_MAX;
+    auto *gang_coordinator =
+        aicore_sidecar_at_v1<AicoreGangCoordinatorV1>(host_base, layout.gang_coordinator_offset);
+    gang_coordinator->gang_task_count = gang_task_count;
 
     auto *contexts = aicore_sidecar_at_v1<AicoreWorkerContextV1>(host_base, layout.worker_contexts_offset);
     int32_t aic_rank = 0;
@@ -1024,6 +1086,10 @@ bool create_aicore_sidecar_v1(
         context.callable_addresses_offset = layout.callable_addresses_offset;
         context.runtime_worker_count = static_cast<uint64_t>(runtime->get_worker_count());
         context.bootstrap_done = 0;
+        context.gang_coordinator_offset = layout.gang_coordinator_offset;
+        context.gang_cohorts_offset = layout.gang_cohorts_offset;
+        context.gang_participants_offset = layout.gang_participants_offset;
+        context.gang_commands_offset = layout.gang_commands_offset;
         context.graph_descriptors_address = device_sm_address + device_segments.descriptors;
         context.graph_payloads_address = device_sm_address + device_segments.payloads;
         context.sidecar_base_address = aligned_address;
@@ -1645,8 +1711,9 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
             uint64_t payload_cycles = 0;
             uint64_t kernel_cycles = 0;
             uint64_t completion_cycles = 0;
-            const uint64_t executable_task_count =
-                runtime->aicore_sidecar_layout.aic_task_count + runtime->aicore_sidecar_layout.aiv_task_count;
+            const uint64_t executable_task_count = runtime->aicore_sidecar_layout.executable_task_count;
+            const uint64_t executable_subtask_count = runtime->aicore_sidecar_layout.executable_subtask_count;
+            const uint64_t ordinary_task_count = executable_task_count - runtime->aicore_sidecar_layout.gang_task_count;
             for (int32_t i = 0; i < runtime->worker_count; ++i) {
                 if (contexts[i].active != 0) ++active_workers;
                 worker_executed += contexts[i].executed_task_count;
@@ -1685,11 +1752,17 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
                 completion_cycles += contexts[i].completion_enqueue_cycles;
             }
             bool completion_inboxes_empty = true;
-            for (uint64_t inbox = 0; inbox < control->aiv_active_worker_count; ++inbox) {
-                if (completion_inboxes[inbox].head != AICORE_INBOX_EMPTY_V1) {
+            for (int32_t worker = 0; worker < runtime->worker_count; ++worker) {
+                if (contexts[worker].active == 0) continue;
+                if (completion_inboxes[worker].head != AICORE_INBOX_EMPTY_V1 ||
+                    completion_inboxes[worker].completed_generations[0] != 0 ||
+                    completion_inboxes[worker].completed_generations[1] != 0) {
                     LOG_ERROR(
-                        "A5 HBG AICore scheduler: completion inbox=%" PRIu64 " not empty head=%" PRId64, inbox,
-                        completion_inboxes[inbox].head
+                        "A5 HBG AICore scheduler: completion line=%d not empty head=%" PRId64
+                        " generations={%" PRIu64 ",%" PRIu64 "}",
+                        worker, completion_inboxes[worker].head,
+                        completion_inboxes[worker].completed_generations[0],
+                        completion_inboxes[worker].completed_generations[1]
                     );
                     completion_inboxes_empty = false;
                     break;
@@ -1697,7 +1770,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
             }
             bool ready_inboxes_empty = true;
             for (uint32_t type = 0; type < AICORE_CORE_TYPE_COUNT_V1 && ready_inboxes_empty; ++type) {
-                for (uint64_t inbox = 0; inbox < control->aiv_active_worker_count; ++inbox) {
+                for (uint64_t inbox = 0; inbox < control->resolver_count; ++inbox) {
                     uint64_t linear = static_cast<uint64_t>(type) * AICORE_WORKER_CAPACITY_V1 + inbox;
                     if (ready_inboxes[linear].head != AICORE_INBOX_EMPTY_V1) {
                         LOG_ERROR(
@@ -1727,7 +1800,6 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
                 }
             }
             bool dispatch_slots_free = true;
-            uint64_t expected_free_words[AICORE_CORE_TYPE_COUNT_V1][AICORE_FREE_SLOT_DIRECTORY_WORD_COUNT_V1]{};
             for (int32_t worker = 0; worker < runtime->worker_count && dispatch_slots_free; ++worker) {
                 if (contexts[worker].active == 0) continue;
                 if (contexts[worker].bootstrap_done == 0) {
@@ -1735,10 +1807,8 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
                     dispatch_slots_free = false;
                     break;
                 }
-                uint32_t type = contexts[worker].core_type == static_cast<int32_t>(CoreType::AIC) ? 0U : 1U;
                 for (uint32_t slot = 0; slot < AICORE_PENDING_SLOT_COUNT_V1; ++slot) {
                     uint64_t linear = static_cast<uint64_t>(worker) * AICORE_PENDING_SLOT_COUNT_V1 + slot;
-                    expected_free_words[type][linear / 64] |= UINT64_C(1) << (linear % 64);
                     const AicoreDispatchSlotV1 &dispatch = dispatch_slots[linear];
                     if (dispatch.task_id != AICORE_TASK_ID_INVALID_V1 ||
                         static_cast<AicoreDispatchPublicationV1>(dispatch.publication & UINT64_C(0xff)) !=
@@ -1755,20 +1825,18 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
             bool free_directory_exact = true;
             for (uint32_t type = 0; type < AICORE_CORE_TYPE_COUNT_V1; ++type) {
                 for (uint32_t word = 0; word < AICORE_FREE_SLOT_DIRECTORY_WORD_COUNT_V1; ++word) {
-                    free_directory_exact = free_directory_exact &&
-                                           free_slot_directory->words[type][word] == expected_free_words[type][word];
+                    free_directory_exact = free_directory_exact && free_slot_directory->words[type][word] == 0;
                 }
             }
             if (control->scheduler_error != 0 ||
                 control->expected_task_count != static_cast<uint64_t>(runtime->host_total_tasks) ||
-                worker_executed != executable_task_count || bootstrap_tasks != executable_task_count ||
-                worker_executed + control->inline_completed_count != control->expected_task_count ||
+                worker_executed != executable_subtask_count || bootstrap_tasks != executable_task_count ||
                 active_workers != control->active_worker_count ||
-                control->bootstrap_arrived_count != control->aiv_active_worker_count ||
+                control->bootstrap_arrived_count != control->resolver_count ||
                 control->bootstrap_complete == 0 || control->resolved_task_count != executable_task_count ||
                 wake_closes != executable_task_count || wake_registers != wake_migrations ||
-                completion_enqueues != executable_task_count || completion_resolves != executable_task_count ||
-                ready_enqueues != executable_task_count || ready_pops != executable_task_count ||
+                completion_enqueues != executable_subtask_count || completion_resolves != executable_task_count ||
+                ready_enqueues != ordinary_task_count || ready_pops != ordinary_task_count ||
                 !task_controls_valid || !completion_inboxes_empty || !ready_inboxes_empty || !ready_directory_empty ||
                 !dispatch_slots_free || !free_directory_exact) {
                 LOG_ERROR(

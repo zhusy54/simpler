@@ -33,6 +33,8 @@ inline constexpr uint64_t AICORE_WORKER_CAPACITY_V1 = 108;
 inline constexpr uint32_t AICORE_PENDING_SLOT_COUNT_V1 = 2;
 inline constexpr uint32_t AICORE_CALLABLE_CAPACITY_V1 = 1024;
 inline constexpr uint32_t AICORE_CORE_TYPE_COUNT_V1 = 2;
+inline constexpr uint32_t AICORE_CLUSTER_CAPACITY_V1 = AICORE_WORKER_CAPACITY_V1 / 3;
+inline constexpr uint32_t AICORE_GANG_COHORT_COUNT_V1 = 2;
 inline constexpr uint32_t AICORE_READY_DIRECTORY_WORD_COUNT_V1 = (AICORE_WORKER_CAPACITY_V1 + 63) / 64;
 inline constexpr uint32_t AICORE_FREE_SLOT_DIRECTORY_WORD_COUNT_V1 =
     (AICORE_WORKER_CAPACITY_V1 * AICORE_PENDING_SLOT_COUNT_V1 + 63) / 64;
@@ -46,6 +48,7 @@ enum class AicoreTaskStateV1 : int64_t {
     BLOCKED = 0,
     READY = 1,
     DONE = 2,
+    DISPATCHING = 3,
 };
 
 enum class AicoreReadySourceV1 : uint8_t {
@@ -58,17 +61,23 @@ enum class AicoreDispatchPublicationV1 : uint8_t {
     FREE = 1,
     FILLING = 2,
     READY = 3,
+    GATED = 4,
 };
 
 enum AicoreTaskMetadataFlagsV1 : uint8_t {
     AICORE_TASK_EXECUTABLE_V1 = 1U << 0,
     AICORE_TASK_HAS_FANIN_V1 = 1U << 1,
+    AICORE_TASK_MIX_V1 = 1U << 2,
+    AICORE_TASK_SPMD_V1 = 1U << 3,
+    AICORE_TASK_SYNC_START_V1 = 1U << 4,
 };
 
-struct alignas(8) AicoreTaskMetadataV1 {
-    uint16_t kernel_id;
-    uint8_t subtask_slot;
+struct alignas(16) AicoreTaskMetadataV1 {
+    uint16_t kernel_ids[3];
+    uint8_t active_mask;
     uint8_t flags;
+    uint16_t logical_block_num;
+    uint16_t total_required_subtasks;
     uint32_t reserved;
 };
 
@@ -78,6 +87,29 @@ inline __host__ __aicore__ bool aicore_task_is_executable_v1(uint8_t flags) {
 
 inline __host__ __aicore__ bool aicore_task_has_fanin_v1(uint8_t flags) {
     return (flags & AICORE_TASK_HAS_FANIN_V1) != 0;
+}
+
+inline __host__ __aicore__ bool aicore_task_is_mix_v1(uint8_t flags) {
+    return (flags & AICORE_TASK_MIX_V1) != 0;
+}
+
+inline __host__ __aicore__ bool aicore_task_is_spmd_v1(uint8_t flags) {
+    return (flags & AICORE_TASK_SPMD_V1) != 0;
+}
+
+inline __host__ __aicore__ bool aicore_task_requires_sync_start_v1(uint8_t flags) {
+    return (flags & AICORE_TASK_SYNC_START_V1) != 0;
+}
+
+inline __host__ __aicore__ bool aicore_task_is_gang_v1(uint8_t flags) {
+    return (flags & (AICORE_TASK_MIX_V1 | AICORE_TASK_SPMD_V1)) != 0;
+}
+
+inline __host__ __aicore__ uint32_t aicore_task_priority_bit_v1(uint8_t flags) {
+    if (aicore_task_requires_sync_start_v1(flags)) return 1U;
+    if (aicore_task_is_mix_v1(flags)) return 2U;
+    if (aicore_task_is_spmd_v1(flags)) return 4U;
+    return 0;
 }
 
 struct alignas(128) AicoreTaskControlV1 {
@@ -102,12 +134,97 @@ struct alignas(128) AicoreTaskControlV1 {
 
 struct alignas(128) AicoreCompletionInboxV1 {
     volatile int64_t head;
-    uint8_t atomic_line_padding[120];
+    uint8_t legacy_line_padding[56];
+    volatile uint64_t completed_generations[AICORE_PENDING_SLOT_COUNT_V1];
+    uint8_t completion_line_padding[48];
 };
 
 struct alignas(128) AicoreReadyInboxV1 {
     volatile int64_t head;
     uint8_t atomic_line_padding[120];
+};
+
+enum class AicoreGangCohortStateV1 : uint64_t {
+    FREE = 0,
+    DRAINING = 1,
+    STAGING = 2,
+    RELEASING = 3,
+    DISPATCHING = 4,
+    EXECUTING = 5,
+    RETIRING = 6,
+};
+
+struct alignas(128) AicoreGangCoordinatorV1 {
+    volatile uint64_t ready_priority_bits;
+    uint8_t priority_line_padding[56];
+
+    volatile uint64_t active_dispatch_cohort;
+    uint64_t next_generation;
+    uint64_t scan_cursor;
+    uint64_t gang_task_count;
+    uint64_t resolver_count;
+    uint64_t cohort_count;
+    uint64_t reserved0;
+    uint64_t owner_reserved;
+
+    uint64_t admitted_count;
+    uint64_t sync_drain_count;
+    uint64_t mix_dispatch_count;
+    uint64_t spmd_dispatch_count;
+    uint64_t capacity_reject_count;
+    uint64_t reserved[3];
+};
+
+struct alignas(128) AicoreGangCohortV1 {
+    volatile uint64_t state;
+    int64_t task_id;
+    uint64_t generation;
+    uint64_t priority_bit;
+    uint64_t active_mask;
+    uint64_t logical_block_num;
+    uint64_t participant_count;
+    uint64_t local_stride;
+    uint64_t admitted_cycles;
+    uint64_t drain_complete_cycles;
+    uint64_t stage_complete_cycles;
+    uint64_t dispatch_complete_cycles;
+    uint64_t completion_cycles;
+    uint64_t reserved[3];
+};
+
+// One Resolver owns one participant cell. The second line contains generation
+// tokens observed only by its parent in the binary Resolver tree.
+struct alignas(128) AicoreGangParticipantV1 {
+    volatile uint64_t config_generation;
+    int64_t task_id;
+    uint32_t active_mask;
+    uint32_t logical_block_num;
+    uint32_t local_expected_subtasks;
+    uint32_t local_published_subtasks;
+    uint32_t local_completed_subtasks;
+    uint32_t block_stride;
+    uint32_t next_block[2];
+    uint32_t participant_count;
+    uint32_t forwarded_state;
+    uint64_t forwarded_generation;
+
+    volatile uint64_t drain_local_token;
+    volatile uint64_t drain_subtree_token;
+    volatile uint64_t stage_local_token;
+    volatile uint64_t stage_subtree_token;
+    volatile uint64_t dispatch_local_token;
+    volatile uint64_t dispatch_subtree_token;
+    volatile uint64_t completion_local_token;
+    volatile uint64_t completion_subtree_token;
+};
+
+// Each Resolver polls its own command line. Resolver0 seeds the root and every
+// parent forwards transitions to two children, avoiding a globally contended
+// cohort line and bounding sync-start release skew by the tree depth.
+struct alignas(128) AicoreGangCommandV1 {
+    volatile uint64_t generation[AICORE_GANG_COHORT_COUNT_V1];
+    volatile uint64_t state[AICORE_GANG_COHORT_COUNT_V1];
+    uint8_t padding[96];
 };
 
 struct alignas(128) AicoreReadyDirectoryV1 {
@@ -148,10 +265,13 @@ struct alignas(128) AicoreDispatchSlotV1 {
     uint8_t has_fanin;
     uint8_t ready_source;
     uint8_t pending_slot;
-    uint16_t reserved0;
+    uint16_t block_num;
     uint32_t generation;
-    uint32_t reserved1;
-    uint8_t metadata_padding[8];
+    uint32_t block_idx;
+    uint32_t cohort_generation;
+    uint8_t cohort_index;
+    uint8_t gang;
+    uint8_t metadata_padding[2];
 
     volatile uint64_t publication;
     uint8_t publication_padding[56];
@@ -170,7 +290,9 @@ struct alignas(128) AicoreRunControlV1 {
     uint64_t ready_inboxes_offset;
     uint64_t ready_directory_offset;
     uint64_t free_slot_directory_offset;
-    uint64_t config_reserved[3];
+    uint64_t gang_coordinator_offset;
+    uint64_t gang_cohorts_offset;
+    uint64_t resolver_count;
 
     volatile uint64_t executed_task_count;
     volatile uint64_t resolved_task_count;
@@ -243,6 +365,19 @@ struct alignas(128) AicoreWorkerContextV1 {
     uint64_t bootstrap_target_aiv_cycles;
     uint64_t bootstrap_ready_claim_aic_cycles;
     uint64_t bootstrap_ready_claim_aiv_cycles;
+
+    volatile uint64_t gang_coordinator_offset;
+    volatile uint64_t gang_cohorts_offset;
+    volatile uint64_t gang_participants_offset;
+    volatile uint64_t gang_commands_offset;
+    volatile uint64_t resolver_count;
+    volatile uint64_t cluster_count;
+    volatile uint64_t cluster_index;
+    volatile uint64_t resolver_index;
+    volatile uint64_t resolver_worker_id;
+    volatile uint64_t is_resolver;
+    volatile uint64_t cluster_worker_ids[3];
+    uint64_t topology_reserved[3];
 
     uint64_t bootstrap_task_count;
     uint64_t ready_enqueue_count;
@@ -352,14 +487,34 @@ struct AicoreExecutionSidecarLayoutV1 {
     uint64_t ready_directory_offset;
     uint64_t free_slot_directory_offset;
     uint64_t trace_cells_offset;
+    uint64_t gang_coordinator_offset;
+    uint64_t gang_cohorts_offset;
+    uint64_t gang_participants_offset;
+    uint64_t gang_commands_offset;
+    uint64_t executable_task_count;
+    uint64_t executable_subtask_count;
+    uint64_t gang_task_count;
+    uint64_t aic_worker_demand;
+    uint64_t aiv_worker_demand;
 };
 
-static_assert(sizeof(AicoreTaskMetadataV1) == 8, "task metadata layout changed");
+static_assert(sizeof(AicoreTaskMetadataV1) == 16, "task metadata layout changed");
 static_assert(sizeof(AicoreTaskControlV1) == 128, "task control layout changed");
 static_assert(offsetof(AicoreTaskControlV1, next_waiter) == 64, "waiter metadata needs its own line");
 static_assert(offsetof(AicoreTaskControlV1, inbox_next) == 80, "inbox link offset changed");
 static_assert(sizeof(AicoreCompletionInboxV1) == 128, "completion inbox layout changed");
+static_assert(
+    offsetof(AicoreCompletionInboxV1, completed_generations) == 64, "SPSC completion line must be cache aligned"
+);
 static_assert(sizeof(AicoreReadyInboxV1) == 128, "ready inbox layout changed");
+static_assert(sizeof(AicoreGangCoordinatorV1) == 256, "gang coordinator layout changed");
+static_assert(
+    offsetof(AicoreGangCoordinatorV1, active_dispatch_cohort) == 64,
+    "owner-only gang state must not share the priority line"
+);
+static_assert(sizeof(AicoreGangCohortV1) == 128, "gang cohort layout changed");
+static_assert(sizeof(AicoreGangParticipantV1) == 128, "gang participant layout changed");
+static_assert(sizeof(AicoreGangCommandV1) == 128, "gang command layout changed");
 static_assert(offsetof(AicoreReadyDirectoryV1, bootstrap_ready_types) == 64, "bootstrap flags must be cache aligned");
 static_assert(sizeof(AicoreReadyDirectoryV1) == 1024, "ready directory layout changed");
 static_assert(sizeof(AicoreFreeSlotDirectoryV1) == 128, "free-slot directory layout changed");
@@ -370,11 +525,12 @@ static_assert(sizeof(AicoreRunControlV1) == 384, "run control layout changed");
 static_assert(offsetof(AicoreRunControlV1, executed_task_count) == 128, "lifecycle atomics need their own line");
 static_assert(offsetof(AicoreRunControlV1, error_claimed) == 256, "error state needs its own line");
 static_assert(sizeof(AicpuCoreLifecycleTraceV1) == 128, "AICPU lifecycle trace layout changed");
-static_assert(sizeof(AicoreWorkerContextV1) == 640, "worker context layout changed");
+static_assert(sizeof(AicoreWorkerContextV1) == 768, "worker context layout changed");
 static_assert(offsetof(AicoreWorkerContextV1, task_metadata_offset) == 128, "runtime offsets changed");
-static_assert(offsetof(AicoreWorkerContextV1, bootstrap_task_count) == 256, "worker stats offset changed");
-static_assert(offsetof(AicoreWorkerContextV1, wake_cas_retry_count) == 384, "wake stats offset changed");
-static_assert(offsetof(AicoreWorkerContextV1, completion_enqueue_cycles) == 512, "termination stats offset changed");
+static_assert(offsetof(AicoreWorkerContextV1, gang_coordinator_offset) == 256, "topology offsets changed");
+static_assert(offsetof(AicoreWorkerContextV1, bootstrap_task_count) == 384, "worker stats offset changed");
+static_assert(offsetof(AicoreWorkerContextV1, wake_cas_retry_count) == 512, "wake stats offset changed");
+static_assert(offsetof(AicoreWorkerContextV1, completion_enqueue_cycles) == 640, "termination stats offset changed");
 static_assert(sizeof(AicoreTaskTraceCellV1) == 256, "task trace layout changed");
 
 #if !defined(__CCE_AICORE__)
@@ -385,6 +541,14 @@ static_assert(
     std::is_standard_layout_v<AicoreCompletionInboxV1> && std::is_trivially_copyable_v<AicoreCompletionInboxV1>
 );
 static_assert(std::is_standard_layout_v<AicoreReadyInboxV1> && std::is_trivially_copyable_v<AicoreReadyInboxV1>);
+static_assert(
+    std::is_standard_layout_v<AicoreGangCoordinatorV1> && std::is_trivially_copyable_v<AicoreGangCoordinatorV1>
+);
+static_assert(std::is_standard_layout_v<AicoreGangCohortV1> && std::is_trivially_copyable_v<AicoreGangCohortV1>);
+static_assert(
+    std::is_standard_layout_v<AicoreGangParticipantV1> && std::is_trivially_copyable_v<AicoreGangParticipantV1>
+);
+static_assert(std::is_standard_layout_v<AicoreGangCommandV1> && std::is_trivially_copyable_v<AicoreGangCommandV1>);
 static_assert(
     std::is_standard_layout_v<AicoreReadyDirectoryV1> && std::is_trivially_copyable_v<AicoreReadyDirectoryV1>
 );
@@ -433,8 +597,7 @@ inline bool aicore_sidecar_reserve_v1(uint64_t *cursor, uint64_t size, uint64_t 
 inline bool aicore_sidecar_plan_v1(
     uint64_t task_count, uint64_t aic_task_count, uint64_t aiv_task_count, AicoreExecutionSidecarLayoutV1 *layout
 ) {
-    if (layout == nullptr || aic_task_count > task_count || aiv_task_count > task_count ||
-        aic_task_count > task_count - aiv_task_count)
+    if (layout == nullptr || aic_task_count > task_count || aiv_task_count > task_count)
         return false;
     AicoreExecutionSidecarLayoutV1 next{};
     next.task_count = task_count;
@@ -471,6 +634,16 @@ inline bool aicore_sidecar_plan_v1(
             &cursor, sizeof(AicoreFreeSlotDirectoryV1), alignof(AicoreFreeSlotDirectoryV1),
             &next.free_slot_directory_offset
         ) ||
+        !aicore_sidecar_reserve_v1(
+            &cursor, sizeof(AicoreGangCoordinatorV1), alignof(AicoreGangCoordinatorV1),
+            &next.gang_coordinator_offset
+        ) ||
+        !AICORE_RESERVE_ARRAY(AICORE_GANG_COHORT_COUNT_V1, AicoreGangCohortV1, gang_cohorts_offset) ||
+        !AICORE_RESERVE_ARRAY(
+            AICORE_GANG_COHORT_COUNT_V1 * AICORE_CLUSTER_CAPACITY_V1, AicoreGangParticipantV1,
+            gang_participants_offset
+        ) ||
+        !AICORE_RESERVE_ARRAY(AICORE_CLUSTER_CAPACITY_V1, AicoreGangCommandV1, gang_commands_offset) ||
         !AICORE_RESERVE_ARRAY(task_count, AicoreTaskTraceCellV1, trace_cells_offset) ||
         !aicore_sidecar_checked_align_v1(cursor, AICORE_SIDECAR_ALIGNMENT_V1, &next.total_size)) {
 #undef AICORE_RESERVE_ARRAY
@@ -512,7 +685,25 @@ inline bool aicore_sidecar_init_v1(void *base, const AicoreExecutionSidecarLayou
     for (uint64_t i = 0; i < AICORE_CORE_TYPE_COUNT_V1 * AICORE_WORKER_CAPACITY_V1; ++i)
         ready[i].head = AICORE_INBOX_EMPTY_V1;
     auto *contexts = aicore_sidecar_at_v1<AicoreWorkerContextV1>(base, layout.worker_contexts_offset);
-    for (uint64_t worker = 0; worker < AICORE_WORKER_CAPACITY_V1; ++worker)
+    for (uint64_t worker = 0; worker < AICORE_WORKER_CAPACITY_V1; ++worker) {
         contexts[worker].physical_core_id = -1;
+        contexts[worker].cluster_index = UINT64_MAX;
+        contexts[worker].resolver_index = UINT64_MAX;
+        contexts[worker].resolver_worker_id = UINT64_MAX;
+        contexts[worker].cluster_worker_ids[0] = UINT64_MAX;
+        contexts[worker].cluster_worker_ids[1] = UINT64_MAX;
+        contexts[worker].cluster_worker_ids[2] = UINT64_MAX;
+    }
+    auto *coordinator = aicore_sidecar_at_v1<AicoreGangCoordinatorV1>(base, layout.gang_coordinator_offset);
+    coordinator->active_dispatch_cohort = UINT64_MAX;
+    coordinator->cohort_count = AICORE_GANG_COHORT_COUNT_V1;
+    auto *cohorts = aicore_sidecar_at_v1<AicoreGangCohortV1>(base, layout.gang_cohorts_offset);
+    for (uint32_t i = 0; i < AICORE_GANG_COHORT_COUNT_V1; ++i) {
+        cohorts[i].state = static_cast<uint64_t>(AicoreGangCohortStateV1::FREE);
+        cohorts[i].task_id = AICORE_TASK_ID_INVALID_V1;
+    }
+    auto *participants = aicore_sidecar_at_v1<AicoreGangParticipantV1>(base, layout.gang_participants_offset);
+    for (uint32_t i = 0; i < AICORE_GANG_COHORT_COUNT_V1 * AICORE_CLUSTER_CAPACITY_V1; ++i)
+        participants[i].task_id = AICORE_TASK_ID_INVALID_V1;
     return true;
 }

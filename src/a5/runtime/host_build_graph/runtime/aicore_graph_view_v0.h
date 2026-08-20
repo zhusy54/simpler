@@ -74,10 +74,18 @@ struct AicoreRootInfoV0 {
 
 using AicoreTaskInfoV0 = AicoreRootInfoV0;
 
+struct AicoreTaskShapeV1 {
+    int64_t task_id;
+    int32_t kernel_ids[3];
+    uint8_t active_mask;
+    uint8_t reserved[3];
+};
+
 static_assert(sizeof(AicoreReadonlyGraphV0) == 32, "read-only graph view layout changed");
 static_assert(offsetof(AicoreReadonlyGraphV0, descriptors_address) == 0, "descriptor address offset changed");
 static_assert(offsetof(AicoreReadonlyGraphV0, payloads_address) == 8, "payload address offset changed");
 static_assert(sizeof(AicoreRootInfoV0) == 24, "root classification result layout changed");
+static_assert(sizeof(AicoreTaskShapeV1) == 24, "task shape result layout changed");
 
 inline __host__ __aicore__ __gm__ uint8_t *
 aicore_graph_descriptor_v0(const AicoreReadonlyGraphV0 &graph, int64_t task_id) {
@@ -100,9 +108,13 @@ aicore_graph_fanin_id_v0(const AicoreReadonlyGraphV0 &graph, int64_t task_id, in
 }
 
 inline __host__ __aicore__ AicoreRootStatusV0
-aicore_classify_task_v0(const AicoreReadonlyGraphV0 &graph, int64_t task_id, AicoreTaskInfoV0 *task) {
-    if (task == nullptr) return AicoreRootStatusV0::UNSUPPORTED_SHAPE;
-    *task = {-1, AICORE_GRAPH_INVALID_KERNEL_ID_V0, -1, AicoreRootCoreTypeV0::NONE};
+aicore_classify_task_shape_v1(const AicoreReadonlyGraphV0 &graph, int64_t task_id, AicoreTaskShapeV1 *shape) {
+    if (shape == nullptr) return AicoreRootStatusV0::UNSUPPORTED_SHAPE;
+    *shape = {-1,
+              {AICORE_GRAPH_INVALID_KERNEL_ID_V0, AICORE_GRAPH_INVALID_KERNEL_ID_V0,
+               AICORE_GRAPH_INVALID_KERNEL_ID_V0},
+              0,
+              {0, 0, 0}};
     if (graph.task_count == 0) return AicoreRootStatusV0::EMPTY;
     if (graph.descriptors_address == 0 || graph.payloads_address == 0 || task_id < 0 ||
         static_cast<uint64_t>(task_id) >= graph.task_count) {
@@ -129,16 +141,32 @@ aicore_classify_task_v0(const AicoreReadonlyGraphV0 &graph, int64_t task_id, Aic
     }
 
     __gm__ int32_t *kernel_ids = reinterpret_cast<__gm__ int32_t *>(descriptor + AICORE_GRAPH_KERNEL_IDS_OFFSET_V0);
-    int32_t active_slot = -1;
     for (int32_t slot = 0; slot < 3; ++slot) {
         if (kernel_ids[slot] == AICORE_GRAPH_INVALID_KERNEL_ID_V0) continue;
-        if (active_slot != -1 || kernel_ids[slot] < 0) return AicoreRootStatusV0::UNSUPPORTED_SHAPE;
-        active_slot = slot;
-        task->kernel_id = kernel_ids[slot];
+        if (kernel_ids[slot] < 0) return AicoreRootStatusV0::UNSUPPORTED_SHAPE;
+        shape->kernel_ids[slot] = kernel_ids[slot];
+        shape->active_mask |= static_cast<uint8_t>(1U << slot);
     }
-    if (active_slot == -1) return AicoreRootStatusV0::UNSUPPORTED_SHAPE;
+    if (shape->active_mask == 0) return AicoreRootStatusV0::UNSUPPORTED_SHAPE;
+
+    shape->task_id = task_id;
+    return AicoreRootStatusV0::OK;
+}
+
+inline __host__ __aicore__ AicoreRootStatusV0
+aicore_classify_task_v0(const AicoreReadonlyGraphV0 &graph, int64_t task_id, AicoreTaskInfoV0 *task) {
+    if (task == nullptr) return AicoreRootStatusV0::UNSUPPORTED_SHAPE;
+    *task = {-1, AICORE_GRAPH_INVALID_KERNEL_ID_V0, -1, AicoreRootCoreTypeV0::NONE};
+    AicoreTaskShapeV1 shape{};
+    AicoreRootStatusV0 status = aicore_classify_task_shape_v1(graph, task_id, &shape);
+    if (status != AicoreRootStatusV0::OK) return status;
+    if ((shape.active_mask & static_cast<uint8_t>(shape.active_mask - 1)) != 0) {
+        return AicoreRootStatusV0::UNSUPPORTED_SHAPE;
+    }
+    int32_t active_slot = (shape.active_mask & 1U) != 0 ? 0 : ((shape.active_mask & 2U) != 0 ? 1 : 2);
 
     task->task_id = task_id;
+    task->kernel_id = shape.kernel_ids[active_slot];
     task->subtask_slot = active_slot;
     task->core_type = active_slot == 0 ? AicoreRootCoreTypeV0::AIC : AicoreRootCoreTypeV0::AIV;
     return AicoreRootStatusV0::OK;
@@ -161,9 +189,10 @@ aicore_classify_single_root_v0(const AicoreReadonlyGraphV0 &graph, AicoreRootInf
 
 inline __host__ __aicore__ AicoreRootStatusV0 aicore_materialize_task_payload_resolved_v0(
     const AicoreReadonlyGraphV0 &graph, const AicoreTaskInfoV0 &task, uint64_t function_bin_address,
-    __gm__ PTO2DispatchPayload *dispatch_payload
+    __gm__ PTO2DispatchPayload *dispatch_payload, int32_t block_idx = 0, int32_t block_num = 1
 ) {
-    if (dispatch_payload == nullptr || function_bin_address == 0 || task.task_id < 0) {
+    if (dispatch_payload == nullptr || function_bin_address == 0 || task.task_id < 0 || block_idx < 0 ||
+        block_num <= 0 || block_idx >= block_num) {
         return AicoreRootStatusV0::INVALID_CALLABLE;
     }
     __gm__ uint8_t *payload = aicore_graph_payload_v0(graph, task.task_id);
@@ -187,8 +216,8 @@ inline __host__ __aicore__ AicoreRootStatusV0 aicore_materialize_task_payload_re
         dispatch_payload->args[n++] = scalars[i];
 
     dispatch_payload->src_payload = 0;
-    dispatch_payload->local_context.block_idx = 0;
-    dispatch_payload->local_context.block_num = 1;
+    dispatch_payload->local_context.block_idx = block_idx;
+    dispatch_payload->local_context.block_num = block_num;
     dispatch_payload->local_context.async_ctx.task_token.raw = static_cast<uint64_t>(task.task_id);
     dispatch_payload->args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dispatch_payload->local_context);
     dispatch_payload->args[PAYLOAD_GLOBAL_CONTEXT_INDEX] =

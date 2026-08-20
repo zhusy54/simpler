@@ -11,6 +11,8 @@
 
 #include "aicore_lifecycle.h"
 
+#include "aicore_cluster_topology_v1.h"
+
 #include <algorithm>
 #include <cinttypes>
 #include <cstring>
@@ -143,37 +145,117 @@ int32_t AicoreLifecycle::post_handshake_init(Runtime *runtime) {
     }
     LOG_INFO("Core discovery complete: %d AIC, %d AIV", aic_count, aiv_count);
 
-    const int32_t active_aic = static_cast<int32_t>(
-        std::min<uint64_t>(static_cast<uint64_t>(aic_count), runtime->aicore_sidecar_layout.aic_task_count)
+    if (aic_count <= 0 || aic_count > static_cast<int32_t>(AICORE_CLUSTER_CAPACITY_V1) ||
+        aiv_count != aic_count * PLATFORM_AIV_CORES_PER_BLOCKDIM) {
+        LOG_ERROR("A5 HBG AICore scheduler: incomplete cluster topology AIC=%d AIV=%d", aic_count, aiv_count);
+        return -1;
+    }
+    int32_t cluster_workers[AICORE_CLUSTER_CAPACITY_V1][PLATFORM_CORES_PER_BLOCKDIM];
+    for (auto &cluster : cluster_workers)
+        for (int32_t &worker : cluster)
+            worker = -1;
+    for (int32_t worker = 0; worker < core_count_; ++worker) {
+        const int32_t physical_core_id = static_cast<int32_t>(cores_[worker].physical_core_id);
+        AicoreClusterCoordinateV1 coordinate{-1, -1};
+        const bool mapped = aicore_cluster_coordinate_from_worker_v1(
+            worker, cores_[worker].core_type == CoreType::AIC, aic_count,
+            PLATFORM_AIV_CORES_PER_BLOCKDIM, &coordinate
+        );
+        const int32_t cluster = coordinate.cluster_index;
+        const int32_t lane = coordinate.cluster_lane;
+        if (!mapped || lane >= PLATFORM_CORES_PER_BLOCKDIM ||
+            cluster_workers[cluster][lane] != -1) {
+            LOG_ERROR(
+                "A5 HBG AICore scheduler: invalid discovered topology worker=%d physical=%d cluster=%d lane=%d",
+                worker, physical_core_id, cluster, lane
+            );
+            return -1;
+        }
+        cluster_workers[cluster][lane] = worker;
+    }
+    for (int32_t cluster = 0; cluster < aic_count; ++cluster) {
+        for (int32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
+            if (cluster_workers[cluster][lane] < 0) {
+                LOG_ERROR("A5 HBG AICore scheduler: cluster %d is missing lane %d", cluster, lane);
+                return -1;
+            }
+        }
+    }
+
+    const uint64_t executable_task_count = runtime->aicore_sidecar_layout.executable_task_count;
+    const bool has_gang_tasks = runtime->aicore_sidecar_layout.gang_task_count != 0;
+    const int32_t requested_aic = static_cast<int32_t>(std::min<uint64_t>(
+        aic_count,
+        std::max(runtime->aicore_sidecar_layout.aic_worker_demand, runtime->aicore_sidecar_layout.aic_task_count)
+    ));
+    const int32_t requested_aiv = static_cast<int32_t>(std::min<uint64_t>(
+        aiv_count,
+        std::max(runtime->aicore_sidecar_layout.aiv_worker_demand, runtime->aicore_sidecar_layout.aiv_task_count)
+    ));
+    uint64_t required_clusters = std::max<uint64_t>(
+        requested_aic,
+        (static_cast<uint64_t>(requested_aiv) + PLATFORM_AIV_CORES_PER_BLOCKDIM - 1) /
+            PLATFORM_AIV_CORES_PER_BLOCKDIM
     );
-    const int32_t active_aiv_executors = static_cast<int32_t>(
-        std::min<uint64_t>(static_cast<uint64_t>(aiv_count), runtime->aicore_sidecar_layout.aiv_task_count)
-    );
-    const uint64_t executable_task_count =
-        runtime->aicore_sidecar_layout.aic_task_count + runtime->aicore_sidecar_layout.aiv_task_count;
-    const int32_t active_aiv = aiv_count == 0 ? 0 : std::max(active_aiv_executors, executable_task_count != 0 ? 1 : 0);
-    if ((runtime->aicore_sidecar_layout.aic_task_count != 0 && active_aic == 0) ||
-        (runtime->aicore_sidecar_layout.aiv_task_count != 0 && active_aiv_executors == 0) ||
-        (executable_task_count != 0 && active_aiv == 0)) {
+    if (executable_task_count != 0) required_clusters = std::max<uint64_t>(required_clusters, 1);
+    if (has_gang_tasks) required_clusters = static_cast<uint64_t>(aic_count);
+    const int32_t active_clusters = static_cast<int32_t>(std::min<uint64_t>(required_clusters, aic_count));
+    if ((runtime->aicore_sidecar_layout.aic_worker_demand > static_cast<uint64_t>(aic_count) &&
+         runtime->aicore_sidecar_layout.gang_task_count == 0) ||
+        (runtime->aicore_sidecar_layout.aiv_worker_demand > static_cast<uint64_t>(aiv_count) &&
+         runtime->aicore_sidecar_layout.gang_task_count == 0) ||
+        (executable_task_count != 0 && active_clusters == 0)) {
         LOG_ERROR(
-            "A5 HBG AICore scheduler: topology cannot execute graph (tasks AIC=%" PRIu64 " AIV=%" PRIu64
-            ", cores AIC=%d AIV=%d)",
-            runtime->aicore_sidecar_layout.aic_task_count, runtime->aicore_sidecar_layout.aiv_task_count, aic_count,
-            aiv_count
+            "A5 HBG AICore scheduler: topology cannot execute graph (demand AIC=%" PRIu64 " AIV=%" PRIu64
+            ", cores AIC=%d AIV=%d)", runtime->aicore_sidecar_layout.aic_worker_demand,
+            runtime->aicore_sidecar_layout.aiv_worker_demand, aic_count, aiv_count
         );
         return -1;
     }
 
-    for (int32_t i = 0; i < core_count_; ++i) {
-        const bool is_aiv = cores_[i].core_type == CoreType::AIV;
-        const int32_t active_count = is_aiv ? active_aiv : active_aic;
-        contexts[i].active = contexts[i].type_rank < active_count ? 1 : 0;
-        contexts[i].inbox_index =
-            is_aiv && contexts[i].active != 0 ? static_cast<uint64_t>(contexts[i].type_rank) : UINT64_MAX;
+    for (int32_t cluster = 0; cluster < aic_count; ++cluster) {
+        const int32_t aiv0_worker = cluster_workers[cluster][1];
+        const int32_t aiv1_worker = cluster_workers[cluster][2];
+        // Do not bind Resolver ownership to a runtime worker rank. Pick the
+        // lower physical AIV in each discovered hardware Cluster.
+        const uint64_t resolver_worker = static_cast<uint64_t>(
+            cores_[aiv0_worker].physical_core_id <= cores_[aiv1_worker].physical_core_id ? aiv0_worker : aiv1_worker
+        );
+        for (int32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
+            const int32_t worker = cluster_workers[cluster][lane];
+            const bool active_lane = cluster < active_clusters &&
+                                     (has_gang_tasks || lane == 1 || (lane == 0 && cluster < requested_aic) ||
+                                      (lane == 2 && cluster * PLATFORM_AIV_CORES_PER_BLOCKDIM + 1 < requested_aiv));
+            contexts[worker].active = active_lane ? 1 : 0;
+            contexts[worker].cluster_count = static_cast<uint64_t>(active_clusters);
+            contexts[worker].cluster_index = static_cast<uint64_t>(cluster);
+            contexts[worker].resolver_index =
+                cluster < active_clusters ? static_cast<uint64_t>(cluster) : UINT64_MAX;
+            contexts[worker].resolver_worker_id = resolver_worker;
+            contexts[worker].is_resolver =
+                static_cast<uint64_t>(worker) == resolver_worker && cluster < active_clusters ? 1 : 0;
+            contexts[worker].inbox_index = contexts[worker].is_resolver != 0 ? static_cast<uint64_t>(cluster) : UINT64_MAX;
+            contexts[worker].resolver_count = static_cast<uint64_t>(active_clusters);
+            for (int32_t member = 0; member < PLATFORM_CORES_PER_BLOCKDIM; ++member)
+                contexts[worker].cluster_worker_ids[member] = static_cast<uint64_t>(cluster_workers[cluster][member]);
+        }
     }
-    run_control->active_worker_count = static_cast<uint64_t>(active_aic) + static_cast<uint64_t>(active_aiv);
+    int32_t active_aic = 0;
+    int32_t active_aiv = 0;
+    for (int32_t worker = 0; worker < core_count_; ++worker) {
+        if (contexts[worker].active == 0) continue;
+        if (cores_[worker].core_type == CoreType::AIC) ++active_aic;
+        else ++active_aiv;
+    }
+    run_control->active_worker_count = static_cast<uint64_t>(active_aic + active_aiv);
     run_control->aic_active_worker_count = static_cast<uint64_t>(active_aic);
     run_control->aiv_active_worker_count = static_cast<uint64_t>(active_aiv);
+    run_control->resolver_count = static_cast<uint64_t>(active_clusters);
+    auto *coordinator = aicore_sidecar_at_v1<AicoreGangCoordinatorV1>(
+        runtime->aicore_sidecar_base, runtime->aicore_sidecar_layout.gang_coordinator_offset
+    );
+    coordinator->resolver_count = static_cast<uint64_t>(active_clusters);
+    cache_flush_range(coordinator, sizeof(*coordinator));
     if (executable_task_count == 0) run_control->bootstrap_complete = 1;
 
     if (is_pmu_enabled()) pmu_aicpu_init(physical_core_ids_, core_count_);

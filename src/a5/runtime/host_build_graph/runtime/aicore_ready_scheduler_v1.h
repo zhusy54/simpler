@@ -102,6 +102,12 @@ inline __host__ __aicore__ uint32_t aicore_metadata_core_type_index_v1(uint8_t s
     return subtask_slot == 0 ? 0U : 1U;
 }
 
+inline __host__ __aicore__ uint8_t aicore_metadata_single_subtask_slot_v1(uint8_t active_mask) {
+    if ((active_mask & 1U) != 0) return 0;
+    if ((active_mask & 2U) != 0) return 1;
+    return 2;
+}
+
 inline __host__ __aicore__ uint64_t
 aicore_completion_id_v1(__gm__ const AicoreWorkerContextV1 *context, uint64_t local_completion_index) {
     return local_completion_index * context->runtime_worker_count + context->worker_index;
@@ -153,6 +159,20 @@ aicore_ready_directory_at_v1(__gm__ void *sidecar_base, __gm__ const AicoreWorke
 inline __host__ __aicore__ __gm__ AicoreFreeSlotDirectoryV1 *
 aicore_free_slot_directory_at_v1(__gm__ void *sidecar_base, __gm__ const AicoreWorkerContextV1 *context) {
     return aicore_sidecar_at_v1<AicoreFreeSlotDirectoryV1>(sidecar_base, context->free_slot_directory_offset);
+}
+
+inline __host__ __aicore__ __gm__ AicoreGangCoordinatorV1 *
+aicore_gang_coordinator_at_v1(__gm__ void *sidecar_base, __gm__ const AicoreWorkerContextV1 *context) {
+    return aicore_sidecar_at_v1<AicoreGangCoordinatorV1>(sidecar_base, context->gang_coordinator_offset);
+}
+
+inline __aicore__ void aicore_publish_gang_ready_v1(
+    __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *context, __gm__ AicoreTaskControlV1 *control,
+    uint8_t metadata_flags
+) {
+    aicore_gm_store_v0(control->state, static_cast<int64_t>(AicoreTaskStateV1::READY));
+    __gm__ AicoreGangCoordinatorV1 *coordinator = aicore_gang_coordinator_at_v1(sidecar_base, context);
+    aicore_gm_fetch_or_v0(coordinator->ready_priority_bits, aicore_task_priority_bit_v1(metadata_flags));
 }
 
 inline __host__ __aicore__ __gm__ AicoreTaskClaimBindingV1 *
@@ -746,13 +766,19 @@ inline __aicore__ bool aicore_fill_dispatch_slot_v1(
         aicore_task_metadata_at_v1(sidecar_base, resolver, ready_claim.task_id);
     aicore_observe_cache_line_v0(metadata_source);
     AicoreTaskMetadataV1 metadata{};
-    metadata.kernel_id = metadata_source->kernel_id;
-    metadata.subtask_slot = metadata_source->subtask_slot;
+    metadata.kernel_ids[0] = metadata_source->kernel_ids[0];
+    metadata.kernel_ids[1] = metadata_source->kernel_ids[1];
+    metadata.kernel_ids[2] = metadata_source->kernel_ids[2];
+    metadata.active_mask = metadata_source->active_mask;
     metadata.flags = metadata_source->flags;
+    metadata.logical_block_num = metadata_source->logical_block_num;
+    metadata.total_required_subtasks = metadata_source->total_required_subtasks;
+    const uint8_t subtask_slot = aicore_metadata_single_subtask_slot_v1(metadata.active_mask);
+    const uint16_t kernel_id = metadata.kernel_ids[subtask_slot];
     __gm__ AicoreWorkerContextV1 *target = aicore_worker_context_at_v1(sidecar_base, resolver, slot_claim.worker_id);
     aicore_observe_cache_line_v0(target);
-    if (!aicore_task_is_executable_v1(metadata.flags) ||
-        aicore_metadata_core_type_index_v1(metadata.subtask_slot) != aicore_core_type_index_v1(target->core_type)) {
+    if (!aicore_task_is_executable_v1(metadata.flags) || aicore_task_is_gang_v1(metadata.flags) ||
+        aicore_metadata_core_type_index_v1(subtask_slot) != aicore_core_type_index_v1(target->core_type)) {
         aicore_record_scheduler_error_v1(
             run_control, ready_claim.task_id, AicoreRootStatusV0::UNSUPPORTED_SHAPE, &graph, resolver, UINT64_C(44)
         );
@@ -764,8 +790,8 @@ inline __aicore__ bool aicore_fill_dispatch_slot_v1(
     if (generation == 0) generation = 1;
     __gm__ uint64_t *callable_addresses =
         aicore_sidecar_at_v1<uint64_t>(sidecar_base, resolver->callable_addresses_offset);
-    aicore_observe_cache_line_v0(&callable_addresses[metadata.kernel_id]);
-    uint64_t callable_address = callable_addresses[metadata.kernel_id];
+    aicore_observe_cache_line_v0(&callable_addresses[kernel_id]);
+    uint64_t callable_address = callable_addresses[kernel_id];
     if (callable_address == 0) {
         aicore_record_scheduler_error_v1(
             run_control, ready_claim.task_id, AicoreRootStatusV0::INVALID_CALLABLE, &graph, resolver, UINT64_C(45)
@@ -778,12 +804,17 @@ inline __aicore__ bool aicore_fill_dispatch_slot_v1(
     slot->claim_start_cycles = ready_claim.claim_start_cycles;
     slot->claim_end_cycles = ready_claim.claim_end_cycles;
     slot->claim_worker_id = resolver->worker_index;
-    slot->kernel_id = metadata.kernel_id;
-    slot->subtask_slot = metadata.subtask_slot;
+    slot->kernel_id = kernel_id;
+    slot->subtask_slot = subtask_slot;
     slot->has_fanin = aicore_task_has_fanin_v1(metadata.flags) ? 1 : 0;
     slot->ready_source = static_cast<uint8_t>(ready_claim.source);
     slot->pending_slot = static_cast<uint8_t>(slot_claim.slot_index);
     slot->generation = generation;
+    slot->block_idx = 0;
+    slot->block_num = 1;
+    slot->cohort_generation = 0;
+    slot->cohort_index = UINT8_MAX;
+    slot->gang = 0;
     aicore_writeback_cache_line_v0(slot);
 
     AicoreTaskClaimBindingV1 binding{};
@@ -792,8 +823,8 @@ inline __aicore__ bool aicore_fill_dispatch_slot_v1(
     binding.dispatch_payload_offset =
         target->dispatch_payload_offset + static_cast<uint64_t>(slot_claim.slot_index) * sizeof(PTO2DispatchPayload);
     binding.owner_worker_id = slot_claim.worker_id;
-    binding.kernel_id = metadata.kernel_id;
-    binding.subtask_slot = metadata.subtask_slot;
+    binding.kernel_id = kernel_id;
+    binding.subtask_slot = subtask_slot;
     binding.pending_slot = static_cast<uint8_t>(slot_claim.slot_index);
     binding.dispatch_generation = generation;
     binding.ready_claim_start_cycles = ready_claim.claim_start_cycles;
@@ -816,9 +847,9 @@ inline __aicore__ bool aicore_fill_dispatch_slot_v1(
 
     AicoreTaskInfoV0 task{
         ready_claim.task_id,
-        static_cast<int32_t>(metadata.kernel_id),
-        static_cast<int32_t>(metadata.subtask_slot),
-        metadata.subtask_slot == 0 ? AicoreRootCoreTypeV0::AIC : AicoreRootCoreTypeV0::AIV,
+        static_cast<int32_t>(kernel_id),
+        static_cast<int32_t>(subtask_slot),
+        subtask_slot == 0 ? AicoreRootCoreTypeV0::AIC : AicoreRootCoreTypeV0::AIV,
     };
     __gm__ PTO2DispatchPayload *payload =
         aicore_sidecar_at_v1<PTO2DispatchPayload>(sidecar_base, binding.dispatch_payload_offset);
@@ -909,10 +940,17 @@ inline __aicore__ bool aicore_enqueue_completion_v1(
 inline __aicore__ bool aicore_resolve_completion_v1(
     const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *context,
     __gm__ AicoreRunControlV1 *run_control, int64_t task_id, AicoreWakeStatsV1 *wake_stats,
-    AicoreReadyStatsV1 *ready_stats, AicoreCompletionStatsV1 *completion_stats, bool trace_enabled = false
+    AicoreReadyStatsV1 *ready_stats, AicoreCompletionStatsV1 *completion_stats, bool trace_enabled = false,
+    bool validate_done_state = true
 ) {
     __gm__ AicoreTaskControlV1 *control = aicore_task_control_at_v1(sidecar_base, context, task_id);
-    if (aicore_gm_load_v0(control->state) != static_cast<int64_t>(AicoreTaskStateV1::DONE)) return false;
+    if (validate_done_state &&
+        aicore_gm_load_v0(control->state) != static_cast<int64_t>(AicoreTaskStateV1::DONE)) {
+        aicore_record_scheduler_error_v1(
+            run_control, task_id, AicoreRootStatusV0::INVALID_ARGUMENTS, &graph, context, UINT64_C(61)
+        );
+        return false;
+    }
     uint64_t resolve_start = trace_enabled ? aicore_scheduler_cycles_v1() : 0;
     if (trace_enabled) {
         aicore_observe_cache_line_v0(&control->next_waiter);
@@ -925,11 +963,21 @@ inline __aicore__ bool aicore_resolve_completion_v1(
         }
     }
     int64_t waiter = aicore_gm_exchange_v0(control->wake_list_head, AICORE_WAKE_LIST_CLOSED_V1);
-    if (waiter == AICORE_WAKE_LIST_CLOSED_V1) return false;
+    if (waiter == AICORE_WAKE_LIST_CLOSED_V1) {
+        aicore_record_scheduler_error_v1(
+            run_control, task_id, AicoreRootStatusV0::INVALID_ARGUMENTS, &graph, context, UINT64_C(62)
+        );
+        return false;
+    }
     if (wake_stats != nullptr) ++wake_stats->wake_close_count;
     AicoreReadyBatchV1 batches[AICORE_CORE_TYPE_COUNT_V1]{};
     while (waiter >= 0) {
-        if (static_cast<uint64_t>(waiter) >= graph.task_count) return false;
+        if (static_cast<uint64_t>(waiter) >= graph.task_count) {
+            aicore_record_scheduler_error_v1(
+                run_control, task_id, AicoreRootStatusV0::INVALID_TASK_ID, &graph, context, UINT64_C(63)
+            );
+            return false;
+        }
         __gm__ AicoreTaskControlV1 *waiter_control = aicore_task_control_at_v1(sidecar_base, context, waiter);
         int64_t next = aicore_observe_next_waiter_v1(waiter_control);
         if (wake_stats != nullptr) ++wake_stats->wake_migrate_count;
@@ -938,18 +986,38 @@ inline __aicore__ bool aicore_resolve_completion_v1(
         if (route == AicoreRouteResultV1::READY_TO_ENQUEUE) {
             __gm__ AicoreTaskMetadataV1 *metadata = aicore_task_metadata_at_v1(sidecar_base, context, waiter);
             aicore_observe_cache_line_v0(metadata);
-            if (!aicore_task_is_executable_v1(metadata->flags) ||
-                !aicore_ready_batch_append_v1(
-                    sidecar_base, context, waiter, &batches[aicore_metadata_core_type_index_v1(metadata->subtask_slot)],
-                    ready_stats, trace_enabled
-                ))
+            if (!aicore_task_is_executable_v1(metadata->flags)) {
+                aicore_record_scheduler_error_v1(
+                    run_control, waiter, AicoreRootStatusV0::INVALID_ARGUMENTS, &graph, context, UINT64_C(64)
+                );
                 return false;
+            }
+            if (aicore_task_is_gang_v1(metadata->flags)) {
+                aicore_publish_gang_ready_v1(sidecar_base, context, waiter_control, metadata->flags);
+            } else if (!aicore_ready_batch_append_v1(
+                           sidecar_base, context, waiter,
+                           &batches[aicore_metadata_core_type_index_v1(
+                               aicore_metadata_single_subtask_slot_v1(metadata->active_mask)
+                           )],
+                           ready_stats, trace_enabled
+                       )) {
+                aicore_record_scheduler_error_v1(
+                    run_control, waiter, AicoreRootStatusV0::INVALID_ARGUMENTS, &graph, context, UINT64_C(65)
+                );
+                return false;
+            }
         }
         waiter = next;
     }
     for (uint32_t type = 0; type < AICORE_CORE_TYPE_COUNT_V1; ++type) {
-        if (!aicore_ready_batch_push_v1(sidecar_base, context, type, context->inbox_index, &batches[type], ready_stats))
+        if (!aicore_ready_batch_push_v1(
+                sidecar_base, context, type, context->inbox_index, &batches[type], ready_stats
+            )) {
+            aicore_record_scheduler_error_v1(
+                run_control, task_id, AicoreRootStatusV0::INVALID_ARGUMENTS, &graph, context, UINT64_C(66)
+            );
             return false;
+        }
     }
     if (trace_enabled) {
         control->completion_resolve_end_cycles = aicore_scheduler_cycles_v1();

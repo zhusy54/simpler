@@ -207,8 +207,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             auto *run_control = aicore_sidecar_at_v1<AicoreRunControlV1>(
                 runtime->aicore_sidecar_base, runtime->aicore_sidecar_layout.run_control_offset
             );
-            const uint64_t executable_task_count =
-                runtime->aicore_sidecar_layout.aic_task_count + runtime->aicore_sidecar_layout.aiv_task_count;
+            const uint64_t executable_task_count = runtime->aicore_sidecar_layout.executable_task_count;
             const bool trace_enabled = is_chip_swimlane_enabled();
             const uint64_t completion_wait_start_cycles = trace_enabled ? get_sys_cnt_aicpu() : 0;
             uint64_t bootstrap_complete_cycles = 0;

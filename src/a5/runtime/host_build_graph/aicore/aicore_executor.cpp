@@ -11,7 +11,8 @@
 
 #include "aicore/aicore.h"
 #include "aicore/aicore_profiling_state.h"
-#include "aicore_ready_scheduler_v1.h"
+// Cluster-local normal and gang scheduling share one device-side protocol.
+#include "aicore_gang_scheduler_v1.h"
 #include "aicore_task_profiling_v1.h"
 #include "common/platform_config.h"
 #include "pto2_dispatch_payload.h"
@@ -80,6 +81,16 @@ __aicore__ __attribute__((always_inline)) void execute_task(__gm__ PTO2DispatchP
     UnifiedKernelFunc kernel = (UnifiedKernelFunc)payload->function_bin_addr;
     kernel(reinterpret_cast<__gm__ int64_t *>(payload->args));
     OUT_OF_ORDER_STORE_BARRIER();
+}
+
+__aicore__ __attribute__((always_inline)) bool should_commit_scheduler_trace(
+    __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *context, __gm__ AicoreDispatchSlotV1 *slot
+) {
+    if (slot->gang == 0) return true;
+    if (slot->block_idx != 0) return false;
+    __gm__ AicoreTaskMetadataV1 *metadata = aicore_task_metadata_at_v1(sidecar_base, context, slot->task_id);
+    aicore_observe_cache_line_v0(metadata);
+    return slot->subtask_slot == aicore_metadata_single_subtask_slot_v1(metadata->active_mask);
 }
 
 __aicore__ __attribute__((always_inline)) void local_backoff(uint32_t iterations) {
@@ -196,8 +207,7 @@ __aicore__ __attribute__((always_inline)) void commit_task_trace(
 
 __aicore__ bool bootstrap_ready_graph(
     const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver,
-    __gm__ AicoreRunControlV1 *run_control, uint64_t resolver_count, uint64_t *ready_victim_cursors,
-    AicoreWorkerStatsV1 *stats, bool trace_enabled
+    __gm__ AicoreRunControlV1 *run_control, uint64_t resolver_count, AicoreWorkerStatsV1 *stats, bool trace_enabled
 ) {
     if (resolver_count == 0 || resolver->inbox_index >= resolver_count) return false;
     if (trace_enabled) stats->bootstrap_start_cycles = aicore_scheduler_cycles_v1();
@@ -218,12 +228,21 @@ __aicore__ bool bootstrap_ready_graph(
                 ) :
                 AicoreRouteResultV1::READY_TO_ENQUEUE;
         if (route == AicoreRouteResultV1::ERROR) return false;
-        if (route == AicoreRouteResultV1::READY_TO_ENQUEUE &&
-            !aicore_bootstrap_ready_batch_append_v1(
-                sidecar_base, resolver, static_cast<int64_t>(task_id),
-                &batches[aicore_metadata_core_type_index_v1(metadata->subtask_slot)], &stats->ready, trace_enabled
-            ))
-            return false;
+        if (route == AicoreRouteResultV1::READY_TO_ENQUEUE) {
+            if (aicore_task_is_gang_v1(metadata->flags)) {
+                __gm__ AicoreTaskControlV1 *control =
+                    aicore_task_control_at_v1(sidecar_base, resolver, static_cast<int64_t>(task_id));
+                aicore_publish_gang_ready_v1(sidecar_base, resolver, control, metadata->flags);
+            } else if (!aicore_bootstrap_ready_batch_append_v1(
+                           sidecar_base, resolver, static_cast<int64_t>(task_id),
+                           &batches[aicore_metadata_core_type_index_v1(
+                               aicore_metadata_single_subtask_slot_v1(metadata->active_mask)
+                           )],
+                           &stats->ready, trace_enabled
+                       )) {
+                return false;
+            }
+        }
         ++stats->bootstrap_task_count;
     }
     aicore_cache_barrier_v0();
@@ -253,8 +272,8 @@ __aicore__ bool bootstrap_ready_graph(
     if (trace_enabled) stats->bootstrap_end_cycles = aicore_scheduler_cycles_v1();
     if (trace_enabled) stats->target_bootstrap_start_cycles = aicore_scheduler_cycles_v1();
 
-    for (uint64_t worker_id = resolver->inbox_index; worker_id < resolver->runtime_worker_count;
-         worker_id += resolver_count) {
+    for (uint32_t cluster_lane = 0; cluster_lane < 3; ++cluster_lane) {
+        const uint64_t worker_id = resolver->cluster_worker_ids[cluster_lane];
         uint64_t target_start = trace_enabled ? aicore_scheduler_cycles_v1() : 0;
         __gm__ AicoreWorkerContextV1 *target = aicore_worker_context_at_v1(sidecar_base, resolver, worker_id);
         aicore_observe_cache_line_v0(target);
@@ -266,16 +285,6 @@ __aicore__ bool bootstrap_ready_graph(
                 aicore_dispatch_slot_at_v1(sidecar_base, resolver, worker_id, slot_index);
             aicore_observe_cache_line_v0(slot);
             aicore_initialize_free_slot_v1(slot);
-            AicoreFreeSlotClaimV1 slot_claim{worker_id, slot_index, slot->generation};
-            AicoreRefillTimingV1 refill_timing{};
-            if (!aicore_refill_private_slot_v1(
-                    graph, sidecar_base, resolver, run_control, resolver_count, slot_claim, ready_victim_cursors,
-                    &stats->ready, trace_enabled, trace_enabled ? &refill_timing : nullptr
-                ))
-                return false;
-            stats->bootstrap_ready_claim_cycles[type] += refill_timing.ready_claim_cycles;
-            stats->bootstrap_slot_fill_cycles[type] += refill_timing.slot_fill_cycles;
-            stats->bootstrap_free_advertise_cycles[type] += refill_timing.free_advertise_cycles;
         }
         aicore_gm_publish_v0(target->bootstrap_done, UINT64_C(1));
         if (trace_enabled) stats->bootstrap_target_cycles[type] += aicore_scheduler_cycles_v1() - target_start;
@@ -290,22 +299,15 @@ __aicore__ bool run_ready_dispatch_loop(
     bool trace_enabled, uint64_t aicore_entry_cycles, uint64_t handshake_publish_cycles,
     uint64_t register_release_cycles, uint64_t descriptor_cache_observed_cycles
 ) {
-    uint64_t resolver_count = aicore_gm_load_v0(run_control->aiv_active_worker_count);
-    bool resolver_worker = context->core_type == static_cast<int32_t>(AicoreRootCoreTypeV0::AIV);
+    uint64_t resolver_count = aicore_gm_load_v0(run_control->resolver_count);
+    bool resolver_worker = context->is_resolver != 0;
     if (resolver_count == 0) return false;
-    uint64_t completion_victim_cursor = resolver_worker ? (context->inbox_index + 1) % resolver_count : 0;
     uint64_t ready_victim_cursors[AICORE_CORE_TYPE_COUNT_V1]{
         resolver_worker ? (context->inbox_index + 1) % resolver_count : 0,
         resolver_worker ? (context->inbox_index + 1) % resolver_count : 0,
     };
-    uint64_t free_slot_cursors[AICORE_CORE_TYPE_COUNT_V1]{
-        context->worker_index * AICORE_PENDING_SLOT_COUNT_V1,
-        context->worker_index * AICORE_PENDING_SLOT_COUNT_V1,
-    };
     if (resolver_worker &&
-        !bootstrap_ready_graph(
-            graph, sidecar_base, context, run_control, resolver_count, ready_victim_cursors, stats, trace_enabled
-        ))
+        !bootstrap_ready_graph(graph, sidecar_base, context, run_control, resolver_count, stats, trace_enabled))
         return false;
 
     uint64_t seen_publication[AICORE_PENDING_SLOT_COUNT_V1]{};
@@ -330,27 +332,25 @@ __aicore__ bool run_ready_dispatch_loop(
 
         bool scheduler_progress = false;
         if (resolver_worker) {
-            bool completion_progress = false;
             uint64_t operation_start = trace_enabled ? get_sys_cnt_aicore() : 0;
-            if (!aicore_service_completion_inboxes_v1(
-                    graph, sidecar_base, context, run_control, resolver_count, &completion_victim_cursor,
-                    ready_victim_cursors, &stats->wake, &stats->ready, &stats->completion, &completion_progress,
-                    trace_enabled
-                ))
-                return false;
+            const bool completion_progress = aicore_service_cluster_completions_v1(
+                graph, sidecar_base, context, run_control, &stats->wake, &stats->ready, &stats->completion
+            );
             if (trace_enabled) inter_task_timing.completion_service_cycles += get_sys_cnt_aicore() - operation_start;
             scheduler_progress = completion_progress;
-            for (uint32_t type = 0; type < AICORE_CORE_TYPE_COUNT_V1; ++type) {
-                bool dispatch_progress = false;
-                operation_start = trace_enabled ? get_sys_cnt_aicore() : 0;
-                if (!aicore_dispatch_one_overflow_v1(
-                        graph, sidecar_base, context, run_control, resolver_count, type, &ready_victim_cursors[type],
-                        &free_slot_cursors[type], &stats->ready, &stats->free_slot, &dispatch_progress, trace_enabled
-                    ))
-                    return false;
-                if (trace_enabled) inter_task_timing.dispatch_cycles[type] += get_sys_cnt_aicore() - operation_start;
-                scheduler_progress = scheduler_progress || dispatch_progress;
-            }
+            scheduler_progress = aicore_service_gang_scheduler_v1(
+                                     graph, sidecar_base, context, run_control, &stats->wake, &stats->ready,
+                                     &stats->completion
+                                 ) ||
+                                 scheduler_progress;
+            operation_start = trace_enabled ? get_sys_cnt_aicore() : 0;
+            scheduler_progress = aicore_fill_cluster_normal_slots_v1(
+                                     graph, sidecar_base, context, run_control, ready_victim_cursors, &stats->ready,
+                                     trace_enabled
+                                 ) ||
+                                 scheduler_progress;
+            if (trace_enabled)
+                inter_task_timing.dispatch_cycles[0] += get_sys_cnt_aicore() - operation_start;
         }
 
         if (!bootstrap_observed) {
@@ -410,6 +410,8 @@ __aicore__ bool run_ready_dispatch_loop(
                 slot->claim_end_cycles,
                 static_cast<AicoreReadySourceV1>(slot->ready_source),
             };
+            const bool commit_scheduler_trace =
+                trace_enabled && should_commit_scheduler_trace(sidecar_base, context, slot);
             OUT_OF_ORDER_STORE_BARRIER();
             __gm__ ChipSwimlaneAicoreTaskRecord *profile_record =
                 common_profile_recorded ? nullptr : aicore_task_profiling_reserve_v1(task_profiling);
@@ -430,13 +432,11 @@ __aicore__ bool run_ready_dispatch_loop(
             uint64_t completion_start = get_sys_cnt_aicore();
             uint64_t local_completion_index = stats->completion.enqueue_count;
             uint64_t completion_id = aicore_completion_id_v1(context, local_completion_index);
-            uint64_t completion_inbox_index =
-                aicore_completion_inbox_index_v1(context, resolver_count, local_completion_index);
-            if (!aicore_enqueue_completion_v1(
-                    graph, sidecar_base, context, run_control, resolver_count, record.task_id, local_completion_index,
-                    &stats->completion, trace_enabled
-                ))
-                return false;
+            uint64_t completion_inbox_index = context->resolver_index;
+            __gm__ AicoreCompletionInboxV1 *completion_line =
+                aicore_completion_inbox_at_v1(sidecar_base, context, context->worker_index);
+            aicore_gm_store_v0(completion_line->completed_generations[slot_index], slot->generation);
+            ++stats->completion.enqueue_count;
             uint64_t completion_end = get_sys_cnt_aicore();
             aicore_task_profiling_commit_v1(
                 profile_record, static_cast<uint64_t>(record.task_id), record.claim_end_cycles, kernel_start, kernel_end
@@ -448,7 +448,7 @@ __aicore__ bool run_ready_dispatch_loop(
             stats->completion_enqueue_cycles += completion_end - completion_start;
             scan_start = (slot_index + 1) % AICORE_PENDING_SLOT_COUNT_V1;
             backoff_iterations = kInitialBackoffIterations;
-            if (trace_enabled) {
+            if (commit_scheduler_trace) {
                 uint64_t bookkeeping_end = get_sys_cnt_aicore();
                 commit_task_trace(
                     sidecar_base, context, record, ready_scan_start, ready_observe, kernel_start, kernel_end,
@@ -509,6 +509,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     __gm__ AicoreWorkerContextV1 *context = reinterpret_cast<__gm__ AicoreWorkerContextV1 *>(handshake->task);
     aicore_observe_cache_line_v0(context);
     aicore_observe_cache_line_v0(&context->task_metadata_offset);
+    aicore_observe_cache_line_v0(&context->gang_coordinator_offset);
     context->worker_index = static_cast<uint64_t>(block_idx);
     aicore_publish_cache_line_v0(&context->sidecar_base_address);
     AicoreTaskProfilingStateV1 task_profiling{};

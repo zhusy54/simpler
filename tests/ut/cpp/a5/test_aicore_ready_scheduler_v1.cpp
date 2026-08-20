@@ -18,7 +18,8 @@
 #include <thread>
 #include <vector>
 
-#include "aicore_ready_scheduler_v1.h"
+#include "aicore_gang_scheduler_v1.h"
+#include "aicore_cluster_topology_v1.h"
 #include "pto_runtime2_types.h"
 
 namespace {
@@ -61,6 +62,14 @@ public:
         std::copy(fanins.begin(), fanins.end(), payloads_[task].fanin_local_ids);
     }
 
+    void mixed(size_t task, uint8_t active_mask) {
+        ASSERT_LT(task, task_count_);
+        for (uint8_t subtask_slot = 0; subtask_slot < 3; ++subtask_slot) {
+            if ((active_mask & (1U << subtask_slot)) != 0) descriptors_[task].kernel_id[subtask_slot] = 1;
+        }
+        payloads_[task].fanin_count = 0;
+    }
+
     AicoreReadonlyGraphV0 graph() const {
         return {
             reinterpret_cast<uint64_t>(descriptors_.get()),
@@ -85,6 +94,7 @@ struct FixtureStorage {
         contexts = aicore_sidecar_at_v1<AicoreWorkerContextV1>(sidecar->base(), layout.worker_contexts_offset);
         run_control->claim_bindings_offset = layout.claim_bindings_offset;
         run_control->aiv_active_worker_count = workers;
+        run_control->resolver_count = workers;
         for (uint64_t worker = 0; worker < workers; ++worker) {
             AicoreWorkerContextV1 &context = contexts[worker];
             context.core_type = static_cast<int32_t>(AicoreRootCoreTypeV0::AIV);
@@ -98,6 +108,10 @@ struct FixtureStorage {
             context.worker_contexts_offset = layout.worker_contexts_offset;
             context.dispatch_slots_offset = layout.dispatch_slots_offset;
             context.callable_addresses_offset = layout.callable_addresses_offset;
+            context.gang_coordinator_offset = layout.gang_coordinator_offset;
+            context.gang_cohorts_offset = layout.gang_cohorts_offset;
+            context.gang_participants_offset = layout.gang_participants_offset;
+            context.gang_commands_offset = layout.gang_commands_offset;
             context.dispatch_payload_offset =
                 layout.dispatch_payloads_offset + worker * AICORE_PENDING_SLOT_COUNT_V1 * sizeof(PTO2DispatchPayload);
             context.graph_task_count = task_count;
@@ -107,8 +121,12 @@ struct FixtureStorage {
         }
         metadata = aicore_sidecar_at_v1<AicoreTaskMetadataV1>(sidecar->base(), layout.task_metadata_offset);
         for (uint64_t task = 0; task < task_count; ++task) {
-            metadata[task].kernel_id = 1;
-            metadata[task].subtask_slot = 0;
+            metadata[task].kernel_ids[0] = 1;
+            metadata[task].kernel_ids[1] = UINT16_MAX;
+            metadata[task].kernel_ids[2] = UINT16_MAX;
+            metadata[task].active_mask = 1;
+            metadata[task].logical_block_num = 1;
+            metadata[task].total_required_subtasks = 1;
             metadata[task].flags = AICORE_TASK_EXECUTABLE_V1;
         }
     }
@@ -141,16 +159,225 @@ TEST(AicoreReadySidecarV1, PlansAndInitializesReadyState) {
         EXPECT_EQ(ready[inbox].head, AICORE_INBOX_EMPTY_V1);
 }
 
+TEST(AicoreClusterTopologyV1, UsesMixedKernelLaunchCoordinate) {
+    constexpr int32_t kClusters = 4;
+    AicoreClusterCoordinateV1 coordinate{};
+    ASSERT_TRUE(aicore_cluster_coordinate_from_worker_v1(2, true, kClusters, 2, &coordinate));
+    EXPECT_EQ(coordinate.cluster_index, 2);
+    EXPECT_EQ(coordinate.cluster_lane, 0);
+    ASSERT_TRUE(aicore_cluster_coordinate_from_worker_v1(9, false, kClusters, 2, &coordinate));
+    EXPECT_EQ(coordinate.cluster_index, 2);
+    EXPECT_EQ(coordinate.cluster_lane, 2);
+    EXPECT_FALSE(aicore_cluster_coordinate_from_worker_v1(12, false, kClusters, 2, &coordinate));
+}
+
+TEST(AicoreGangPriorityV1, SyncStartPrecedesMixAndSpmd) {
+    EXPECT_EQ(aicore_task_priority_bit_v1(AICORE_TASK_SPMD_V1), 4u);
+    EXPECT_EQ(aicore_task_priority_bit_v1(AICORE_TASK_MIX_V1), 2u);
+    EXPECT_EQ(aicore_task_priority_bit_v1(AICORE_TASK_MIX_V1 | AICORE_TASK_SYNC_START_V1), 1u);
+
+    FixtureStorage storage(3, 3);
+    GraphBuffer graph(3);
+    graph.executable(0, 0);
+    graph.mixed(1, 3);
+    graph.executable(2, 1);
+    auto *coordinator =
+        aicore_sidecar_at_v1<AicoreGangCoordinatorV1>(storage.sidecar->base(), storage.layout.gang_coordinator_offset);
+    coordinator->gang_task_count = 3;
+    coordinator->resolver_count = 1;
+    coordinator->ready_priority_bits = 7;
+    storage.run_control->resolver_count = 1;
+    AicoreWorkerContextV1 &resolver = storage.contexts[1];
+    resolver.is_resolver = 1;
+    resolver.resolver_index = 0;
+    resolver.resolver_count = 1;
+    resolver.cluster_worker_ids[0] = 0;
+    resolver.cluster_worker_ids[1] = 1;
+    resolver.cluster_worker_ids[2] = 2;
+    auto *controls =
+        aicore_sidecar_at_v1<AicoreTaskControlV1>(storage.sidecar->base(), storage.layout.task_controls_offset);
+    for (uint32_t task = 0; task < 3; ++task)
+        controls[task].state = static_cast<int64_t>(AicoreTaskStateV1::READY);
+    storage.metadata[0].active_mask = 1;
+    storage.metadata[0].logical_block_num = 4;
+    storage.metadata[0].total_required_subtasks = 4;
+    storage.metadata[0].flags = AICORE_TASK_EXECUTABLE_V1 | AICORE_TASK_SPMD_V1;
+    storage.metadata[1].active_mask = 3;
+    storage.metadata[1].logical_block_num = 1;
+    storage.metadata[1].total_required_subtasks = 2;
+    storage.metadata[1].flags = AICORE_TASK_EXECUTABLE_V1 | AICORE_TASK_MIX_V1;
+    storage.metadata[2].active_mask = 2;
+    storage.metadata[2].logical_block_num = 2;
+    storage.metadata[2].total_required_subtasks = 2;
+    storage.metadata[2].flags =
+        AICORE_TASK_EXECUTABLE_V1 | AICORE_TASK_SPMD_V1 | AICORE_TASK_SYNC_START_V1;
+
+    ASSERT_TRUE(aicore_gang_admit_one_v1(
+        graph.graph(), storage.sidecar->base(), &resolver, storage.run_control
+    ));
+    auto *cohort =
+        aicore_sidecar_at_v1<AicoreGangCohortV1>(storage.sidecar->base(), storage.layout.gang_cohorts_offset);
+    EXPECT_EQ(cohort->task_id, 2);
+    EXPECT_EQ(cohort->state, static_cast<uint64_t>(AicoreGangCohortStateV1::DRAINING));
+    EXPECT_EQ(controls[2].state, static_cast<int64_t>(AicoreTaskStateV1::DISPATCHING));
+    EXPECT_FALSE(aicore_gang_admit_one_v1(
+        graph.graph(), storage.sidecar->base(), &resolver, storage.run_control
+    ));
+}
+
+TEST(AicoreSyncStartV1, RejectsImpossibleCohortBeforeDrain) {
+    FixtureStorage storage(1, 3);
+    GraphBuffer graph(1);
+    graph.executable(0, 1);
+    AicoreWorkerContextV1 &resolver = storage.contexts[1];
+    resolver.is_resolver = 1;
+    resolver.resolver_index = 0;
+    resolver.resolver_count = 1;
+    resolver.cluster_worker_ids[0] = 0;
+    resolver.cluster_worker_ids[1] = 1;
+    resolver.cluster_worker_ids[2] = 2;
+    storage.run_control->resolver_count = 1;
+    storage.metadata[0].kernel_ids[1] = 1;
+    storage.metadata[0].active_mask = 2;
+    storage.metadata[0].logical_block_num = 3;
+    storage.metadata[0].total_required_subtasks = 3;
+    storage.metadata[0].flags =
+        AICORE_TASK_EXECUTABLE_V1 | AICORE_TASK_SPMD_V1 | AICORE_TASK_SYNC_START_V1;
+    auto *control = aicore_task_control_at_v1(storage.sidecar->base(), &resolver, 0);
+    control->state = static_cast<int64_t>(AicoreTaskStateV1::READY);
+    auto *coordinator = aicore_gang_coordinator_at_v1(storage.sidecar->base(), &resolver);
+    coordinator->gang_task_count = 1;
+    coordinator->resolver_count = 1;
+    coordinator->ready_priority_bits = 1;
+
+    EXPECT_FALSE(aicore_gang_admit_one_v1(
+        graph.graph(), storage.sidecar->base(), &resolver, storage.run_control
+    ));
+    EXPECT_EQ(coordinator->capacity_reject_count, 1u);
+    EXPECT_EQ(
+        storage.run_control->scheduler_error, static_cast<uint64_t>(AicoreRootStatusV0::UNSUPPORTED_SHAPE)
+    );
+    EXPECT_EQ(storage.run_control->error_reserved[0], 72u);
+    EXPECT_EQ(coordinator->active_dispatch_cohort, UINT64_MAX);
+}
+
+TEST(AicoreGangTokensV1, StaleGenerationCannotCompleteTree) {
+    FixtureStorage storage(1, 3);
+    AicoreWorkerContextV1 &resolver = storage.contexts[0];
+    resolver.resolver_index = 0;
+    resolver.resolver_count = 3;
+    constexpr uint64_t kGeneration = 9;
+    for (uint64_t participant_index = 0; participant_index < 3; ++participant_index) {
+        auto *participant = aicore_gang_participant_at_v1(
+            storage.sidecar->base(), &resolver, 0, participant_index
+        );
+        participant->dispatch_local_token = kGeneration;
+    }
+    auto *stale_child = aicore_gang_participant_at_v1(storage.sidecar->base(), &resolver, 0, 2);
+    stale_child->dispatch_local_token = kGeneration - 1;
+    resolver.resolver_index = 1;
+    EXPECT_TRUE(aicore_gang_update_subtree_token_v1(
+        storage.sidecar->base(), &resolver, 0, 3, kGeneration, AicoreGangTokenPhaseV1::DISPATCH
+    ));
+    resolver.resolver_index = 2;
+    EXPECT_FALSE(aicore_gang_update_subtree_token_v1(
+        storage.sidecar->base(), &resolver, 0, 3, kGeneration, AicoreGangTokenPhaseV1::DISPATCH
+    ));
+    resolver.resolver_index = 0;
+    EXPECT_FALSE(aicore_gang_update_subtree_token_v1(
+        storage.sidecar->base(), &resolver, 0, 3, kGeneration, AicoreGangTokenPhaseV1::DISPATCH
+    ));
+    stale_child->dispatch_local_token = kGeneration;
+    resolver.resolver_index = 2;
+    EXPECT_TRUE(aicore_gang_update_subtree_token_v1(
+        storage.sidecar->base(), &resolver, 0, 3, kGeneration, AicoreGangTokenPhaseV1::DISPATCH
+    ));
+    resolver.resolver_index = 0;
+    EXPECT_TRUE(aicore_gang_update_subtree_token_v1(
+        storage.sidecar->base(), &resolver, 0, 3, kGeneration, AicoreGangTokenPhaseV1::DISPATCH
+    ));
+}
+
+TEST(AicoreGangMixV1, ReservesWholeClusterOrNothing) {
+    FixtureStorage storage(1, 3);
+    GraphBuffer graph(1);
+    graph.mixed(0, 7);
+    AicoreWorkerContextV1 &resolver = storage.contexts[1];
+    resolver.is_resolver = 1;
+    resolver.resolver_index = 0;
+    resolver.resolver_count = 1;
+    resolver.cluster_worker_ids[0] = 0;
+    resolver.cluster_worker_ids[1] = 1;
+    resolver.cluster_worker_ids[2] = 2;
+    storage.contexts[0].core_type = static_cast<int32_t>(AicoreRootCoreTypeV0::AIC);
+    for (uint32_t worker = 0; worker < 3; ++worker) {
+        for (uint32_t pending_slot = 0; pending_slot < AICORE_PENDING_SLOT_COUNT_V1; ++pending_slot)
+            aicore_initialize_free_slot_v1(
+                aicore_dispatch_slot_at_v1(storage.sidecar->base(), &resolver, worker, pending_slot)
+            );
+    }
+    storage.metadata[0].active_mask = 7;
+    storage.metadata[0].kernel_ids[0] = 1;
+    storage.metadata[0].kernel_ids[1] = 1;
+    storage.metadata[0].kernel_ids[2] = 1;
+    storage.metadata[0].logical_block_num = 1;
+    storage.metadata[0].total_required_subtasks = 3;
+    storage.metadata[0].flags = AICORE_TASK_EXECUTABLE_V1 | AICORE_TASK_MIX_V1;
+    auto *callables =
+        aicore_sidecar_at_v1<uint64_t>(storage.sidecar->base(), storage.layout.callable_addresses_offset);
+    callables[1] = 0x1000;
+    auto *participant = aicore_gang_participant_at_v1(storage.sidecar->base(), &resolver, 0, 0);
+    participant->config_generation = 1;
+    participant->task_id = 0;
+    participant->active_mask = 7;
+    participant->logical_block_num = 1;
+    participant->local_expected_subtasks = 3;
+    auto *blocked0 = aicore_dispatch_slot_at_v1(storage.sidecar->base(), &resolver, 1, 0);
+    auto *blocked1 = aicore_dispatch_slot_at_v1(storage.sidecar->base(), &resolver, 2, 1);
+    aicore_gm_store_v0(
+        blocked0->publication,
+        aicore_dispatch_publication_v1(blocked0->generation, AicoreDispatchPublicationV1::READY)
+    );
+    aicore_gm_store_v0(
+        blocked1->publication,
+        aicore_dispatch_publication_v1(blocked1->generation, AicoreDispatchPublicationV1::READY)
+    );
+    EXPECT_FALSE(aicore_gang_fill_mix_block_v1(
+        graph.graph(), storage.sidecar->base(), &resolver, storage.run_control, participant, 0, 0,
+        AicoreDispatchPublicationV1::GATED
+    ));
+    EXPECT_EQ(participant->local_published_subtasks, 0u);
+    aicore_gm_store_v0(
+        blocked0->publication,
+        aicore_dispatch_publication_v1(blocked0->generation, AicoreDispatchPublicationV1::FREE)
+    );
+    aicore_gm_store_v0(
+        blocked1->publication,
+        aicore_dispatch_publication_v1(blocked1->generation, AicoreDispatchPublicationV1::FREE)
+    );
+    ASSERT_TRUE(aicore_gang_fill_mix_block_v1(
+        graph.graph(), storage.sidecar->base(), &resolver, storage.run_control, participant, 0, 0,
+        AicoreDispatchPublicationV1::GATED
+    ));
+    EXPECT_EQ(participant->local_published_subtasks, 3u);
+    for (uint32_t worker = 0; worker < 3; ++worker) {
+        auto *slot = aicore_dispatch_slot_at_v1(storage.sidecar->base(), &resolver, worker, 0);
+        EXPECT_EQ(aicore_dispatch_state_v1(slot->publication), AicoreDispatchPublicationV1::GATED);
+        EXPECT_EQ(slot->block_idx, 0u);
+        EXPECT_EQ(slot->block_num, 1u);
+    }
+}
+
 TEST(AicoreBootstrapV1, RegistersOnlyOnFirstExecutableProducer) {
     FixtureStorage storage(4, 2);
     GraphBuffer graph(4);
     graph.executable(0, 0);
     graph.executable(1, 1, {0});
     graph.executable(3, 1, {2, 1});
-    storage.metadata[1].subtask_slot = 1;
+    storage.metadata[1].active_mask = 2;
     storage.metadata[1].flags |= AICORE_TASK_HAS_FANIN_V1;
     storage.metadata[2].flags = 0;
-    storage.metadata[3].subtask_slot = 1;
+    storage.metadata[3].active_mask = 2;
     storage.metadata[3].flags |= AICORE_TASK_HAS_FANIN_V1;
     auto *controls =
         aicore_sidecar_at_v1<AicoreTaskControlV1>(storage.sidecar->base(), storage.layout.task_controls_offset);
@@ -497,6 +724,118 @@ TEST(AicoreFreeSlotDirectoryV1, ClaimIsUniqueAndGenerationChecked) {
     first.join();
     second.join();
     EXPECT_EQ(claimed_mask.load(), UINT64_C(0xf));
+}
+
+TEST(AicoreClusterCompletionV1, SpscGenerationCompletesNormalTask) {
+    FixtureStorage storage(1, 3);
+    GraphBuffer graph(1);
+    graph.executable(0, 0);
+    AicoreWorkerContextV1 &resolver = storage.contexts[1];
+    resolver.is_resolver = 1;
+    resolver.resolver_index = 0;
+    resolver.resolver_count = 1;
+    resolver.cluster_worker_ids[0] = 0;
+    resolver.cluster_worker_ids[1] = 1;
+    resolver.cluster_worker_ids[2] = 2;
+    auto *slot = aicore_dispatch_slot_at_v1(storage.sidecar->base(), &resolver, 0, 0);
+    aicore_initialize_free_slot_v1(slot);
+    slot->task_id = 0;
+    slot->gang = 0;
+    aicore_gm_store_v0(
+        slot->publication, aicore_dispatch_publication_v1(slot->generation, AicoreDispatchPublicationV1::READY)
+    );
+    auto *completion_line = aicore_completion_inbox_at_v1(storage.sidecar->base(), &resolver, 0);
+    completion_line->completed_generations[0] = slot->generation;
+    auto *control = aicore_task_control_at_v1(storage.sidecar->base(), &resolver, 0);
+    control->state = static_cast<int64_t>(AicoreTaskStateV1::READY);
+    AicoreWakeStatsV1 wake_stats{};
+    AicoreReadyStatsV1 ready_stats{};
+    AicoreCompletionStatsV1 completion_stats{};
+    ASSERT_TRUE(aicore_service_cluster_completions_v1(
+        graph.graph(), storage.sidecar->base(), &resolver, storage.run_control, &wake_stats, &ready_stats,
+        &completion_stats
+    ));
+    EXPECT_EQ(completion_line->completed_generations[0], 0u);
+    EXPECT_EQ(aicore_dispatch_state_v1(slot->publication), AicoreDispatchPublicationV1::FREE);
+    EXPECT_EQ(control->state, static_cast<int64_t>(AicoreTaskStateV1::DONE));
+    EXPECT_EQ(control->wake_list_head, AICORE_WAKE_LIST_CLOSED_V1);
+    EXPECT_EQ(storage.run_control->resolved_task_count, 1u);
+}
+
+TEST(AicoreSyncStartV1, DrainsStagesAndReleasesBeforeCompletion) {
+    FixtureStorage storage(1, 3);
+    GraphBuffer graph(1);
+    graph.executable(0, 1);
+    AicoreWorkerContextV1 &resolver = storage.contexts[1];
+    resolver.is_resolver = 1;
+    resolver.resolver_index = 0;
+    resolver.resolver_count = 1;
+    resolver.cluster_worker_ids[0] = 0;
+    resolver.cluster_worker_ids[1] = 1;
+    resolver.cluster_worker_ids[2] = 2;
+    storage.contexts[0].core_type = static_cast<int32_t>(AicoreRootCoreTypeV0::AIC);
+    storage.run_control->resolver_count = 1;
+    for (uint32_t worker = 0; worker < 3; ++worker) {
+        for (uint32_t pending_slot = 0; pending_slot < AICORE_PENDING_SLOT_COUNT_V1; ++pending_slot)
+            aicore_initialize_free_slot_v1(
+                aicore_dispatch_slot_at_v1(storage.sidecar->base(), &resolver, worker, pending_slot)
+            );
+    }
+    storage.metadata[0].kernel_ids[1] = 1;
+    storage.metadata[0].active_mask = 2;
+    storage.metadata[0].logical_block_num = 2;
+    storage.metadata[0].total_required_subtasks = 2;
+    storage.metadata[0].flags =
+        AICORE_TASK_EXECUTABLE_V1 | AICORE_TASK_SPMD_V1 | AICORE_TASK_SYNC_START_V1;
+    auto *callables =
+        aicore_sidecar_at_v1<uint64_t>(storage.sidecar->base(), storage.layout.callable_addresses_offset);
+    callables[1] = 0x1000;
+    auto *control = aicore_task_control_at_v1(storage.sidecar->base(), &resolver, 0);
+    control->state = static_cast<int64_t>(AicoreTaskStateV1::READY);
+    auto *coordinator = aicore_gang_coordinator_at_v1(storage.sidecar->base(), &resolver);
+    coordinator->gang_task_count = 1;
+    coordinator->resolver_count = 1;
+    coordinator->ready_priority_bits = 1;
+    AicoreWakeStatsV1 wake_stats{};
+    AicoreReadyStatsV1 ready_stats{};
+    AicoreCompletionStatsV1 completion_stats{};
+    ASSERT_TRUE(aicore_gang_admit_one_v1(
+        graph.graph(), storage.sidecar->base(), &resolver, storage.run_control
+    ));
+    auto *cohort = aicore_gang_cohort_at_v1(storage.sidecar->base(), &resolver, 0);
+    ASSERT_TRUE(aicore_service_gang_scheduler_v1(
+        graph.graph(), storage.sidecar->base(), &resolver, storage.run_control, &wake_stats, &ready_stats,
+        &completion_stats
+    ));
+    EXPECT_EQ(cohort->state, static_cast<uint64_t>(AicoreGangCohortStateV1::STAGING));
+    ASSERT_TRUE(aicore_service_gang_scheduler_v1(
+        graph.graph(), storage.sidecar->base(), &resolver, storage.run_control, &wake_stats, &ready_stats,
+        &completion_stats
+    ));
+    EXPECT_EQ(cohort->state, static_cast<uint64_t>(AicoreGangCohortStateV1::RELEASING));
+    ASSERT_TRUE(aicore_service_gang_scheduler_v1(
+        graph.graph(), storage.sidecar->base(), &resolver, storage.run_control, &wake_stats, &ready_stats,
+        &completion_stats
+    ));
+    EXPECT_EQ(cohort->state, static_cast<uint64_t>(AicoreGangCohortStateV1::EXECUTING));
+    EXPECT_EQ(coordinator->active_dispatch_cohort, UINT64_MAX);
+    for (uint32_t worker = 1; worker <= 2; ++worker) {
+        auto *slot = aicore_dispatch_slot_at_v1(storage.sidecar->base(), &resolver, worker, 0);
+        ASSERT_EQ(aicore_dispatch_state_v1(slot->publication), AicoreDispatchPublicationV1::READY);
+        aicore_completion_inbox_at_v1(storage.sidecar->base(), &resolver, worker)
+            ->completed_generations[0] = slot->generation;
+    }
+    ASSERT_TRUE(aicore_service_cluster_completions_v1(
+        graph.graph(), storage.sidecar->base(), &resolver, storage.run_control, &wake_stats, &ready_stats,
+        &completion_stats
+    ));
+    ASSERT_TRUE(aicore_service_gang_scheduler_v1(
+        graph.graph(), storage.sidecar->base(), &resolver, storage.run_control, &wake_stats, &ready_stats,
+        &completion_stats
+    ));
+    EXPECT_EQ(cohort->state, static_cast<uint64_t>(AicoreGangCohortStateV1::FREE));
+    EXPECT_EQ(control->state, static_cast<int64_t>(AicoreTaskStateV1::DONE));
+    EXPECT_EQ(storage.run_control->resolved_task_count, 1u);
 }
 
 }  // namespace

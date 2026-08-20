@@ -1,0 +1,917 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+#pragma once
+
+#include "aicore_ready_scheduler_v1.h"
+
+enum class AicoreGangTokenPhaseV1 : uint32_t {
+    DRAIN = 0,
+    STAGE = 1,
+    DISPATCH = 2,
+    COMPLETION = 3,
+};
+
+inline __host__ __aicore__ __gm__ AicoreGangCohortV1 *aicore_gang_cohort_at_v1(
+    __gm__ void *sidecar_base, __gm__ const AicoreWorkerContextV1 *context, uint32_t cohort_index
+) {
+    return aicore_sidecar_at_v1<AicoreGangCohortV1>(
+        sidecar_base, context->gang_cohorts_offset + static_cast<uint64_t>(cohort_index) * sizeof(AicoreGangCohortV1)
+    );
+}
+
+inline __host__ __aicore__ __gm__ AicoreGangParticipantV1 *aicore_gang_participant_at_v1(
+    __gm__ void *sidecar_base, __gm__ const AicoreWorkerContextV1 *context, uint32_t cohort_index,
+    uint64_t resolver_index
+) {
+    const uint64_t linear = static_cast<uint64_t>(cohort_index) * AICORE_CLUSTER_CAPACITY_V1 + resolver_index;
+    return aicore_sidecar_at_v1<AicoreGangParticipantV1>(
+        sidecar_base, context->gang_participants_offset + linear * sizeof(AicoreGangParticipantV1)
+    );
+}
+
+inline __host__ __aicore__ __gm__ AicoreGangCommandV1 *aicore_gang_command_at_v1(
+    __gm__ void *sidecar_base, __gm__ const AicoreWorkerContextV1 *context, uint64_t resolver_index
+) {
+    return aicore_sidecar_at_v1<AicoreGangCommandV1>(
+        sidecar_base, context->gang_commands_offset + resolver_index * sizeof(AicoreGangCommandV1)
+    );
+}
+
+inline __aicore__ void aicore_gang_publish_command_v1(
+    __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver, uint64_t resolver_index,
+    uint32_t cohort_index, uint64_t generation, AicoreGangCohortStateV1 state
+) {
+    __gm__ AicoreGangCommandV1 *command = aicore_gang_command_at_v1(sidecar_base, resolver, resolver_index);
+    command->generation[cohort_index] = generation;
+    command->state[cohort_index] = static_cast<uint64_t>(state);
+    aicore_publish_cache_line_v0(command);
+}
+
+inline __aicore__ bool aicore_gang_forward_command_v1(
+    __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver,
+    __gm__ AicoreGangParticipantV1 *participant, uint32_t cohort_index, uint64_t generation,
+    AicoreGangCohortStateV1 state
+) {
+    if (participant->forwarded_generation == generation &&
+        participant->forwarded_state == static_cast<uint32_t>(state))
+        return false;
+    const uint64_t children[2] = {resolver->resolver_index * 2 + 1, resolver->resolver_index * 2 + 2};
+    for (uint32_t child_slot = 0; child_slot < 2; ++child_slot) {
+        if (children[child_slot] >= participant->participant_count) continue;
+        aicore_gang_publish_command_v1(
+            sidecar_base, resolver, children[child_slot], cohort_index, generation, state
+        );
+    }
+    participant->forwarded_generation = generation;
+    participant->forwarded_state = static_cast<uint32_t>(state);
+    aicore_publish_cache_line_v0(participant);
+    return true;
+}
+
+inline __host__ __aicore__ uint32_t aicore_gang_popcount_v1(uint32_t mask) {
+    return static_cast<uint32_t>(__builtin_popcount(mask));
+}
+
+inline __aicore__ __gm__ volatile uint64_t *aicore_gang_local_token_v1(
+    __gm__ AicoreGangParticipantV1 *participant, AicoreGangTokenPhaseV1 phase
+) {
+    if (phase == AicoreGangTokenPhaseV1::DRAIN) return &participant->drain_local_token;
+    if (phase == AicoreGangTokenPhaseV1::STAGE) return &participant->stage_local_token;
+    if (phase == AicoreGangTokenPhaseV1::DISPATCH) return &participant->dispatch_local_token;
+    return &participant->completion_local_token;
+}
+
+inline __aicore__ __gm__ volatile uint64_t *aicore_gang_subtree_token_v1(
+    __gm__ AicoreGangParticipantV1 *participant, AicoreGangTokenPhaseV1 phase
+) {
+    if (phase == AicoreGangTokenPhaseV1::DRAIN) return &participant->drain_subtree_token;
+    if (phase == AicoreGangTokenPhaseV1::STAGE) return &participant->stage_subtree_token;
+    if (phase == AicoreGangTokenPhaseV1::DISPATCH) return &participant->dispatch_subtree_token;
+    return &participant->completion_subtree_token;
+}
+
+inline __aicore__ bool aicore_gang_publish_local_token_v1(
+    __gm__ AicoreGangParticipantV1 *participant, AicoreGangTokenPhaseV1 phase, uint64_t generation
+) {
+    __gm__ volatile uint64_t *token = aicore_gang_local_token_v1(participant, phase);
+    if (*token == generation) return false;
+    *token = generation;
+    aicore_publish_cache_line_v0(token);
+    return true;
+}
+
+inline __aicore__ bool aicore_gang_update_subtree_token_v1(
+    __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver, uint32_t cohort_index,
+    uint64_t participant_count, uint64_t generation, AicoreGangTokenPhaseV1 phase
+) {
+    const uint64_t resolver_index = resolver->resolver_index;
+    if (resolver_index >= participant_count) return false;
+    __gm__ AicoreGangParticipantV1 *participant =
+        aicore_gang_participant_at_v1(sidecar_base, resolver, cohort_index, resolver_index);
+    __gm__ volatile uint64_t *local_token = aicore_gang_local_token_v1(participant, phase);
+    __gm__ volatile uint64_t *subtree_token = aicore_gang_subtree_token_v1(participant, phase);
+    if (*subtree_token == generation) return true;
+    aicore_observe_cache_line_v0(local_token);
+    if (*local_token != generation) return false;
+    const uint64_t children[2] = {resolver_index * 2 + 1, resolver_index * 2 + 2};
+    for (uint32_t child_slot = 0; child_slot < 2; ++child_slot) {
+        if (children[child_slot] >= participant_count) continue;
+        __gm__ AicoreGangParticipantV1 *child =
+            aicore_gang_participant_at_v1(sidecar_base, resolver, cohort_index, children[child_slot]);
+        __gm__ volatile uint64_t *child_token = aicore_gang_subtree_token_v1(child, phase);
+        aicore_observe_cache_line_v0(child_token);
+        if (*child_token != generation) return false;
+    }
+    *subtree_token = generation;
+    aicore_publish_cache_line_v0(subtree_token);
+    return true;
+}
+
+inline __aicore__ bool aicore_gang_root_token_ready_v1(
+    __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver, uint32_t cohort_index,
+    uint64_t generation, AicoreGangTokenPhaseV1 phase
+) {
+    __gm__ AicoreGangParticipantV1 *root = aicore_gang_participant_at_v1(sidecar_base, resolver, cohort_index, 0);
+    __gm__ volatile uint64_t *token = aicore_gang_subtree_token_v1(root, phase);
+    aicore_observe_cache_line_v0(token);
+    return *token == generation;
+}
+
+inline __host__ __aicore__ uint64_t aicore_gang_retire_token_v1(uint64_t generation) {
+    return ~generation;
+}
+
+inline __aicore__ void aicore_gang_publish_retire_v1(
+    __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver,
+    __gm__ AicoreGangParticipantV1 *participant, uint32_t cohort_index, uint64_t generation
+) {
+    const uint64_t retire_token = aicore_gang_retire_token_v1(generation);
+    aicore_gang_publish_local_token_v1(participant, AicoreGangTokenPhaseV1::COMPLETION, retire_token);
+    (void)aicore_gang_update_subtree_token_v1(
+        sidecar_base, resolver, cohort_index, participant->participant_count, retire_token,
+        AicoreGangTokenPhaseV1::COMPLETION
+    );
+}
+
+inline __aicore__ bool aicore_fill_explicit_dispatch_slot_v1(
+    const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver,
+    __gm__ AicoreRunControlV1 *run_control, uint64_t worker_id, uint32_t pending_slot, int64_t task_id,
+    uint8_t subtask_slot, uint32_t block_idx, uint32_t block_num, uint32_t cohort_index, uint32_t cohort_generation,
+    AicoreDispatchPublicationV1 publication
+) {
+    if (worker_id >= resolver->runtime_worker_count || pending_slot >= AICORE_PENDING_SLOT_COUNT_V1 || task_id < 0 ||
+        static_cast<uint64_t>(task_id) >= graph.task_count || subtask_slot >= 3 || block_num == 0 ||
+        block_idx >= block_num) {
+        return false;
+    }
+    __gm__ AicoreTaskMetadataV1 *metadata = aicore_task_metadata_at_v1(sidecar_base, resolver, task_id);
+    aicore_observe_cache_line_v0(metadata);
+    if ((metadata->active_mask & (1U << subtask_slot)) == 0) return false;
+    const uint16_t kernel_id = metadata->kernel_ids[subtask_slot];
+    __gm__ uint64_t *callable_addresses =
+        aicore_sidecar_at_v1<uint64_t>(sidecar_base, resolver->callable_addresses_offset);
+    aicore_observe_cache_line_v0(&callable_addresses[kernel_id]);
+    const uint64_t callable_address = callable_addresses[kernel_id];
+    if (kernel_id == UINT16_MAX || callable_address == 0) {
+        aicore_record_scheduler_error_v1(
+            run_control, task_id, AicoreRootStatusV0::INVALID_CALLABLE, &graph, resolver, UINT64_C(70)
+        );
+        return false;
+    }
+
+    __gm__ AicoreWorkerContextV1 *target = aicore_worker_context_at_v1(sidecar_base, resolver, worker_id);
+    aicore_observe_cache_line_v0(target);
+    __gm__ AicoreDispatchSlotV1 *slot =
+        aicore_dispatch_slot_at_v1(sidecar_base, resolver, worker_id, pending_slot);
+    aicore_observe_cache_line_v0(slot);
+    uint32_t generation = slot->generation + 1;
+    if (generation == 0) generation = 1;
+    slot->task_id = task_id;
+    slot->ready_inbox_index = resolver->resolver_index;
+    slot->claim_start_cycles = 0;
+    slot->claim_end_cycles = 0;
+    slot->claim_worker_id = resolver->worker_index;
+    slot->kernel_id = kernel_id;
+    slot->subtask_slot = subtask_slot;
+    slot->has_fanin = aicore_task_has_fanin_v1(metadata->flags) ? 1 : 0;
+    slot->ready_source = static_cast<uint8_t>(AicoreReadySourceV1::LOCAL);
+    slot->pending_slot = static_cast<uint8_t>(pending_slot);
+    slot->block_num = static_cast<uint16_t>(block_num);
+    slot->generation = generation;
+    slot->block_idx = block_idx;
+    slot->cohort_generation = cohort_generation;
+    slot->cohort_index = static_cast<uint8_t>(cohort_index);
+    slot->gang = 1;
+    aicore_writeback_cache_line_v0(slot);
+
+    AicoreTaskInfoV0 task{
+        task_id, static_cast<int32_t>(kernel_id), static_cast<int32_t>(subtask_slot),
+        subtask_slot == 0 ? AicoreRootCoreTypeV0::AIC : AicoreRootCoreTypeV0::AIV,
+    };
+    __gm__ PTO2DispatchPayload *payload = aicore_sidecar_at_v1<PTO2DispatchPayload>(
+        sidecar_base, target->dispatch_payload_offset + static_cast<uint64_t>(pending_slot) * sizeof(PTO2DispatchPayload)
+    );
+    AicoreRootStatusV0 status = aicore_materialize_task_payload_resolved_v0(
+        graph, task, callable_address, payload, static_cast<int32_t>(block_idx), static_cast<int32_t>(block_num)
+    );
+    if (status != AicoreRootStatusV0::OK) {
+        aicore_record_scheduler_error_v1(run_control, task_id, status, &graph, resolver, UINT64_C(71));
+        return false;
+    }
+    aicore_publish_dispatch_payload_v1(payload);
+    aicore_gm_store_v0(slot->publication, aicore_dispatch_publication_v1(generation, publication));
+    return true;
+}
+
+inline __aicore__ int32_t aicore_gang_find_free_pending_slot_v1(
+    __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver, uint64_t worker_id
+) {
+    for (uint32_t pending_slot = 0; pending_slot < AICORE_PENDING_SLOT_COUNT_V1; ++pending_slot) {
+        __gm__ AicoreDispatchSlotV1 *slot =
+            aicore_dispatch_slot_at_v1(sidecar_base, resolver, worker_id, pending_slot);
+        if (aicore_dispatch_state_v1(aicore_gm_load_v0(slot->publication)) == AicoreDispatchPublicationV1::FREE)
+            return static_cast<int32_t>(pending_slot);
+    }
+    return -1;
+}
+
+inline __aicore__ bool aicore_gang_fill_single_v1(
+    const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver,
+    __gm__ AicoreRunControlV1 *run_control, __gm__ AicoreGangParticipantV1 *participant, uint32_t cohort_index,
+    uint64_t worker_id, uint8_t subtask_slot, uint32_t block_idx, AicoreDispatchPublicationV1 publication
+) {
+    const int32_t pending_slot = aicore_gang_find_free_pending_slot_v1(sidecar_base, resolver, worker_id);
+    if (pending_slot < 0) return false;
+    __gm__ AicoreDispatchSlotV1 *slot =
+        aicore_dispatch_slot_at_v1(sidecar_base, resolver, worker_id, static_cast<uint32_t>(pending_slot));
+    const uint32_t generation = aicore_dispatch_generation_v1(aicore_gm_load_v0(slot->publication));
+    aicore_gm_store_v0(
+        slot->publication, aicore_dispatch_publication_v1(generation, AicoreDispatchPublicationV1::FILLING)
+    );
+    if (!aicore_fill_explicit_dispatch_slot_v1(
+            graph, sidecar_base, resolver, run_control, worker_id, static_cast<uint32_t>(pending_slot),
+            participant->task_id, subtask_slot, block_idx, participant->logical_block_num, cohort_index,
+            static_cast<uint32_t>(participant->config_generation), publication
+        )) {
+        return false;
+    }
+    ++participant->local_published_subtasks;
+    return true;
+}
+
+inline __aicore__ bool aicore_gang_fill_mix_block_v1(
+    const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver,
+    __gm__ AicoreRunControlV1 *run_control, __gm__ AicoreGangParticipantV1 *participant, uint32_t cohort_index,
+    uint32_t block_idx, AicoreDispatchPublicationV1 publication
+) {
+    int32_t pending_slot = -1;
+    for (uint32_t candidate = 0; candidate < AICORE_PENDING_SLOT_COUNT_V1; ++candidate) {
+        bool all_free = true;
+        for (uint8_t subtask_slot = 0; subtask_slot < 3; ++subtask_slot) {
+            if ((participant->active_mask & (1U << subtask_slot)) == 0) continue;
+            const uint64_t worker_id = resolver->cluster_worker_ids[subtask_slot];
+            __gm__ AicoreDispatchSlotV1 *slot =
+                aicore_dispatch_slot_at_v1(sidecar_base, resolver, worker_id, candidate);
+            if (aicore_dispatch_state_v1(aicore_gm_load_v0(slot->publication)) != AicoreDispatchPublicationV1::FREE) {
+                all_free = false;
+                break;
+            }
+        }
+        if (all_free) {
+            pending_slot = static_cast<int32_t>(candidate);
+            break;
+        }
+    }
+    if (pending_slot < 0) return false;
+    for (uint8_t subtask_slot = 0; subtask_slot < 3; ++subtask_slot) {
+        if ((participant->active_mask & (1U << subtask_slot)) == 0) continue;
+        const uint64_t worker_id = resolver->cluster_worker_ids[subtask_slot];
+        __gm__ AicoreDispatchSlotV1 *slot =
+            aicore_dispatch_slot_at_v1(sidecar_base, resolver, worker_id, static_cast<uint32_t>(pending_slot));
+        const uint32_t generation = aicore_dispatch_generation_v1(aicore_gm_load_v0(slot->publication));
+        aicore_gm_store_v0(
+            slot->publication, aicore_dispatch_publication_v1(generation, AicoreDispatchPublicationV1::FILLING)
+        );
+    }
+    for (uint8_t subtask_slot = 0; subtask_slot < 3; ++subtask_slot) {
+        if ((participant->active_mask & (1U << subtask_slot)) == 0) continue;
+        if (!aicore_fill_explicit_dispatch_slot_v1(
+                graph, sidecar_base, resolver, run_control, resolver->cluster_worker_ids[subtask_slot],
+                static_cast<uint32_t>(pending_slot), participant->task_id, subtask_slot, block_idx,
+                participant->logical_block_num, cohort_index, static_cast<uint32_t>(participant->config_generation),
+                AicoreDispatchPublicationV1::GATED
+            )) {
+            return false;
+        }
+    }
+    if (publication == AicoreDispatchPublicationV1::READY) {
+        for (uint8_t subtask_slot = 0; subtask_slot < 3; ++subtask_slot) {
+            if ((participant->active_mask & (1U << subtask_slot)) == 0) continue;
+            __gm__ AicoreDispatchSlotV1 *slot = aicore_dispatch_slot_at_v1(
+                sidecar_base, resolver, resolver->cluster_worker_ids[subtask_slot],
+                static_cast<uint32_t>(pending_slot)
+            );
+            aicore_gm_store_v0(
+                slot->publication,
+                aicore_dispatch_publication_v1(slot->generation, AicoreDispatchPublicationV1::READY)
+            );
+        }
+    }
+    participant->local_published_subtasks += aicore_gang_popcount_v1(participant->active_mask);
+    return true;
+}
+
+inline __aicore__ bool aicore_gang_local_slots_drained_v1(
+    __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver, uint32_t active_mask
+) {
+    const bool single_aiv = aicore_gang_popcount_v1(active_mask) == 1 && (active_mask & 6U) != 0;
+    for (uint32_t cluster_lane = 0; cluster_lane < 3; ++cluster_lane) {
+        const bool used = cluster_lane == 0 ? (active_mask & 1U) != 0 :
+                                             (single_aiv || (active_mask & (1U << cluster_lane)) != 0);
+        if (!used) continue;
+        for (uint32_t pending_slot = 0; pending_slot < AICORE_PENDING_SLOT_COUNT_V1; ++pending_slot) {
+            __gm__ AicoreDispatchSlotV1 *slot = aicore_dispatch_slot_at_v1(
+                sidecar_base, resolver, resolver->cluster_worker_ids[cluster_lane], pending_slot
+            );
+            if (aicore_dispatch_state_v1(aicore_gm_load_v0(slot->publication)) != AicoreDispatchPublicationV1::FREE)
+                return false;
+        }
+    }
+    return true;
+}
+
+inline __aicore__ void aicore_gang_fill_participant_v1(
+    const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver,
+    __gm__ AicoreRunControlV1 *run_control, __gm__ AicoreGangParticipantV1 *participant, uint32_t cohort_index,
+    AicoreDispatchPublicationV1 publication
+) {
+    const uint32_t active_mask = participant->active_mask;
+    if (aicore_gang_popcount_v1(active_mask) > 1) {
+        while (participant->next_block[0] < participant->logical_block_num) {
+            const uint32_t block_idx = participant->next_block[0];
+            if (!aicore_gang_fill_mix_block_v1(
+                    graph, sidecar_base, resolver, run_control, participant, cohort_index, block_idx, publication
+                ))
+                break;
+            participant->next_block[0] += participant->block_stride;
+        }
+    } else if ((active_mask & 1U) != 0) {
+        while (participant->next_block[0] < participant->logical_block_num) {
+            const uint32_t block_idx = participant->next_block[0];
+            if (!aicore_gang_fill_single_v1(
+                    graph, sidecar_base, resolver, run_control, participant, cohort_index,
+                    resolver->cluster_worker_ids[0], 0, block_idx, publication
+                ))
+                break;
+            participant->next_block[0] += participant->block_stride;
+        }
+    } else {
+        const uint8_t subtask_slot = (active_mask & 2U) != 0 ? 1 : 2;
+        for (uint32_t lane = 0; lane < 2; ++lane) {
+            while (participant->next_block[lane] < participant->logical_block_num) {
+                const uint32_t block_idx = participant->next_block[lane];
+                if (!aicore_gang_fill_single_v1(
+                        graph, sidecar_base, resolver, run_control, participant, cohort_index,
+                        resolver->cluster_worker_ids[lane + 1], subtask_slot, block_idx, publication
+                    ))
+                    break;
+                participant->next_block[lane] += participant->block_stride;
+            }
+        }
+    }
+    aicore_publish_cache_line_v0(participant);
+}
+
+inline __aicore__ void aicore_gang_release_local_slots_v1(
+    __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver, uint32_t cohort_index, uint64_t generation
+) {
+    for (uint32_t cluster_lane = 0; cluster_lane < 3; ++cluster_lane) {
+        for (uint32_t pending_slot = 0; pending_slot < AICORE_PENDING_SLOT_COUNT_V1; ++pending_slot) {
+            __gm__ AicoreDispatchSlotV1 *slot = aicore_dispatch_slot_at_v1(
+                sidecar_base, resolver, resolver->cluster_worker_ids[cluster_lane], pending_slot
+            );
+            const uint64_t publication = aicore_gm_load_v0(slot->publication);
+            if (aicore_dispatch_state_v1(publication) != AicoreDispatchPublicationV1::GATED) continue;
+            aicore_observe_cache_line_v0(slot);
+            if (slot->cohort_index != cohort_index || slot->cohort_generation != generation) continue;
+            aicore_gm_store_v0(
+                slot->publication,
+                aicore_dispatch_publication_v1(slot->generation, AicoreDispatchPublicationV1::READY)
+            );
+        }
+    }
+}
+
+inline __aicore__ int64_t aicore_gang_select_ready_task_v1(
+    __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver, uint64_t priority_bit
+) {
+    for (uint64_t task_id = 0; task_id < resolver->graph_task_count; ++task_id) {
+        __gm__ AicoreTaskMetadataV1 *metadata =
+            aicore_task_metadata_at_v1(sidecar_base, resolver, static_cast<int64_t>(task_id));
+        if (!aicore_task_is_gang_v1(metadata->flags) || aicore_task_priority_bit_v1(metadata->flags) != priority_bit)
+            continue;
+        __gm__ AicoreTaskControlV1 *control =
+            aicore_task_control_at_v1(sidecar_base, resolver, static_cast<int64_t>(task_id));
+        if (aicore_gm_load_v0(control->state) == static_cast<int64_t>(AicoreTaskStateV1::READY))
+            return static_cast<int64_t>(task_id);
+    }
+    return AICORE_TASK_ID_INVALID_V1;
+}
+
+inline __aicore__ uint32_t aicore_gang_assigned_blocks_v1(
+    uint32_t first, uint32_t stride, uint32_t logical_block_num
+) {
+    if (first >= logical_block_num) return 0;
+    return 1 + (logical_block_num - 1 - first) / stride;
+}
+
+inline __aicore__ bool aicore_gang_admit_one_v1(
+    const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver,
+    __gm__ AicoreRunControlV1 *run_control
+) {
+    if (resolver->resolver_index != 0) return false;
+    __gm__ AicoreGangCoordinatorV1 *coordinator = aicore_gang_coordinator_at_v1(sidecar_base, resolver);
+    aicore_observe_cache_line_v0(coordinator);
+    aicore_observe_cache_line_v0(&coordinator->active_dispatch_cohort);
+    if (coordinator->active_dispatch_cohort != UINT64_MAX) return false;
+    uint64_t ready_bits = coordinator->ready_priority_bits;
+    if (ready_bits == 0) return false;
+    const uint64_t priority_bit = (ready_bits & 1U) != 0 ? 1U : ((ready_bits & 2U) != 0 ? 2U : 4U);
+    uint32_t cohort_index = UINT32_MAX;
+    for (uint32_t candidate = 0; candidate < AICORE_GANG_COHORT_COUNT_V1; ++candidate) {
+        __gm__ AicoreGangCohortV1 *cohort = aicore_gang_cohort_at_v1(sidecar_base, resolver, candidate);
+        aicore_observe_cache_line_v0(cohort);
+        if (cohort->state == static_cast<uint64_t>(AicoreGangCohortStateV1::FREE)) {
+            cohort_index = candidate;
+            break;
+        }
+    }
+    if (cohort_index == UINT32_MAX) return false;
+    const int64_t task_id = aicore_gang_select_ready_task_v1(sidecar_base, resolver, priority_bit);
+    if (task_id < 0) {
+        aicore_gm_fetch_and_v0(coordinator->ready_priority_bits, ~priority_bit);
+        if (aicore_gang_select_ready_task_v1(sidecar_base, resolver, priority_bit) >= 0)
+            aicore_gm_fetch_or_v0(coordinator->ready_priority_bits, priority_bit);
+        return false;
+    }
+    __gm__ AicoreTaskMetadataV1 *metadata = aicore_task_metadata_at_v1(sidecar_base, resolver, task_id);
+    aicore_observe_cache_line_v0(metadata);
+    const uint32_t active_mask = metadata->active_mask;
+    const uint32_t block_num = metadata->logical_block_num;
+    const bool mix = aicore_task_is_mix_v1(metadata->flags);
+    const bool single_aiv = !mix && (active_mask & 6U) != 0;
+    const uint32_t capacity = single_aiv ? static_cast<uint32_t>(resolver->resolver_count * 2) :
+                                           static_cast<uint32_t>(resolver->resolver_count);
+    if (aicore_task_requires_sync_start_v1(metadata->flags) && block_num > capacity) {
+        ++coordinator->capacity_reject_count;
+        aicore_publish_cache_line_v0(&coordinator->admitted_count);
+        aicore_record_scheduler_error_v1(
+            run_control, task_id, AicoreRootStatusV0::UNSUPPORTED_SHAPE, &graph, resolver, UINT64_C(72)
+        );
+        return false;
+    }
+    const uint32_t required_participants = single_aiv ? (block_num + 1) / 2 : block_num;
+    const uint32_t participant_count = required_participants < resolver->resolver_count ?
+                                           required_participants :
+                                           static_cast<uint32_t>(resolver->resolver_count);
+    uint64_t generation = ++coordinator->next_generation;
+    if (generation == 0) generation = ++coordinator->next_generation;
+    for (uint32_t participant_index = 0; participant_index < participant_count; ++participant_index) {
+        __gm__ AicoreGangParticipantV1 *participant =
+            aicore_gang_participant_at_v1(sidecar_base, resolver, cohort_index, participant_index);
+        participant->config_generation = generation;
+        participant->task_id = task_id;
+        participant->active_mask = active_mask;
+        participant->logical_block_num = block_num;
+        participant->local_published_subtasks = 0;
+        participant->local_completed_subtasks = 0;
+        participant->forwarded_state = UINT32_MAX;
+        participant->forwarded_generation = 0;
+        participant->drain_local_token = 0;
+        participant->drain_subtree_token = 0;
+        participant->stage_local_token = 0;
+        participant->stage_subtree_token = 0;
+        participant->dispatch_local_token = 0;
+        participant->dispatch_subtree_token = 0;
+        participant->completion_local_token = 0;
+        participant->completion_subtree_token = 0;
+        if (single_aiv) {
+            participant->block_stride = static_cast<uint32_t>(resolver->resolver_count * 2);
+            participant->next_block[0] = participant_index * 2;
+            participant->next_block[1] = participant_index * 2 + 1;
+            participant->local_expected_subtasks =
+                aicore_gang_assigned_blocks_v1(
+                    participant->next_block[0], participant->block_stride, block_num
+                ) +
+                aicore_gang_assigned_blocks_v1(
+                    participant->next_block[1], participant->block_stride, block_num
+                );
+        } else {
+            participant->block_stride = static_cast<uint32_t>(resolver->resolver_count);
+            participant->next_block[0] = participant_index;
+            participant->next_block[1] = UINT32_MAX;
+            participant->local_expected_subtasks =
+                aicore_gang_assigned_blocks_v1(participant_index, participant->block_stride, block_num) *
+                aicore_gang_popcount_v1(active_mask);
+        }
+        participant->participant_count = participant_count;
+        aicore_publish_cache_line_v0(participant);
+        aicore_publish_cache_line_v0(&participant->drain_local_token);
+    }
+    __gm__ AicoreGangCohortV1 *cohort = aicore_gang_cohort_at_v1(sidecar_base, resolver, cohort_index);
+    cohort->task_id = task_id;
+    cohort->generation = generation;
+    cohort->priority_bit = priority_bit;
+    cohort->active_mask = active_mask;
+    cohort->logical_block_num = block_num;
+    cohort->participant_count = participant_count;
+    cohort->local_stride = single_aiv ? resolver->resolver_count * 2 : resolver->resolver_count;
+    cohort->admitted_cycles = aicore_scheduler_cycles_v1();
+    cohort->state = static_cast<uint64_t>(aicore_task_requires_sync_start_v1(metadata->flags) ?
+                                              AicoreGangCohortStateV1::DRAINING :
+                                              AicoreGangCohortStateV1::DISPATCHING);
+    aicore_publish_cache_line_v0(cohort);
+    __gm__ AicoreTaskControlV1 *control = aicore_task_control_at_v1(sidecar_base, resolver, task_id);
+    aicore_gm_store_v0(control->state, static_cast<int64_t>(AicoreTaskStateV1::DISPATCHING));
+    coordinator->active_dispatch_cohort = cohort_index;
+    ++coordinator->admitted_count;
+    if (priority_bit == 1) ++coordinator->sync_drain_count;
+    else if (priority_bit == 2) ++coordinator->mix_dispatch_count;
+    else ++coordinator->spmd_dispatch_count;
+    aicore_publish_cache_line_v0(&coordinator->active_dispatch_cohort);
+    aicore_publish_cache_line_v0(&coordinator->admitted_count);
+    aicore_gang_publish_command_v1(
+        sidecar_base, resolver, 0, cohort_index, generation,
+        aicore_task_requires_sync_start_v1(metadata->flags) ? AicoreGangCohortStateV1::DRAINING :
+                                                              AicoreGangCohortStateV1::DISPATCHING
+    );
+    return true;
+}
+
+inline __aicore__ bool aicore_gang_service_participant_v1(
+    const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver,
+    __gm__ AicoreRunControlV1 *run_control, uint32_t cohort_index, uint64_t cohort_generation,
+    AicoreGangCohortStateV1 state
+) {
+    __gm__ AicoreGangParticipantV1 *participant =
+        aicore_gang_participant_at_v1(sidecar_base, resolver, cohort_index, resolver->resolver_index);
+    aicore_observe_cache_line_v0(participant);
+    if (participant->config_generation != cohort_generation ||
+        resolver->resolver_index >= participant->participant_count)
+        return false;
+    bool progress =
+        aicore_gang_forward_command_v1(sidecar_base, resolver, participant, cohort_index, cohort_generation, state);
+    if (state == AicoreGangCohortStateV1::DRAINING) {
+        if (aicore_gang_local_slots_drained_v1(sidecar_base, resolver, participant->active_mask)) {
+            progress = aicore_gang_publish_local_token_v1(
+                           participant, AicoreGangTokenPhaseV1::DRAIN, cohort_generation
+                       ) ||
+                       progress;
+        }
+        (void)aicore_gang_update_subtree_token_v1(
+            sidecar_base, resolver, cohort_index, participant->participant_count, cohort_generation,
+            AicoreGangTokenPhaseV1::DRAIN
+        );
+    } else if (state == AicoreGangCohortStateV1::STAGING) {
+        const uint32_t before = participant->local_published_subtasks;
+        aicore_gang_fill_participant_v1(
+            graph, sidecar_base, resolver, run_control, participant, cohort_index,
+            AicoreDispatchPublicationV1::GATED
+        );
+        progress = participant->local_published_subtasks != before;
+        if (participant->local_published_subtasks == participant->local_expected_subtasks)
+            aicore_gang_publish_local_token_v1(participant, AicoreGangTokenPhaseV1::STAGE, cohort_generation);
+        (void)aicore_gang_update_subtree_token_v1(
+            sidecar_base, resolver, cohort_index, participant->participant_count, cohort_generation,
+            AicoreGangTokenPhaseV1::STAGE
+        );
+    } else if (state == AicoreGangCohortStateV1::RELEASING) {
+        aicore_gang_release_local_slots_v1(sidecar_base, resolver, cohort_index, cohort_generation);
+        progress = aicore_gang_publish_local_token_v1(
+                       participant, AicoreGangTokenPhaseV1::DISPATCH, cohort_generation
+                   ) ||
+                   progress;
+        (void)aicore_gang_update_subtree_token_v1(
+            sidecar_base, resolver, cohort_index, participant->participant_count, cohort_generation,
+            AicoreGangTokenPhaseV1::DISPATCH
+        );
+    } else if (state == AicoreGangCohortStateV1::DISPATCHING) {
+        const uint32_t before = participant->local_published_subtasks;
+        aicore_gang_fill_participant_v1(
+            graph, sidecar_base, resolver, run_control, participant, cohort_index,
+            AicoreDispatchPublicationV1::READY
+        );
+        progress = participant->local_published_subtasks != before;
+        if (participant->local_published_subtasks == participant->local_expected_subtasks)
+            aicore_gang_publish_local_token_v1(participant, AicoreGangTokenPhaseV1::DISPATCH, cohort_generation);
+        (void)aicore_gang_update_subtree_token_v1(
+            sidecar_base, resolver, cohort_index, participant->participant_count, cohort_generation,
+            AicoreGangTokenPhaseV1::DISPATCH
+        );
+    } else if (state == AicoreGangCohortStateV1::RETIRING) {
+        aicore_gang_publish_retire_v1(sidecar_base, resolver, participant, cohort_index, cohort_generation);
+    }
+    if (state != AicoreGangCohortStateV1::RETIRING &&
+        participant->local_completed_subtasks == participant->local_expected_subtasks &&
+        participant->local_expected_subtasks != 0) {
+        aicore_gang_publish_local_token_v1(participant, AicoreGangTokenPhaseV1::COMPLETION, cohort_generation);
+    }
+    if (state != AicoreGangCohortStateV1::RETIRING) {
+        (void)aicore_gang_update_subtree_token_v1(
+            sidecar_base, resolver, cohort_index, participant->participant_count, cohort_generation,
+            AicoreGangTokenPhaseV1::COMPLETION
+        );
+    }
+    return progress;
+}
+
+inline __aicore__ bool aicore_gang_service_owner_v1(
+    const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver,
+    __gm__ AicoreRunControlV1 *run_control, uint32_t cohort_index, __gm__ AicoreGangCohortV1 *cohort,
+    AicoreWakeStatsV1 *wake_stats, AicoreReadyStatsV1 *ready_stats, AicoreCompletionStatsV1 *completion_stats
+) {
+    if (resolver->resolver_index != 0 || cohort->participant_count == 0) return false;
+    const uint64_t generation = cohort->generation;
+    auto state = static_cast<AicoreGangCohortStateV1>(cohort->state);
+    bool progress = false;
+    if (state == AicoreGangCohortStateV1::DRAINING &&
+        aicore_gang_root_token_ready_v1(
+            sidecar_base, resolver, cohort_index, generation, AicoreGangTokenPhaseV1::DRAIN
+        )) {
+        cohort->drain_complete_cycles = aicore_scheduler_cycles_v1();
+        cohort->state = static_cast<uint64_t>(AicoreGangCohortStateV1::STAGING);
+        aicore_publish_cache_line_v0(cohort);
+        aicore_gang_publish_command_v1(
+            sidecar_base, resolver, 0, cohort_index, generation, AicoreGangCohortStateV1::STAGING
+        );
+        progress = true;
+    } else if (state == AicoreGangCohortStateV1::STAGING &&
+               aicore_gang_root_token_ready_v1(
+                   sidecar_base, resolver, cohort_index, generation, AicoreGangTokenPhaseV1::STAGE
+               )) {
+        cohort->stage_complete_cycles = aicore_scheduler_cycles_v1();
+        cohort->state = static_cast<uint64_t>(AicoreGangCohortStateV1::RELEASING);
+        aicore_publish_cache_line_v0(cohort);
+        aicore_gang_publish_command_v1(
+            sidecar_base, resolver, 0, cohort_index, generation, AicoreGangCohortStateV1::RELEASING
+        );
+        progress = true;
+    } else if ((state == AicoreGangCohortStateV1::RELEASING ||
+                state == AicoreGangCohortStateV1::DISPATCHING) &&
+               aicore_gang_root_token_ready_v1(
+                   sidecar_base, resolver, cohort_index, generation, AicoreGangTokenPhaseV1::DISPATCH
+               )) {
+        cohort->dispatch_complete_cycles = aicore_scheduler_cycles_v1();
+        cohort->state = static_cast<uint64_t>(AicoreGangCohortStateV1::EXECUTING);
+        aicore_publish_cache_line_v0(cohort);
+        __gm__ AicoreGangCoordinatorV1 *coordinator = aicore_gang_coordinator_at_v1(sidecar_base, resolver);
+        coordinator->active_dispatch_cohort = UINT64_MAX;
+        aicore_publish_cache_line_v0(&coordinator->active_dispatch_cohort);
+        aicore_gang_publish_command_v1(
+            sidecar_base, resolver, 0, cohort_index, generation, AicoreGangCohortStateV1::EXECUTING
+        );
+        progress = true;
+    }
+    state = static_cast<AicoreGangCohortStateV1>(cohort->state);
+    if (state == AicoreGangCohortStateV1::EXECUTING &&
+        aicore_gang_root_token_ready_v1(
+            sidecar_base, resolver, cohort_index, generation, AicoreGangTokenPhaseV1::COMPLETION
+        )) {
+        __gm__ AicoreTaskControlV1 *control =
+            aicore_task_control_at_v1(sidecar_base, resolver, cohort->task_id);
+        aicore_gm_store_v0(control->state, static_cast<int64_t>(AicoreTaskStateV1::DONE));
+        if (!aicore_resolve_completion_v1(
+                graph, sidecar_base, resolver, run_control, cohort->task_id, wake_stats, ready_stats,
+                completion_stats, false, false
+            )) {
+            return false;
+        }
+        if (completion_stats != nullptr) ++completion_stats->resolve_count;
+        cohort->completion_cycles = aicore_scheduler_cycles_v1();
+        cohort->state = static_cast<uint64_t>(AicoreGangCohortStateV1::RETIRING);
+        aicore_publish_cache_line_v0(cohort);
+        aicore_gang_publish_command_v1(
+            sidecar_base, resolver, 0, cohort_index, generation, AicoreGangCohortStateV1::FREE
+        );
+        __gm__ AicoreGangParticipantV1 *root =
+            aicore_gang_participant_at_v1(sidecar_base, resolver, cohort_index, 0);
+        aicore_observe_cache_line_v0(root);
+        (void)aicore_gang_forward_command_v1(
+            sidecar_base, resolver, root, cohort_index, generation, AicoreGangCohortStateV1::FREE
+        );
+        aicore_gang_publish_retire_v1(sidecar_base, resolver, root, cohort_index, generation);
+        progress = true;
+    }
+    state = static_cast<AicoreGangCohortStateV1>(cohort->state);
+    if (state == AicoreGangCohortStateV1::RETIRING &&
+        aicore_gang_root_token_ready_v1(
+            sidecar_base, resolver, cohort_index, aicore_gang_retire_token_v1(generation),
+            AicoreGangTokenPhaseV1::COMPLETION
+        )) {
+        cohort->task_id = AICORE_TASK_ID_INVALID_V1;
+        cohort->state = static_cast<uint64_t>(AicoreGangCohortStateV1::FREE);
+        aicore_publish_cache_line_v0(cohort);
+        // A gang task is globally resolved only after every Resolver has observed
+        // the FREE command. Otherwise AICPU may stop the AICore schedulers while
+        // the tree still contains a retiring generation, making the cohort unsafe
+        // to reuse and failing final scheduler validation.
+        aicore_gm_fetch_add_v0(run_control->resolved_task_count, UINT64_C(1));
+        progress = true;
+    }
+    return progress;
+}
+
+inline __aicore__ bool aicore_service_gang_scheduler_v1(
+    const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver,
+    __gm__ AicoreRunControlV1 *run_control, AicoreWakeStatsV1 *wake_stats, AicoreReadyStatsV1 *ready_stats,
+    AicoreCompletionStatsV1 *completion_stats
+) {
+    if (resolver->is_resolver == 0) return false;
+    __gm__ AicoreGangCoordinatorV1 *coordinator = aicore_gang_coordinator_at_v1(sidecar_base, resolver);
+    if (coordinator->gang_task_count == 0) return false;
+    bool progress = false;
+    const bool owner = resolver->resolver_index == 0;
+    uint64_t command_generations[AICORE_GANG_COHORT_COUNT_V1]{};
+    uint64_t command_states[AICORE_GANG_COHORT_COUNT_V1]{};
+    if (!owner) {
+        __gm__ AicoreGangCommandV1 *command =
+            aicore_gang_command_at_v1(sidecar_base, resolver, resolver->resolver_index);
+        aicore_observe_cache_line_v0(command);
+        for (uint32_t cohort_index = 0; cohort_index < AICORE_GANG_COHORT_COUNT_V1; ++cohort_index) {
+            command_generations[cohort_index] = command->generation[cohort_index];
+            command_states[cohort_index] = command->state[cohort_index];
+        }
+    }
+    for (uint32_t cohort_index = 0; cohort_index < AICORE_GANG_COHORT_COUNT_V1; ++cohort_index) {
+        __gm__ AicoreGangCohortV1 *cohort = nullptr;
+        uint64_t generation = command_generations[cohort_index];
+        auto state = static_cast<AicoreGangCohortStateV1>(command_states[cohort_index]);
+        if (owner) {
+            cohort = aicore_gang_cohort_at_v1(sidecar_base, resolver, cohort_index);
+            aicore_observe_cache_line_v0(cohort);
+            generation = cohort->generation;
+            state = static_cast<AicoreGangCohortStateV1>(cohort->state);
+        }
+        if (state == AicoreGangCohortStateV1::FREE) {
+            if (!owner && generation != 0) {
+                __gm__ AicoreGangParticipantV1 *participant = aicore_gang_participant_at_v1(
+                    sidecar_base, resolver, cohort_index, resolver->resolver_index
+                );
+                // This Resolver necessarily observed its participant config in
+                // an earlier active phase before the cohort could complete.
+                // Keep that owner-local line hot after FREE instead of forcing
+                // a DCCI invalidate on every idle scheduler iteration.
+                if (participant->config_generation == generation &&
+                    resolver->resolver_index < participant->participant_count) {
+                    progress = aicore_gang_forward_command_v1(
+                                   sidecar_base, resolver, participant, cohort_index, generation, state
+                               ) ||
+                               progress;
+                    aicore_gang_publish_retire_v1(
+                        sidecar_base, resolver, participant, cohort_index, generation
+                    );
+                }
+            }
+            continue;
+        }
+        progress = aicore_gang_service_participant_v1(
+                       graph, sidecar_base, resolver, run_control, cohort_index, generation, state
+                   ) ||
+                   progress;
+        if (owner) {
+            progress = aicore_gang_service_owner_v1(
+                           graph, sidecar_base, resolver, run_control, cohort_index, cohort, wake_stats, ready_stats,
+                           completion_stats
+                       ) ||
+                       progress;
+        }
+    }
+    if (owner)
+        progress = aicore_gang_admit_one_v1(graph, sidecar_base, resolver, run_control) || progress;
+    return progress;
+}
+
+inline __aicore__ bool aicore_service_cluster_completions_v1(
+    const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver,
+    __gm__ AicoreRunControlV1 *run_control, AicoreWakeStatsV1 *wake_stats, AicoreReadyStatsV1 *ready_stats,
+    AicoreCompletionStatsV1 *completion_stats
+) {
+    if (resolver->is_resolver == 0) return false;
+    bool progress = false;
+    for (uint32_t cluster_lane = 0; cluster_lane < 3; ++cluster_lane) {
+        const uint64_t worker_id = resolver->cluster_worker_ids[cluster_lane];
+        __gm__ AicoreCompletionInboxV1 *completion_line =
+            aicore_completion_inbox_at_v1(sidecar_base, resolver, worker_id);
+        for (uint32_t pending_slot = 0; pending_slot < AICORE_PENDING_SLOT_COUNT_V1; ++pending_slot) {
+            const uint64_t completed_generation =
+                aicore_gm_load_v0(completion_line->completed_generations[pending_slot]);
+            if (completed_generation == 0) continue;
+            __gm__ AicoreDispatchSlotV1 *slot =
+                aicore_dispatch_slot_at_v1(sidecar_base, resolver, worker_id, pending_slot);
+            const uint64_t publication = aicore_gm_load_v0(slot->publication);
+            if (aicore_dispatch_state_v1(publication) != AicoreDispatchPublicationV1::READY ||
+                aicore_dispatch_generation_v1(publication) != completed_generation) {
+                aicore_record_scheduler_error_v1(
+                    run_control, slot->task_id, AicoreRootStatusV0::INVALID_ARGUMENTS, &graph, resolver, UINT64_C(74)
+                );
+                return false;
+            }
+            aicore_observe_cache_line_v0(slot);
+            const int64_t task_id = slot->task_id;
+            const bool gang = slot->gang != 0;
+            const uint32_t cohort_index = slot->cohort_index;
+            const uint32_t cohort_generation = slot->cohort_generation;
+            slot->task_id = AICORE_TASK_ID_INVALID_V1;
+            aicore_writeback_cache_line_v0(slot);
+            aicore_gm_store_v0(completion_line->completed_generations[pending_slot], UINT64_C(0));
+            aicore_gm_store_v0(
+                slot->publication,
+                aicore_dispatch_publication_v1(slot->generation, AicoreDispatchPublicationV1::FREE)
+            );
+            if (gang) {
+                if (cohort_index >= AICORE_GANG_COHORT_COUNT_V1) return false;
+                __gm__ AicoreGangParticipantV1 *participant = aicore_gang_participant_at_v1(
+                    sidecar_base, resolver, cohort_index, resolver->resolver_index
+                );
+                aicore_observe_cache_line_v0(participant);
+                if (participant->config_generation != cohort_generation || participant->task_id != task_id ||
+                    participant->local_completed_subtasks >= participant->local_expected_subtasks) {
+                    aicore_record_scheduler_error_v1(
+                        run_control, task_id, AicoreRootStatusV0::INVALID_ARGUMENTS, &graph, resolver, UINT64_C(73)
+                    );
+                    return false;
+                }
+                ++participant->local_completed_subtasks;
+                aicore_publish_cache_line_v0(participant);
+            } else {
+                __gm__ AicoreTaskControlV1 *control = aicore_task_control_at_v1(sidecar_base, resolver, task_id);
+                aicore_gm_store_v0(control->state, static_cast<int64_t>(AicoreTaskStateV1::DONE));
+                if (!aicore_resolve_completion_v1(
+                        graph, sidecar_base, resolver, run_control, task_id, wake_stats, ready_stats, completion_stats,
+                        false, false
+                    ))
+                    return false;
+                if (completion_stats != nullptr) ++completion_stats->resolve_count;
+                aicore_gm_fetch_add_v0(run_control->resolved_task_count, UINT64_C(1));
+            }
+            progress = true;
+        }
+    }
+    return progress;
+}
+
+inline __aicore__ bool aicore_fill_cluster_normal_slots_v1(
+    const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver,
+    __gm__ AicoreRunControlV1 *run_control, uint64_t *ready_victim_cursors, AicoreReadyStatsV1 *ready_stats,
+    bool trace_enabled
+) {
+    if (resolver->is_resolver == 0) return false;
+    __gm__ AicoreGangCoordinatorV1 *coordinator = aicore_gang_coordinator_at_v1(sidecar_base, resolver);
+    if (coordinator->gang_task_count != 0) {
+        aicore_observe_cache_line_v0(coordinator);
+        aicore_observe_cache_line_v0(&coordinator->active_dispatch_cohort);
+        if (coordinator->ready_priority_bits != 0 || coordinator->active_dispatch_cohort != UINT64_MAX) return false;
+    }
+    bool progress = false;
+    for (uint32_t cluster_lane = 0; cluster_lane < 3; ++cluster_lane) {
+        const uint64_t worker_id = resolver->cluster_worker_ids[cluster_lane];
+        __gm__ AicoreWorkerContextV1 *target = aicore_worker_context_at_v1(sidecar_base, resolver, worker_id);
+        if (target->active == 0) continue;
+        const uint32_t core_type = aicore_core_type_index_v1(target->core_type);
+        for (uint32_t pending_slot = 0; pending_slot < AICORE_PENDING_SLOT_COUNT_V1; ++pending_slot) {
+            __gm__ AicoreDispatchSlotV1 *slot =
+                aicore_dispatch_slot_at_v1(sidecar_base, resolver, worker_id, pending_slot);
+            const uint64_t publication = aicore_gm_load_v0(slot->publication);
+            if (aicore_dispatch_state_v1(publication) != AicoreDispatchPublicationV1::FREE) continue;
+            AicoreReadyClaimV1 ready{};
+            if (!aicore_claim_ready_for_slot_v1(
+                    graph, sidecar_base, resolver, run_control, resolver->resolver_count, core_type,
+                    &ready_victim_cursors[core_type], ready_stats, &ready
+                ))
+                return progress;
+            if (ready.task_id < 0) continue;
+            AicoreFreeSlotClaimV1 claim{
+                worker_id, pending_slot, aicore_dispatch_generation_v1(publication),
+            };
+            aicore_gm_store_v0(
+                slot->publication,
+                aicore_dispatch_publication_v1(claim.generation, AicoreDispatchPublicationV1::FILLING)
+            );
+            if (!aicore_fill_dispatch_slot_v1(
+                    graph, sidecar_base, resolver, run_control, claim, ready, trace_enabled
+                ))
+                return false;
+            progress = true;
+        }
+    }
+    return progress;
+}
