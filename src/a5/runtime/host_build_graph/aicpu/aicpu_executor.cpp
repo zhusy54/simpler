@@ -52,6 +52,7 @@ struct AicpuExecutor {
     // is -1 during init) so the threads don't all collapse to leader 0.
     std::atomic<bool> hs_setup_done_{false};
     std::atomic<bool> hs_config_done_{false};
+    std::atomic<bool> hs_bootstrap_done_{false};
     std::atomic<int32_t> hs_arrived_{0};
     std::atomic<int32_t> hs_release_arrived_{0};
     std::atomic<int32_t> hs_thread_seq_{0};
@@ -134,6 +135,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
 
         hs_arrived_.store(0, std::memory_order_relaxed);
         hs_release_arrived_.store(0, std::memory_order_relaxed);
+        hs_bootstrap_done_.store(false, std::memory_order_relaxed);
         if (aicore_lifecycle_.pre_handshake_init(runtime, aicpu_thread_num_, get_platform_regs()) != 0) {
             init_failed_.store(true, std::memory_order_release);
         }
@@ -163,9 +165,29 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
             SPIN_WAIT_HINT();
     }
 
-    // The DMB register is the execution gate. On success each AICPU thread
-    // opens its own slice only after the shared configuration is visible. On
-    // failure the same partitioned path sends EXIT and waits for every ACK.
+    // Publish the configured context through GM. AICore performs descriptor
+    // observation, Ready bootstrap, and initial slot fill while the DMB gate
+    // remains closed. This is a one-way publication, not a second launch gate.
+    if (!init_failed_.load(std::memory_order_acquire)) {
+        aicore_lifecycle_.publish_context_partition(runtime, tidx);
+    }
+
+    // Only the leader polls the shared bootstrap line. Peers wait in AICPU
+    // local memory, avoiding six concurrent cache invalidates on the same GM
+    // cache line. The following release is the sole AICore-wide DMB gate.
+    if (is_leader) {
+        if (!init_failed_.load(std::memory_order_acquire) &&
+            aicore_lifecycle_.wait_bootstrap_complete(runtime) != 0) {
+            init_failed_.store(true, std::memory_order_release);
+        }
+        hs_bootstrap_done_.store(true, std::memory_order_release);
+    } else {
+        while (!hs_bootstrap_done_.load(std::memory_order_acquire))
+            SPIN_WAIT_HINT();
+    }
+
+    // The DMB register is the only execution gate. On failure the same
+    // partitioned path sends EXIT and waits for every ACK.
     if (aicore_lifecycle_.release_partition(tidx, !init_failed_.load(std::memory_order_acquire)) != 0) {
         init_failed_.store(true, std::memory_order_release);
     }
@@ -315,6 +337,7 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     init_failed_.store(false, std::memory_order_release);
     hs_setup_done_.store(false, std::memory_order_release);
     hs_config_done_.store(false, std::memory_order_release);
+    hs_bootstrap_done_.store(false, std::memory_order_release);
     hs_arrived_.store(0, std::memory_order_release);
     hs_release_arrived_.store(0, std::memory_order_release);
     hs_thread_seq_.store(0, std::memory_order_release);

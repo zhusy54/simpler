@@ -785,6 +785,59 @@ TEST(AicoreCompletionInboxV1, EnqueueUsesPerWorkerCompletionOrderInsteadOfTaskId
     EXPECT_EQ(aicore_completion_inbox_at_v1(storage.sidecar->base(), &storage.contexts[0], 28)->head, 1);
 }
 
+TEST(AicoreFreeSlotDirectoryV1, EmptyBitmapReturnsWithoutMovingCursor) {
+    FixtureStorage storage(1, 40);
+    GraphBuffer graph(1);
+    uint64_t cursor = 65;
+    AicoreFreeSlotClaimV1 claim{};
+    ASSERT_TRUE(aicore_try_claim_free_slot_v1(
+        graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 1, &cursor, nullptr, &claim
+    ));
+    EXPECT_EQ(claim.worker_id, UINT64_MAX);
+    EXPECT_EQ(cursor, 65u);
+}
+
+TEST(AicoreFreeSlotDirectoryV1, SparseBitmapClaimsSetBitsFromCursorAndWraps) {
+    FixtureStorage storage(1, 40);
+    GraphBuffer graph(1);
+    for (uint64_t linear : {UINT64_C(3), UINT64_C(70)}) {
+        uint64_t worker = linear / AICORE_PENDING_SLOT_COUNT_V1;
+        uint32_t slot_index = static_cast<uint32_t>(linear % AICORE_PENDING_SLOT_COUNT_V1);
+        auto *slot = aicore_dispatch_slot_at_v1(storage.sidecar->base(), &storage.contexts[0], worker, slot_index);
+        aicore_initialize_free_slot_v1(slot);
+        aicore_advertise_free_slot_v1(storage.sidecar->base(), &storage.contexts[0], 1, worker, slot_index);
+    }
+
+    uint64_t cursor = 65;
+    AicoreFreeSlotClaimV1 first{};
+    ASSERT_TRUE(aicore_try_claim_free_slot_v1(
+        graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 1, &cursor, nullptr, &first
+    ));
+    EXPECT_EQ(first.worker_id * AICORE_PENDING_SLOT_COUNT_V1 + first.slot_index, 70u);
+    EXPECT_EQ(cursor, 71u);
+
+    AicoreFreeSlotClaimV1 second{};
+    ASSERT_TRUE(aicore_try_claim_free_slot_v1(
+        graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 1, &cursor, nullptr, &second
+    ));
+    EXPECT_EQ(second.worker_id * AICORE_PENDING_SLOT_COUNT_V1 + second.slot_index, 3u);
+    EXPECT_EQ(cursor, 4u);
+}
+
+TEST(AicoreFreeSlotDirectoryV1, SnapshotMasksBitsPastRuntimeCapacity) {
+    FixtureStorage storage(1, 33);
+    auto *directory = aicore_free_slot_directory_at_v1(storage.sidecar->base(), &storage.contexts[0]);
+    directory->words[1][1] = (UINT64_C(1) << 1) | (UINT64_C(1) << 10);
+    uint64_t masks[AICORE_FREE_SLOT_DIRECTORY_WORD_COUNT_V1]{};
+    ASSERT_TRUE(aicore_load_free_slot_directory_masks_v1(
+        storage.sidecar->base(), &storage.contexts[0], 1, 66, masks
+    ));
+    EXPECT_EQ(masks[0], 0u);
+    EXPECT_EQ(masks[1], UINT64_C(1) << 1);
+    EXPECT_EQ(masks[2], 0u);
+    EXPECT_EQ(masks[3], 0u);
+}
+
 TEST(AicoreFreeSlotDirectoryV1, ClaimIsUniqueAndGenerationChecked) {
     FixtureStorage storage(1, 2);
     GraphBuffer graph(1);

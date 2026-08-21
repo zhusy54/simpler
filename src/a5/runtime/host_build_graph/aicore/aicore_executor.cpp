@@ -257,19 +257,18 @@ __aicore__ bool bootstrap_ready_graph(
     aicore_gm_store_v0(ready_directory->bootstrap_ready_types[resolver->inbox_index], ready_types);
     if (trace_enabled) stats->bootstrap_scan_end_cycles = aicore_scheduler_cycles_v1();
 
-    uint64_t arrived = aicore_gm_fetch_add_v0(run_control->bootstrap_arrived_count, UINT64_C(1)) + 1;
+    uint64_t arrived = aicore_gm_fetch_add_v0(run_control->bootstrap_scan_arrived_count, UINT64_C(1)) + 1;
     if (arrived == resolver_count) {
         aicore_bootstrap_ready_directory_publish_v1(sidecar_base, resolver, resolver_count);
-        aicore_gm_publish_v0(run_control->bootstrap_complete, UINT64_C(1));
+        aicore_gm_publish_v0(run_control->bootstrap_scan_complete, UINT64_C(1));
     } else {
         uint32_t barrier_backoff = kInitialBackoffIterations;
-        while (aicore_gm_query_v0(run_control->bootstrap_complete) == 0) {
+        while (aicore_gm_query_v0(run_control->bootstrap_scan_complete) == 0) {
             if (aicore_gm_query_v0(run_control->scheduler_error) != 0) return false;
             local_backoff(barrier_backoff);
             if (barrier_backoff < kMaximumBackoffIterations) barrier_backoff <<= 1;
         }
     }
-    if (trace_enabled) stats->bootstrap_end_cycles = aicore_scheduler_cycles_v1();
     if (trace_enabled) stats->target_bootstrap_start_cycles = aicore_scheduler_cycles_v1();
 
     for (uint32_t cluster_lane = 0; cluster_lane < 3; ++cluster_lane) {
@@ -290,6 +289,26 @@ __aicore__ bool bootstrap_ready_graph(
         if (trace_enabled) stats->bootstrap_target_cycles[type] += aicore_scheduler_cycles_v1() - target_start;
     }
     if (trace_enabled) stats->target_bootstrap_end_cycles = aicore_scheduler_cycles_v1();
+
+    // Prepare the first executable wave while the sole DMB launch gate is
+    // still closed. Gang service runs first to preserve SPMD > Mix > normal
+    // priority; normal fill is suppressed while a gang dispatch is pending.
+    uint64_t ready_victim_cursors[AICORE_CORE_TYPE_COUNT_V1]{
+        (resolver->inbox_index + 1) % resolver_count,
+        (resolver->inbox_index + 1) % resolver_count,
+    };
+    (void)aicore_service_gang_scheduler_v1(
+        graph, sidecar_base, resolver, run_control, &stats->wake, &stats->ready, &stats->completion
+    );
+    (void)aicore_fill_cluster_normal_slots_v1(
+        graph, sidecar_base, resolver, run_control, ready_victim_cursors, &stats->ready, trace_enabled
+    );
+
+    // This completion publication is observed by AICPU before it emits the
+    // one and only DMB release. Resolvers do not wait on another barrier.
+    arrived = aicore_gm_fetch_add_v0(run_control->bootstrap_arrived_count, UINT64_C(1)) + 1;
+    if (arrived == resolver_count) aicore_gm_publish_v0(run_control->bootstrap_complete, UINT64_C(1));
+    if (trace_enabled) stats->bootstrap_end_cycles = aicore_scheduler_cycles_v1();
     return true;
 }
 
@@ -306,10 +325,6 @@ __aicore__ bool run_ready_dispatch_loop(
         resolver_worker ? (context->inbox_index + 1) % resolver_count : 0,
         resolver_worker ? (context->inbox_index + 1) % resolver_count : 0,
     };
-    if (resolver_worker &&
-        !bootstrap_ready_graph(graph, sidecar_base, context, run_control, resolver_count, stats, trace_enabled))
-        return false;
-
     uint64_t seen_publication[AICORE_PENDING_SLOT_COUNT_V1]{};
     uint64_t previous_trace_commit_end = 0;
     uint32_t scan_start = 0;
@@ -319,7 +334,6 @@ __aicore__ bool run_ready_dispatch_loop(
     // The common collector keeps one anchor per core. Full per-task timing is
     // stored in the task-indexed HBG sidecar and merged by host validation.
     bool common_profile_recorded = false;
-    bool bootstrap_observed = false;
     while (true) {
         if (static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE)) == AICORE_EXIT_SIGNAL) {
             if (trace_enabled) stats->exit_observed_cycles = get_sys_cnt_aicore();
@@ -351,16 +365,6 @@ __aicore__ bool run_ready_dispatch_loop(
                                  scheduler_progress;
             if (trace_enabled)
                 inter_task_timing.dispatch_cycles[0] += get_sys_cnt_aicore() - operation_start;
-        }
-
-        if (!bootstrap_observed) {
-            if (aicore_gm_query_v0(context->bootstrap_done) == 0) {
-                ++stats->idle_iteration_count;
-                local_backoff(backoff_iterations);
-                if (backoff_iterations < kMaximumBackoffIterations) backoff_iterations <<= 1;
-                continue;
-            }
-            bootstrap_observed = true;
         }
 
         int32_t ready_slot = -1;
@@ -493,8 +497,11 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     dsb((mem_dsb_t)0);
     uint64_t handshake_publish_cycles = trace_enabled ? get_sys_cnt_aicore() : 0;
 
+    // AICPU publishes the fully configured context through GM. This lets
+    // AICore perform all pre-kernel work without consuming a DMB launch.
     uint32_t startup_signal = 0;
-    while (startup_signal != AICPU_IDLE_TASK_ID && startup_signal != AICORE_EXIT_SIGNAL) {
+    while (handshake->task == 0 && startup_signal != AICORE_EXIT_SIGNAL) {
+        aicore_observe_cache_line_v0(handshake);
         startup_signal = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));
         SPIN_WAIT_HINT();
     }
@@ -502,10 +509,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         write_reg(RegId::COND, AICORE_EXITED_VALUE);
         return;
     }
-    uint64_t register_release_cycles = trace_enabled ? get_sys_cnt_aicore() : 0;
-    write_reg(RegId::COND, AICORE_IDLE_VALUE);
 
-    aicore_observe_cache_line_v0(handshake);
     __gm__ AicoreWorkerContextV1 *context = reinterpret_cast<__gm__ AicoreWorkerContextV1 *>(handshake->task);
     aicore_observe_cache_line_v0(context);
     aicore_observe_cache_line_v0(&context->task_metadata_offset);
@@ -528,13 +532,40 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         context->task_window_mask,
     };
     AicoreWorkerStatsV1 stats{};
+    uint64_t descriptor_cache_observed_cycles = 0;
     if (context->active != 0) {
         aicore_observe_data_cache_v0(reinterpret_cast<__gm__ void *>(graph.descriptors_address));
-        uint64_t descriptor_cache_observed_cycles = trace_enabled ? get_sys_cnt_aicore() : 0;
-        (void)run_ready_dispatch_loop(
-            graph, sidecar_base, context, run_control, &task_profiling, &stats, trace_enabled, aicore_entry_cycles,
-            handshake_publish_cycles, register_release_cycles, descriptor_cache_observed_cycles
-        );
+        descriptor_cache_observed_cycles = trace_enabled ? get_sys_cnt_aicore() : 0;
+        if (context->is_resolver != 0 &&
+            !bootstrap_ready_graph(
+                graph, sidecar_base, context, run_control, aicore_gm_query_v0(run_control->resolver_count), &stats,
+                trace_enabled
+            )) {
+            aicore_record_scheduler_error_v1(
+                run_control, AICORE_TASK_ID_INVALID_V1, AicoreRootStatusV0::INVALID_ARGUMENTS, &graph, context,
+                UINT64_C(90)
+            );
+        }
+    }
+
+    // Sole AICore-wide DMB: after this point a prepared slot may execute.
+    startup_signal = 0;
+    while (startup_signal != AICPU_IDLE_TASK_ID && startup_signal != AICORE_EXIT_SIGNAL) {
+        startup_signal = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));
+        SPIN_WAIT_HINT();
+    }
+    if (startup_signal == AICORE_EXIT_SIGNAL) {
+        if (trace_enabled) stats.exit_observed_cycles = get_sys_cnt_aicore();
+    } else {
+        uint64_t register_release_cycles = trace_enabled ? get_sys_cnt_aicore() : 0;
+        write_reg(RegId::COND, AICORE_IDLE_VALUE);
+        if (context->active != 0) {
+            (void)run_ready_dispatch_loop(
+                graph, sidecar_base, context, run_control, &task_profiling, &stats, trace_enabled,
+                aicore_entry_cycles, handshake_publish_cycles, register_release_cycles,
+                descriptor_cache_observed_cycles
+            );
+        }
     }
 
     if (trace_enabled && stats.exit_wait_start_cycles == 0) stats.exit_wait_start_cycles = get_sys_cnt_aicore();

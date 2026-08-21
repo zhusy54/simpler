@@ -869,6 +869,14 @@ inline __aicore__ bool aicore_service_cluster_completions_v1(
     return progress;
 }
 
+inline __host__ __aicore__ bool aicore_normal_aiv_worker_precedes_v1(
+    uint32_t candidate_occupied_slots, bool candidate_is_resolver, uint32_t selected_occupied_slots,
+    bool selected_is_resolver
+) {
+    if (candidate_is_resolver != selected_is_resolver) return !candidate_is_resolver;
+    return candidate_occupied_slots < selected_occupied_slots;
+}
+
 inline __aicore__ bool aicore_fill_cluster_normal_slots_v1(
     const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver,
     __gm__ AicoreRunControlV1 *run_control, uint64_t *ready_victim_cursors, AicoreReadyStatsV1 *ready_stats,
@@ -882,26 +890,112 @@ inline __aicore__ bool aicore_fill_cluster_normal_slots_v1(
         if (coordinator->ready_priority_bits != 0 || coordinator->active_dispatch_cohort != UINT64_MAX) return false;
     }
     bool progress = false;
-    for (uint32_t cluster_lane = 0; cluster_lane < 3; ++cluster_lane) {
-        const uint64_t worker_id = resolver->cluster_worker_ids[cluster_lane];
-        __gm__ AicoreWorkerContextV1 *target = aicore_worker_context_at_v1(sidecar_base, resolver, worker_id);
-        if (target->active == 0) continue;
-        const uint32_t core_type = aicore_core_type_index_v1(target->core_type);
-        for (uint32_t pending_slot = 0; pending_slot < AICORE_PENDING_SLOT_COUNT_V1; ++pending_slot) {
-            __gm__ AicoreDispatchSlotV1 *slot =
-                aicore_dispatch_slot_at_v1(sidecar_base, resolver, worker_id, pending_slot);
-            const uint64_t publication = aicore_gm_query_v0(slot->publication);
-            if (aicore_dispatch_state_v1(publication) != AicoreDispatchPublicationV1::FREE) continue;
+
+    // AIC has no peer lane in its Cluster, so preserve the existing slot order.
+    const uint32_t aic_core_type = static_cast<uint32_t>(AicoreRootCoreTypeV0::AIC);
+    if (aicore_ready_directory_nonempty_v1(
+            sidecar_base, resolver, resolver->resolver_count, aic_core_type
+        )) {
+        bool aic_ready_available = true;
+        for (uint32_t cluster_lane = 0; cluster_lane < 3 && aic_ready_available; ++cluster_lane) {
+            const uint64_t worker_id = resolver->cluster_worker_ids[cluster_lane];
+            __gm__ AicoreWorkerContextV1 *target = aicore_worker_context_at_v1(sidecar_base, resolver, worker_id);
+            if (target->active == 0 || target->core_type != static_cast<int32_t>(AicoreRootCoreTypeV0::AIC)) continue;
+            for (uint32_t pending_slot = 0; pending_slot < AICORE_PENDING_SLOT_COUNT_V1; ++pending_slot) {
+                __gm__ AicoreDispatchSlotV1 *slot =
+                    aicore_dispatch_slot_at_v1(sidecar_base, resolver, worker_id, pending_slot);
+                const uint64_t publication = aicore_gm_query_v0(slot->publication);
+                if (aicore_dispatch_state_v1(publication) != AicoreDispatchPublicationV1::FREE) continue;
+                AicoreReadyClaimV1 ready{};
+                if (!aicore_claim_ready_for_slot_v1(
+                        graph, sidecar_base, resolver, run_control, resolver->resolver_count, aic_core_type,
+                        &ready_victim_cursors[aic_core_type], ready_stats, &ready, trace_enabled
+                    ))
+                    return progress;
+                if (ready.task_id < 0) {
+                    aic_ready_available = false;
+                    break;
+                }
+                AicoreFreeSlotClaimV1 claim{
+                    worker_id, pending_slot, aicore_dispatch_generation_v1(publication),
+                };
+                aicore_gm_store_v0(
+                    slot->publication,
+                    aicore_dispatch_publication_v1(claim.generation, AicoreDispatchPublicationV1::FILLING)
+                );
+                if (!aicore_fill_dispatch_slot_v1(
+                        graph, sidecar_base, resolver, run_control, claim, ready, trace_enabled
+                    ))
+                    return false;
+                progress = true;
+            }
+        }
+    }
+
+    // A Resolver shares its AIV with Executor work. Exhaust the non-Resolver
+    // peer's free slots before using the Resolver, leaving the Resolver
+    // available to advance Cluster scheduling whenever peer capacity remains.
+    struct AivWorkerSlots {
+        uint64_t worker_id{UINT64_MAX};
+        uint64_t publications[AICORE_PENDING_SLOT_COUNT_V1]{};
+        uint32_t free_mask{0};
+        uint32_t occupied_slots{0};
+        bool is_resolver{false};
+    };
+    const uint32_t aiv_core_type = static_cast<uint32_t>(AicoreRootCoreTypeV0::AIV);
+    if (aicore_ready_directory_nonempty_v1(
+            sidecar_base, resolver, resolver->resolver_count, aiv_core_type
+        )) {
+        AivWorkerSlots aiv_workers[2]{};
+        uint32_t aiv_worker_count = 0;
+        for (uint32_t cluster_lane = 0; cluster_lane < 3; ++cluster_lane) {
+            const uint64_t worker_id = resolver->cluster_worker_ids[cluster_lane];
+            __gm__ AicoreWorkerContextV1 *target = aicore_worker_context_at_v1(sidecar_base, resolver, worker_id);
+            if (target->active == 0 || target->core_type != static_cast<int32_t>(AicoreRootCoreTypeV0::AIV)) continue;
+            if (aiv_worker_count >= 2) return false;
+            AivWorkerSlots &worker = aiv_workers[aiv_worker_count++];
+            worker.worker_id = worker_id;
+            worker.is_resolver = worker_id == resolver->worker_index;
+            for (uint32_t pending_slot = 0; pending_slot < AICORE_PENDING_SLOT_COUNT_V1; ++pending_slot) {
+                __gm__ AicoreDispatchSlotV1 *slot =
+                    aicore_dispatch_slot_at_v1(sidecar_base, resolver, worker_id, pending_slot);
+                const uint64_t publication = aicore_gm_query_v0(slot->publication);
+                worker.publications[pending_slot] = publication;
+                if (aicore_dispatch_state_v1(publication) == AicoreDispatchPublicationV1::FREE)
+                    worker.free_mask |= 1U << pending_slot;
+                else
+                    ++worker.occupied_slots;
+            }
+        }
+        for (uint32_t attempt = 0; attempt < aiv_worker_count * AICORE_PENDING_SLOT_COUNT_V1; ++attempt) {
+            uint32_t selected = aiv_worker_count;
+            for (uint32_t worker_index = 0; worker_index < aiv_worker_count; ++worker_index) {
+                const AivWorkerSlots &candidate = aiv_workers[worker_index];
+                if (candidate.free_mask == 0) continue;
+                if (selected == aiv_worker_count ||
+                    aicore_normal_aiv_worker_precedes_v1(
+                        candidate.occupied_slots, candidate.is_resolver, aiv_workers[selected].occupied_slots,
+                        aiv_workers[selected].is_resolver
+                    ))
+                    selected = worker_index;
+            }
+            if (selected == aiv_worker_count) break;
+            AivWorkerSlots &worker = aiv_workers[selected];
+            const uint32_t pending_slot = static_cast<uint32_t>(__builtin_ctz(worker.free_mask));
+            worker.free_mask &= ~(1U << pending_slot);
             AicoreReadyClaimV1 ready{};
             if (!aicore_claim_ready_for_slot_v1(
-                    graph, sidecar_base, resolver, run_control, resolver->resolver_count, core_type,
-                    &ready_victim_cursors[core_type], ready_stats, &ready
+                    graph, sidecar_base, resolver, run_control, resolver->resolver_count, aiv_core_type,
+                    &ready_victim_cursors[aiv_core_type], ready_stats, &ready, trace_enabled
                 ))
                 return progress;
-            if (ready.task_id < 0) continue;
+            if (ready.task_id < 0) break;
+            const uint64_t publication = worker.publications[pending_slot];
             AicoreFreeSlotClaimV1 claim{
-                worker_id, pending_slot, aicore_dispatch_generation_v1(publication),
+                worker.worker_id, pending_slot, aicore_dispatch_generation_v1(publication),
             };
+            __gm__ AicoreDispatchSlotV1 *slot =
+                aicore_dispatch_slot_at_v1(sidecar_base, resolver, worker.worker_id, pending_slot);
             aicore_gm_store_v0(
                 slot->publication,
                 aicore_dispatch_publication_v1(claim.generation, AicoreDispatchPublicationV1::FILLING)
@@ -910,6 +1004,7 @@ inline __aicore__ bool aicore_fill_cluster_normal_slots_v1(
                     graph, sidecar_base, resolver, run_control, claim, ready, trace_enabled
                 ))
                 return false;
+            ++worker.occupied_slots;
             progress = true;
         }
     }

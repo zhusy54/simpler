@@ -545,15 +545,6 @@ bool append_aicore_scheduler_trace(
         first = false;
     };
     std::vector<std::vector<const AicoreTaskTraceCellV1 *>> worker_traces(static_cast<size_t>(runtime->worker_count));
-    uint64_t execution_start_cycles = std::numeric_limits<uint64_t>::max();
-    uint64_t descriptor_ready_cycles = 0;
-    for (uint64_t task_id = 0; task_id < runtime->aicore_sidecar_layout.task_count; ++task_id) {
-        const AicoreTaskTraceCellV1 &trace = traces[task_id];
-        if (trace.valid == 0 || trace.aicore_entry_cycles == 0) continue;
-        execution_start_cycles = std::min(execution_start_cycles, trace.claim_start_cycles);
-        descriptor_ready_cycles = std::max(descriptor_ready_cycles, trace.descriptor_cache_observed_cycles);
-    }
-    execution_start_cycles = std::max(execution_start_cycles, descriptor_ready_cycles);
     for (uint64_t task_id = 0; task_id < runtime->aicore_sidecar_layout.task_count; ++task_id) {
         const AicoreTaskTraceCellV1 &trace = traces[task_id];
         if (trace.valid == 0) continue;
@@ -582,25 +573,37 @@ bool append_aicore_scheduler_trace(
                 trace.worker_id, trace_core_type, trace.task_id, "HandshakeToRegisterRelease",
                 trace.handshake_publish_cycles, trace.register_release_cycles
             );
+            if (trace.worker_id < static_cast<uint64_t>(runtime->worker_count)) {
+                const AicpuCoreLifecycleTraceV1 &lifecycle = lifecycle_traces[trace.worker_id];
+                emit(
+                    trace.worker_id, trace_core_type, trace.task_id, "HandshakeToAicpuObserve",
+                    trace.handshake_publish_cycles, lifecycle.handshake_observed_cycles
+                );
+                emit(
+                    trace.worker_id, trace_core_type, trace.task_id, "ContextPublishToDescriptorReady",
+                    lifecycle.context_publish_complete_cycles, trace.descriptor_cache_observed_cycles
+                );
+            }
             emit(
-                trace.worker_id, trace_core_type, trace.task_id, "RegisterReleaseToDescriptorReady",
-                trace.register_release_cycles, trace.descriptor_cache_observed_cycles
+                trace.worker_id, trace_core_type, trace.task_id, "HandshakeToDescriptorReady",
+                trace.handshake_publish_cycles, trace.descriptor_cache_observed_cycles
             );
-            emit(
-                trace.worker_id, trace_core_type, trace.task_id, "DescriptorReadyToReadyClaim",
-                trace.descriptor_cache_observed_cycles, execution_start_cycles
-            );
-            const uint64_t first_ready_cycles = trace.ready_transition_cycles == 0 ?
-                                                    execution_start_cycles :
-                                                    std::max(execution_start_cycles, trace.ready_transition_cycles);
-            emit(
-                trace.worker_id, trace_core_type, trace.task_id, "ExecutionStartToFirstReady", execution_start_cycles,
-                first_ready_cycles
-            );
-            emit(
-                trace.worker_id, trace_core_type, trace.task_id, "FirstReadyToReadyClaim", first_ready_cycles,
-                std::max(first_ready_cycles, trace.claim_start_cycles)
-            );
+            if (trace.claim_start_cycles != 0) {
+                emit(
+                    trace.worker_id, trace_core_type, trace.task_id, "DescriptorReadyToReadyClaim",
+                    trace.descriptor_cache_observed_cycles, trace.claim_start_cycles
+                );
+                emit(
+                    trace.worker_id, trace_core_type, trace.task_id, "RegisterReleaseToReadyClaim",
+                    trace.register_release_cycles, trace.claim_start_cycles
+                );
+            }
+            if (trace.claim_end_cycles != 0) {
+                emit(
+                    trace.worker_id, trace_core_type, trace.task_id, "ReadyClaimToRegisterRelease",
+                    trace.claim_end_cycles, trace.register_release_cycles
+                );
+            }
         }
         emit(
             trace.worker_id, trace_core_type, trace.task_id, "Payload", trace.ready_observe_cycles,
@@ -816,11 +819,7 @@ bool append_aicore_scheduler_trace(
     const uint64_t supervisor_thread =
         runtime->aicpu_thread_num > 0 ? static_cast<uint64_t>(runtime->aicpu_thread_num - 1) : 0;
     emit_aicpu(
-        UINT64_MAX, supervisor_thread, UINT64_MAX, "WaitBootstrap", run_control->completion_wait_start_cycles,
-        run_control->bootstrap_complete_cycles
-    );
-    emit_aicpu(
-        UINT64_MAX, supervisor_thread, UINT64_MAX, "WaitResolved", run_control->bootstrap_complete_cycles,
+        UINT64_MAX, supervisor_thread, UINT64_MAX, "WaitResolved", run_control->completion_wait_start_cycles,
         run_control->all_tasks_resolved_cycles, run_control->completion_poll_count, run_control->completion_poll_cycles,
         run_control->error_poll_count
     );
@@ -831,8 +830,28 @@ bool append_aicore_scheduler_trace(
     for (int32_t worker = 0; worker < runtime->worker_count; ++worker) {
         const AicpuCoreLifecycleTraceV1 &trace = lifecycle_traces[worker];
         emit_aicpu(
-            trace.worker_id, trace.aicpu_thread_id, trace.core_type, "RegisterRelease", trace.register_release_cycles,
-            trace.register_release_cycles
+            trace.worker_id, trace.aicpu_thread_id, trace.core_type, "HandshakeObserveToPartitionComplete",
+            trace.handshake_observed_cycles, trace.handshake_partition_complete_cycles
+        );
+        emit_aicpu(
+            trace.worker_id, trace.aicpu_thread_id, trace.core_type, "WaitHandshakeBarrier",
+            trace.handshake_partition_complete_cycles, trace.config_start_cycles
+        );
+        emit_aicpu(
+            trace.worker_id, trace.aicpu_thread_id, trace.core_type, "TopologyConfig", trace.config_start_cycles,
+            trace.topology_complete_cycles
+        );
+        emit_aicpu(
+            trace.worker_id, trace.aicpu_thread_id, trace.core_type, "ContextPublish",
+            trace.topology_complete_cycles, trace.context_publish_complete_cycles
+        );
+        emit_aicpu(
+            trace.worker_id, trace.aicpu_thread_id, trace.core_type, "WaitBootstrap",
+            trace.bootstrap_wait_start_cycles, trace.bootstrap_complete_cycles
+        );
+        emit_aicpu(
+            trace.worker_id, trace.aicpu_thread_id, trace.core_type, "BootstrapCompleteToRegisterRelease",
+            trace.bootstrap_complete_cycles, trace.register_release_cycles
         );
         emit_aicpu(
             trace.worker_id, trace.aicpu_thread_id, trace.core_type, "ExitSignalToAck", trace.exit_signal_cycles,
@@ -1833,6 +1852,8 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
                 control->expected_task_count != static_cast<uint64_t>(runtime->host_total_tasks) ||
                 worker_executed != executable_subtask_count || bootstrap_tasks != executable_task_count ||
                 active_workers != control->active_worker_count ||
+                control->bootstrap_scan_arrived_count != control->resolver_count ||
+                control->bootstrap_scan_complete == 0 ||
                 control->bootstrap_arrived_count != control->resolver_count ||
                 control->bootstrap_complete == 0 || control->resolved_task_count != executable_task_count ||
                 wake_closes != executable_task_count || wake_registers != wake_migrations ||

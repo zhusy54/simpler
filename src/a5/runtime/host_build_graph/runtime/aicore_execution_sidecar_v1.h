@@ -313,7 +313,9 @@ struct alignas(128) AicoreRunControlV1 {
     uint64_t completion_poll_count;
     uint64_t completion_poll_cycles;
     uint64_t error_poll_count;
-    uint64_t lifecycle_reserved[5];
+    volatile uint64_t bootstrap_scan_arrived_count;
+    volatile uint64_t bootstrap_scan_complete;
+    uint64_t lifecycle_reserved[3];
 
     volatile uint64_t error_claimed;
     volatile uint64_t scheduler_error;
@@ -332,10 +334,17 @@ struct alignas(128) AicpuCoreLifecycleTraceV1 {
     uint64_t aicpu_thread_id;
     uint64_t core_type;
     uint64_t physical_core_id;
+    uint64_t handshake_observed_cycles;
+    uint64_t handshake_partition_complete_cycles;
+    uint64_t config_start_cycles;
+    uint64_t topology_complete_cycles;
+    uint64_t context_publish_complete_cycles;
+    uint64_t bootstrap_wait_start_cycles;
+    uint64_t bootstrap_complete_cycles;
     uint64_t register_release_cycles;
     uint64_t exit_signal_cycles;
     uint64_t exit_ack_cycles;
-    uint64_t reserved[9];
+    uint64_t reserved[2];
 };
 
 struct alignas(128) AicoreWorkerContextV1 {

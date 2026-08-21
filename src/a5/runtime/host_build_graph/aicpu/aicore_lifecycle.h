@@ -24,6 +24,8 @@ public:
     int32_t pre_handshake_init(Runtime *runtime, int32_t aicpu_thread_num, uint64_t regs_base);
     void handshake_partition(Runtime *runtime, int32_t tidx, int32_t nthreads);
     int32_t post_handshake_init(Runtime *runtime);
+    void publish_context_partition(Runtime *runtime, int32_t thread_idx);
+    int32_t wait_bootstrap_complete(Runtime *runtime);
     int32_t release_partition(int32_t thread_idx, bool start_execution);
     void signal_shutdown_partition(int32_t thread_idx);
     int32_t finish_shutdown_partition(int32_t thread_idx, Runtime *runtime);
@@ -37,6 +39,8 @@ private:
         uint32_t physical_core_id;
         CoreType core_type;
         AicpuCoreLifecycleTraceV1 *trace;
+        uint64_t handshake_observed_cycles;
+        uint64_t handshake_partition_complete_cycles;
     };
 
     CoreState cores_[kMaxWorkers]{};
