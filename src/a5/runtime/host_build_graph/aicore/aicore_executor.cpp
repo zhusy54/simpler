@@ -347,8 +347,10 @@ __aicore__ bool run_ready_dispatch_loop(
         bool scheduler_progress = false;
         if (resolver_worker) {
             uint64_t operation_start = trace_enabled ? get_sys_cnt_aicore() : 0;
+            uint64_t direct_refilled_slot_mask = 0;
             const bool completion_progress = aicore_service_cluster_completions_v1(
-                graph, sidecar_base, context, run_control, &stats->wake, &stats->ready, &stats->completion
+                graph, sidecar_base, context, run_control, &stats->wake, &stats->ready, &stats->completion,
+                ready_victim_cursors, trace_enabled, &direct_refilled_slot_mask
             );
             if (trace_enabled) inter_task_timing.completion_service_cycles += get_sys_cnt_aicore() - operation_start;
             scheduler_progress = completion_progress;
@@ -360,7 +362,7 @@ __aicore__ bool run_ready_dispatch_loop(
             operation_start = trace_enabled ? get_sys_cnt_aicore() : 0;
             scheduler_progress = aicore_fill_cluster_normal_slots_v1(
                                      graph, sidecar_base, context, run_control, ready_victim_cursors, &stats->ready,
-                                     trace_enabled
+                                     trace_enabled, direct_refilled_slot_mask
                                  ) ||
                                  scheduler_progress;
             if (trace_enabled)

@@ -907,6 +907,62 @@ TEST(AicoreClusterCompletionV1, SpscGenerationCompletesNormalTask) {
     EXPECT_EQ(storage.run_control->resolved_task_count, 1u);
 }
 
+TEST(AicoreClusterCompletionV1, DirectlyRefillsCompletedSlotWhenReadyTaskExists) {
+    FixtureStorage storage(2, 3);
+    GraphBuffer graph(2);
+    graph.executable(0, 0);
+    graph.executable(1, 0);
+    storage.contexts[0].core_type = static_cast<int32_t>(AicoreRootCoreTypeV0::AIC);
+    AicoreWorkerContextV1 &resolver = storage.contexts[1];
+    resolver.is_resolver = 1;
+    resolver.resolver_index = 0;
+    resolver.resolver_count = 1;
+    resolver.inbox_index = 0;
+    resolver.cluster_worker_ids[0] = 0;
+    resolver.cluster_worker_ids[1] = 1;
+    resolver.cluster_worker_ids[2] = 2;
+    auto *callables =
+        aicore_sidecar_at_v1<uint64_t>(storage.sidecar->base(), storage.layout.callable_addresses_offset);
+    callables[1] = 0x1000;
+
+    auto *slot = aicore_dispatch_slot_at_v1(storage.sidecar->base(), &resolver, 0, 0);
+    aicore_initialize_free_slot_v1(slot);
+    const uint32_t completed_generation = slot->generation;
+    slot->task_id = 0;
+    slot->subtask_slot = 0;
+    slot->gang = 0;
+    aicore_gm_store_v0(
+        slot->publication, aicore_dispatch_publication_v1(completed_generation, AicoreDispatchPublicationV1::READY)
+    );
+    auto *completion_line = aicore_completion_inbox_at_v1(storage.sidecar->base(), &resolver, 0);
+    completion_line->completed_generations[0] = completed_generation;
+    auto *completed_control = aicore_task_control_at_v1(storage.sidecar->base(), &resolver, 0);
+    completed_control->state = static_cast<int64_t>(AicoreTaskStateV1::READY);
+    auto *ready_control = aicore_task_control_at_v1(storage.sidecar->base(), &resolver, 1);
+    ready_control->state = static_cast<int64_t>(AicoreTaskStateV1::READY);
+    AicoreReadyBatchV1 batch{};
+    AicoreReadyStatsV1 ready_stats{};
+    ASSERT_TRUE(aicore_ready_batch_append_v1(storage.sidecar->base(), &resolver, 1, &batch, &ready_stats));
+    ASSERT_TRUE(aicore_ready_batch_push_v1(storage.sidecar->base(), &resolver, 0, 0, &batch, &ready_stats));
+
+    AicoreWakeStatsV1 wake_stats{};
+    AicoreCompletionStatsV1 completion_stats{};
+    uint64_t ready_victim_cursors[AICORE_CORE_TYPE_COUNT_V1]{};
+    uint64_t direct_refilled_slot_mask = 0;
+    ASSERT_TRUE(aicore_service_cluster_completions_v1(
+        graph.graph(), storage.sidecar->base(), &resolver, storage.run_control, &wake_stats, &ready_stats,
+        &completion_stats, ready_victim_cursors, false, &direct_refilled_slot_mask
+    ));
+
+    EXPECT_EQ(completion_line->completed_generations[0], 0u);
+    EXPECT_EQ(slot->task_id, 1);
+    EXPECT_EQ(slot->generation, completed_generation + 1);
+    EXPECT_EQ(aicore_dispatch_state_v1(slot->publication), AicoreDispatchPublicationV1::READY);
+    EXPECT_EQ(completed_control->state, static_cast<int64_t>(AicoreTaskStateV1::DONE));
+    EXPECT_EQ(storage.run_control->resolved_task_count, 1u);
+    EXPECT_EQ(direct_refilled_slot_mask, 1u);
+}
+
 TEST(AicoreSyncStartV1, DrainsStagesAndReleasesBeforeCompletion) {
     FixtureStorage storage(1, 3);
     GraphBuffer graph(1);
