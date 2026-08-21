@@ -711,7 +711,7 @@ TEST(AicoreCompletionInboxV1, ConcurrentPublishAndDetachNeverExposeUnpublishedLi
     };
     auto consume = [&] {
         while (producers_done.load(std::memory_order_acquire) != kProducerCount ||
-               aicore_gm_load_v0(inbox->head) != AICORE_INBOX_EMPTY_V1) {
+               aicore_gm_query_v0(inbox->head) != AICORE_INBOX_EMPTY_V1) {
             int64_t task = aicore_gm_exchange_v0(inbox->head, AICORE_INBOX_EMPTY_V1);
             if (task == AICORE_INBOX_EMPTY_V1) {
                 std::this_thread::yield();

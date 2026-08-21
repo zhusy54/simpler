@@ -119,23 +119,24 @@ inline __aicore__ void aicore_observe_dispatch_payload_v1(__gm__ PTO2DispatchPay
     aicore_observe_dispatch_payload_barrier_v1();
 }
 
-// These wrappers are a runtime-local subset of simpler-dist FDWIC's validated
-// A5 raw-GM atomic protocol. They intentionally expose the observed old value
-// returned by the hardware instead of emulating std::atomic's API.
-inline __aicore__ int64_t aicore_gm_load_v0(__gm__ volatile int64_t &value, int order = __ATOMIC_ACQUIRE) {
+// A5 ld_dev bypasses the scalar DCache. It is only an observation/prefilter
+// primitive; ownership changes use the CAS/exchange/fetch wrappers below.
+// Publication-protected metadata is invalidated separately before consumption.
+inline __aicore__ int64_t aicore_gm_query_v0(__gm__ volatile int64_t &value, int order = __ATOMIC_ACQUIRE) {
 #if defined(__CCE_AICORE__)
     (void)order;
-    constexpr int64_t identity = (-9223372036854775807LL - 1LL);
-    return atomicMax(const_cast<__gm__ int64_t *>(&value), identity);
+    __gm__ int64_t *signed_address = const_cast<__gm__ int64_t *>(&value);
+    __gm__ uint64_t *address = reinterpret_cast<__gm__ uint64_t *>(signed_address);
+    return static_cast<int64_t>(static_cast<uint64_t>(__builtin_cce_ld_dev(address, 0)));
 #else
     return __atomic_load_n(&value, order);
 #endif
 }
 
-inline __aicore__ uint64_t aicore_gm_load_v0(__gm__ volatile uint64_t &value, int order = __ATOMIC_ACQUIRE) {
+inline __aicore__ uint64_t aicore_gm_query_v0(__gm__ volatile uint64_t &value, int order = __ATOMIC_ACQUIRE) {
 #if defined(__CCE_AICORE__)
     (void)order;
-    return atomicAdd(const_cast<__gm__ uint64_t *>(&value), UINT64_C(0));
+    return static_cast<uint64_t>(__builtin_cce_ld_dev(const_cast<__gm__ uint64_t *>(&value), 0));
 #else
     return __atomic_load_n(&value, order);
 #endif
@@ -229,7 +230,7 @@ inline __aicore__ uint64_t
 aicore_gm_fetch_or_v0(__gm__ volatile uint64_t &value, uint64_t bits, int order = __ATOMIC_ACQ_REL) {
 #if defined(__CCE_AICORE__)
     (void)order;
-    uint64_t observed = aicore_gm_load_v0(value);
+    uint64_t observed = aicore_gm_query_v0(value);
     while ((observed & bits) != bits) {
         uint64_t actual = aicore_gm_compare_exchange_v0(value, observed, observed | bits);
         if (actual == observed) break;
@@ -245,7 +246,7 @@ inline __aicore__ uint64_t
 aicore_gm_fetch_and_v0(__gm__ volatile uint64_t &value, uint64_t bits, int order = __ATOMIC_ACQ_REL) {
 #if defined(__CCE_AICORE__)
     (void)order;
-    uint64_t observed = aicore_gm_load_v0(value);
+    uint64_t observed = aicore_gm_query_v0(value);
     while ((observed & bits) != observed) {
         uint64_t actual = aicore_gm_compare_exchange_v0(value, observed, observed & bits);
         if (actual == observed) break;

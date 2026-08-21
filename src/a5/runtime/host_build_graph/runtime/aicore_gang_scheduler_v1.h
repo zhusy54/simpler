@@ -238,7 +238,7 @@ inline __aicore__ int32_t aicore_gang_find_free_pending_slot_v1(
     for (uint32_t pending_slot = 0; pending_slot < AICORE_PENDING_SLOT_COUNT_V1; ++pending_slot) {
         __gm__ AicoreDispatchSlotV1 *slot =
             aicore_dispatch_slot_at_v1(sidecar_base, resolver, worker_id, pending_slot);
-        if (aicore_dispatch_state_v1(aicore_gm_load_v0(slot->publication)) == AicoreDispatchPublicationV1::FREE)
+        if (aicore_dispatch_state_v1(aicore_gm_query_v0(slot->publication)) == AicoreDispatchPublicationV1::FREE)
             return static_cast<int32_t>(pending_slot);
     }
     return -1;
@@ -253,7 +253,7 @@ inline __aicore__ bool aicore_gang_fill_single_v1(
     if (pending_slot < 0) return false;
     __gm__ AicoreDispatchSlotV1 *slot =
         aicore_dispatch_slot_at_v1(sidecar_base, resolver, worker_id, static_cast<uint32_t>(pending_slot));
-    const uint32_t generation = aicore_dispatch_generation_v1(aicore_gm_load_v0(slot->publication));
+    const uint32_t generation = aicore_dispatch_generation_v1(aicore_gm_query_v0(slot->publication));
     aicore_gm_store_v0(
         slot->publication, aicore_dispatch_publication_v1(generation, AicoreDispatchPublicationV1::FILLING)
     );
@@ -281,7 +281,7 @@ inline __aicore__ bool aicore_gang_fill_mix_block_v1(
             const uint64_t worker_id = resolver->cluster_worker_ids[subtask_slot];
             __gm__ AicoreDispatchSlotV1 *slot =
                 aicore_dispatch_slot_at_v1(sidecar_base, resolver, worker_id, candidate);
-            if (aicore_dispatch_state_v1(aicore_gm_load_v0(slot->publication)) != AicoreDispatchPublicationV1::FREE) {
+            if (aicore_dispatch_state_v1(aicore_gm_query_v0(slot->publication)) != AicoreDispatchPublicationV1::FREE) {
                 all_free = false;
                 break;
             }
@@ -297,7 +297,7 @@ inline __aicore__ bool aicore_gang_fill_mix_block_v1(
         const uint64_t worker_id = resolver->cluster_worker_ids[subtask_slot];
         __gm__ AicoreDispatchSlotV1 *slot =
             aicore_dispatch_slot_at_v1(sidecar_base, resolver, worker_id, static_cast<uint32_t>(pending_slot));
-        const uint32_t generation = aicore_dispatch_generation_v1(aicore_gm_load_v0(slot->publication));
+        const uint32_t generation = aicore_dispatch_generation_v1(aicore_gm_query_v0(slot->publication));
         aicore_gm_store_v0(
             slot->publication, aicore_dispatch_publication_v1(generation, AicoreDispatchPublicationV1::FILLING)
         );
@@ -342,7 +342,7 @@ inline __aicore__ bool aicore_gang_local_slots_drained_v1(
             __gm__ AicoreDispatchSlotV1 *slot = aicore_dispatch_slot_at_v1(
                 sidecar_base, resolver, resolver->cluster_worker_ids[cluster_lane], pending_slot
             );
-            if (aicore_dispatch_state_v1(aicore_gm_load_v0(slot->publication)) != AicoreDispatchPublicationV1::FREE)
+            if (aicore_dispatch_state_v1(aicore_gm_query_v0(slot->publication)) != AicoreDispatchPublicationV1::FREE)
                 return false;
         }
     }
@@ -399,7 +399,7 @@ inline __aicore__ void aicore_gang_release_local_slots_v1(
             __gm__ AicoreDispatchSlotV1 *slot = aicore_dispatch_slot_at_v1(
                 sidecar_base, resolver, resolver->cluster_worker_ids[cluster_lane], pending_slot
             );
-            const uint64_t publication = aicore_gm_load_v0(slot->publication);
+            const uint64_t publication = aicore_gm_query_v0(slot->publication);
             if (aicore_dispatch_state_v1(publication) != AicoreDispatchPublicationV1::GATED) continue;
             aicore_observe_cache_line_v0(slot);
             if (slot->cohort_index != cohort_index || slot->cohort_generation != generation) continue;
@@ -421,7 +421,7 @@ inline __aicore__ int64_t aicore_gang_select_ready_task_v1(
             continue;
         __gm__ AicoreTaskControlV1 *control =
             aicore_task_control_at_v1(sidecar_base, resolver, static_cast<int64_t>(task_id));
-        if (aicore_gm_load_v0(control->state) == static_cast<int64_t>(AicoreTaskStateV1::READY))
+        if (aicore_gm_query_v0(control->state) == static_cast<int64_t>(AicoreTaskStateV1::READY))
             return static_cast<int64_t>(task_id);
     }
     return AICORE_TASK_ID_INVALID_V1;
@@ -813,11 +813,11 @@ inline __aicore__ bool aicore_service_cluster_completions_v1(
             aicore_completion_inbox_at_v1(sidecar_base, resolver, worker_id);
         for (uint32_t pending_slot = 0; pending_slot < AICORE_PENDING_SLOT_COUNT_V1; ++pending_slot) {
             const uint64_t completed_generation =
-                aicore_gm_load_v0(completion_line->completed_generations[pending_slot]);
+                aicore_gm_query_v0(completion_line->completed_generations[pending_slot]);
             if (completed_generation == 0) continue;
             __gm__ AicoreDispatchSlotV1 *slot =
                 aicore_dispatch_slot_at_v1(sidecar_base, resolver, worker_id, pending_slot);
-            const uint64_t publication = aicore_gm_load_v0(slot->publication);
+            const uint64_t publication = aicore_gm_query_v0(slot->publication);
             if (aicore_dispatch_state_v1(publication) != AicoreDispatchPublicationV1::READY ||
                 aicore_dispatch_generation_v1(publication) != completed_generation) {
                 aicore_record_scheduler_error_v1(
@@ -890,7 +890,7 @@ inline __aicore__ bool aicore_fill_cluster_normal_slots_v1(
         for (uint32_t pending_slot = 0; pending_slot < AICORE_PENDING_SLOT_COUNT_V1; ++pending_slot) {
             __gm__ AicoreDispatchSlotV1 *slot =
                 aicore_dispatch_slot_at_v1(sidecar_base, resolver, worker_id, pending_slot);
-            const uint64_t publication = aicore_gm_load_v0(slot->publication);
+            const uint64_t publication = aicore_gm_query_v0(slot->publication);
             if (aicore_dispatch_state_v1(publication) != AicoreDispatchPublicationV1::FREE) continue;
             AicoreReadyClaimV1 ready{};
             if (!aicore_claim_ready_for_slot_v1(

@@ -263,8 +263,8 @@ __aicore__ bool bootstrap_ready_graph(
         aicore_gm_publish_v0(run_control->bootstrap_complete, UINT64_C(1));
     } else {
         uint32_t barrier_backoff = kInitialBackoffIterations;
-        while (aicore_gm_load_v0(run_control->bootstrap_complete) == 0) {
-            if (aicore_gm_load_v0(run_control->scheduler_error) != 0) return false;
+        while (aicore_gm_query_v0(run_control->bootstrap_complete) == 0) {
+            if (aicore_gm_query_v0(run_control->scheduler_error) != 0) return false;
             local_backoff(barrier_backoff);
             if (barrier_backoff < kMaximumBackoffIterations) barrier_backoff <<= 1;
         }
@@ -299,7 +299,7 @@ __aicore__ bool run_ready_dispatch_loop(
     bool trace_enabled, uint64_t aicore_entry_cycles, uint64_t handshake_publish_cycles,
     uint64_t register_release_cycles, uint64_t descriptor_cache_observed_cycles
 ) {
-    uint64_t resolver_count = aicore_gm_load_v0(run_control->resolver_count);
+    uint64_t resolver_count = aicore_gm_query_v0(run_control->resolver_count);
     bool resolver_worker = context->is_resolver != 0;
     if (resolver_count == 0) return false;
     uint64_t ready_victim_cursors[AICORE_CORE_TYPE_COUNT_V1]{
@@ -327,7 +327,7 @@ __aicore__ bool run_ready_dispatch_loop(
         }
         if (++scheduler_error_poll_count == kSchedulerErrorPollInterval) {
             scheduler_error_poll_count = 0;
-            if (aicore_gm_load_v0(run_control->scheduler_error) != 0) return false;
+            if (aicore_gm_query_v0(run_control->scheduler_error) != 0) return false;
         }
 
         bool scheduler_progress = false;
@@ -354,7 +354,7 @@ __aicore__ bool run_ready_dispatch_loop(
         }
 
         if (!bootstrap_observed) {
-            if (aicore_gm_load_v0(context->bootstrap_done) == 0) {
+            if (aicore_gm_query_v0(context->bootstrap_done) == 0) {
                 ++stats->idle_iteration_count;
                 local_backoff(backoff_iterations);
                 if (backoff_iterations < kMaximumBackoffIterations) backoff_iterations <<= 1;
@@ -370,7 +370,7 @@ __aicore__ bool run_ready_dispatch_loop(
             uint32_t slot_index = (scan_start + offset) % AICORE_PENDING_SLOT_COUNT_V1;
             __gm__ AicoreDispatchSlotV1 *slot =
                 aicore_dispatch_slot_at_v1(sidecar_base, context, context->worker_index, slot_index);
-            uint64_t publication = aicore_gm_load_v0(slot->publication);
+            uint64_t publication = aicore_gm_query_v0(slot->publication);
             ++stats->task_state_poll_count;
             if (publication != seen_publication[slot_index] &&
                 aicore_dispatch_state_v1(publication) == AicoreDispatchPublicationV1::READY) {
