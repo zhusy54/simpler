@@ -490,6 +490,17 @@ struct alignas(128) AicoreTaskTraceCellV1 {
     uint64_t inter_task_dispatch_prepare_cycles[AICORE_CORE_TYPE_COUNT_V1];
     uint64_t inter_task_dispatch_materialize_cycles[AICORE_CORE_TYPE_COUNT_V1];
     uint64_t inter_task_dispatch_publish_cycles[AICORE_CORE_TYPE_COUNT_V1];
+
+    uint64_t resolver_completion_worker_id;
+    uint64_t resolver_completion_consume_start_cycles;
+    uint64_t resolver_completion_resolve_start_cycles;
+    uint64_t resolver_completion_refill_start_cycles;
+    uint64_t resolver_completion_refill_end_cycles;
+    uint64_t resolver_completion_end_cycles;
+    uint64_t resolver_dispatch_prepare_start_cycles;
+    uint64_t resolver_dispatch_materialize_start_cycles;
+    uint64_t resolver_dispatch_publish_start_cycles;
+    uint64_t resolver_dispatch_end_cycles;
 };
 
 struct AicoreExecutionSidecarLayoutV1 {
@@ -565,7 +576,7 @@ static_assert(offsetof(AicoreWorkerContextV1, gang_coordinator_offset) == 256, "
 static_assert(offsetof(AicoreWorkerContextV1, bootstrap_task_count) == 384, "worker stats offset changed");
 static_assert(offsetof(AicoreWorkerContextV1, wake_cas_retry_count) == 512, "wake stats offset changed");
 static_assert(offsetof(AicoreWorkerContextV1, completion_enqueue_cycles) == 640, "termination stats offset changed");
-static_assert(sizeof(AicoreTaskTraceCellV1) == 384, "task trace layout changed");
+static_assert(sizeof(AicoreTaskTraceCellV1) == 512, "task trace layout changed");
 
 #if !defined(__CCE_AICORE__)
 #include <type_traits>

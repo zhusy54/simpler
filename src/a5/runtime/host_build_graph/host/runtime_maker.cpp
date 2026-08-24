@@ -564,6 +564,24 @@ bool append_aicore_scheduler_trace(
             trace.claim_worker_id, claim_core_type, trace.task_id, claim_phase, trace.claim_start_cycles,
             trace.claim_end_cycles
         );
+        if (trace.claim_worker_id < static_cast<uint64_t>(runtime->worker_count) &&
+            trace.resolver_dispatch_prepare_start_cycles != 0 &&
+            trace.resolver_dispatch_materialize_start_cycles >= trace.resolver_dispatch_prepare_start_cycles &&
+            trace.resolver_dispatch_publish_start_cycles >= trace.resolver_dispatch_materialize_start_cycles &&
+            trace.resolver_dispatch_end_cycles >= trace.resolver_dispatch_publish_start_cycles) {
+            emit(
+                trace.claim_worker_id, claim_core_type, trace.task_id, "ResolverDispatchPrepare",
+                trace.resolver_dispatch_prepare_start_cycles, trace.resolver_dispatch_materialize_start_cycles
+            );
+            emit(
+                trace.claim_worker_id, claim_core_type, trace.task_id, "ResolverDispatchMaterialize",
+                trace.resolver_dispatch_materialize_start_cycles, trace.resolver_dispatch_publish_start_cycles
+            );
+            emit(
+                trace.claim_worker_id, claim_core_type, trace.task_id, "ResolverDispatchPublish",
+                trace.resolver_dispatch_publish_start_cycles, trace.resolver_dispatch_end_cycles
+            );
+        }
         if (trace.aicore_entry_cycles != 0) {
             emit(
                 trace.worker_id, trace_core_type, trace.task_id, "AICoreEntryToHandshake", trace.aicore_entry_cycles,
@@ -622,6 +640,31 @@ bool append_aicore_scheduler_trace(
             trace.ready_observe_cycles
         );
         const AicoreTaskControlV1 &control = task_controls[task_id];
+        if (trace.resolver_completion_worker_id < static_cast<uint64_t>(runtime->worker_count) &&
+            trace.resolver_completion_consume_start_cycles != 0 &&
+            trace.resolver_completion_resolve_start_cycles >= trace.resolver_completion_consume_start_cycles &&
+            trace.resolver_completion_refill_start_cycles >= trace.resolver_completion_resolve_start_cycles &&
+            trace.resolver_completion_refill_end_cycles >= trace.resolver_completion_refill_start_cycles &&
+            trace.resolver_completion_end_cycles >= trace.resolver_completion_refill_end_cycles) {
+            const uint64_t resolver_worker_id = trace.resolver_completion_worker_id;
+            const uint64_t resolver_core_type = static_cast<uint64_t>(contexts[resolver_worker_id].core_type);
+            emit(
+                resolver_worker_id, resolver_core_type, trace.task_id, "ResolverCompletionConsume",
+                trace.resolver_completion_consume_start_cycles, trace.resolver_completion_resolve_start_cycles
+            );
+            emit(
+                resolver_worker_id, resolver_core_type, trace.task_id, "ResolverCompletionResolve",
+                trace.resolver_completion_resolve_start_cycles, trace.resolver_completion_refill_start_cycles
+            );
+            emit(
+                resolver_worker_id, resolver_core_type, trace.task_id, "ResolverCompletionRefill",
+                trace.resolver_completion_refill_start_cycles, trace.resolver_completion_refill_end_cycles
+            );
+            emit(
+                resolver_worker_id, resolver_core_type, trace.task_id, "ResolverCompletionFinalize",
+                trace.resolver_completion_refill_end_cycles, trace.resolver_completion_end_cycles
+            );
+        }
         if (trace.completion_prepare_start_cycles != 0 &&
             trace.refill_resolver_worker_id < static_cast<uint64_t>(runtime->worker_count)) {
             const uint64_t resolver_worker_id = trace.refill_resolver_worker_id;

@@ -417,6 +417,38 @@ def test_hbg_startup_phase_separates_execution_start_from_first_task_claim(tmp_p
     ]
 
 
+def test_hbg_resolver_timeline_phases_keep_distinct_colors(tmp_path):
+    output_path = tmp_path / "trace.json"
+    colors = {
+        "ResolverCompletionConsume": "thread_state_iowait",
+        "ResolverCompletionResolve": "cq_build_running",
+        "ResolverCompletionRefill": "thread_state_runnable",
+        "ResolverCompletionFinalize": "cq_build_passed",
+        "ResolverDispatchPrepare": "thread_state_running",
+        "ResolverDispatchMaterialize": "cq_build_running",
+        "ResolverDispatchPublish": "cq_build_passed",
+    }
+    phases = [
+        {
+            "core_id": 1,
+            "core_type": "aiv",
+            "task_id": 7,
+            "phase": phase,
+            "start_time_us": float(index),
+            "end_time_us": float(index + 1),
+            "duration_us": 1.0,
+        }
+        for index, phase in enumerate(colors)
+    ]
+
+    sc.generate_chrome_trace_json([], str(output_path), aicore_scheduler_phases=phases)
+
+    events = json.loads(output_path.read_text())["traceEvents"]
+    for phase, color in colors.items():
+        event = next(event for event in events if event.get("name") == f"{phase}(t7)")
+        assert event["cname"] == color
+
+
 def test_hbg_detailed_startup_phases_are_not_resplit(tmp_path):
     input_path = tmp_path / "chip_swimlane_records.json"
     input_path.write_text(

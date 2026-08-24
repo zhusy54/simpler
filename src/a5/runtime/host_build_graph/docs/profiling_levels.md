@@ -36,7 +36,9 @@ The AICore phases are:
   `InterTask{ReadyPoll,Backoff,Other}`
   breakdown;
 - execution: `Payload`, `Kernel`, `CompletionEnqueue`, `PostCompletion`;
-- resolution: `CompletionBatchPrepare`, `CompletionBatchClaim`, `WakeResolve`;
+- resolution: `CompletionBatchPrepare`, `CompletionBatchClaim`, `WakeResolve`,
+  `ResolverCompletion{Consume,Resolve,Refill,Finalize}`, and
+  `ResolverDispatch{Prepare,Materialize,Publish}`;
 - teardown: `TraceCommit`, `WaitForExit`, `FinalStatsPublish`,
   `ExitAckPublish`, `Drain`.
 
@@ -62,6 +64,15 @@ slot polling, and idle backoff. The residual `InterTaskOther` contains loop
 control and instrumentation overhead.
 Old traces without these counters retain the aggregate `InterTaskSchedule`.
 
+The `ResolverCompletion*` and `ResolverDispatch*` phases retain their actual
+device timestamps and therefore appear at the precise position between
+`ReadyPop`/`ReadySteal` claims. The `InterTask*` phases are accumulated and
+rendered contiguously before the Resolver's next task; they account for failed
+probes and idle iterations that cannot be attached to a successfully claimed
+or completed task, but their display order is not an operation timeline.
+Gang participant completions remain in `InterTaskGangService`; a gang task has
+one task-indexed trace cell and cannot retain every participant's exact span.
+
 `CompletionEnqueue` records include `completion_id` and `inbox_index`. The ID
 is based on per-worker execution order rather than graph task ID, so Ready
 partitioning cannot force the corresponding completions back into the same
@@ -78,6 +89,6 @@ enqueue/batch/resolve/steal and link waits; wake registration/migration; and
 READY-to-kernel/completion-resolution lag. These are diagnostic measurements,
 not performance merge gates.
 
-Each task has one 256-byte trace cell indexed by task ID. Trace writes occur
+Each task has one 512-byte trace cell indexed by task ID. Trace writes occur
 only at level 1. The common collector publishes its JSON first; HBG inserts the
 scheduler arrays through a temporary file and atomic rename.

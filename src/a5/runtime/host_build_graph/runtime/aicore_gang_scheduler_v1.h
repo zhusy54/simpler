@@ -801,7 +801,9 @@ inline __aicore__ bool aicore_service_cluster_completions_v1(
                 );
                 return false;
             }
-            uint64_t operation_start = timing == nullptr ? 0 : aicore_scheduler_cycles_v1();
+            const bool record_timeline = trace_enabled || timing != nullptr;
+            uint64_t operation_start = record_timeline ? aicore_scheduler_cycles_v1() : 0;
+            const uint64_t completion_start = operation_start;
             aicore_observe_cache_line_v0(slot);
             const int64_t task_id = slot->task_id;
             const bool gang = slot->gang != 0;
@@ -809,13 +811,16 @@ inline __aicore__ bool aicore_service_cluster_completions_v1(
             const uint32_t cohort_index = slot->cohort_index;
             const uint32_t cohort_generation = slot->cohort_generation;
             aicore_gm_store_v0(completion_line->completed_generations[pending_slot], UINT64_C(0));
-            uint64_t operation_end = timing == nullptr ? 0 : aicore_scheduler_cycles_v1();
+            uint64_t operation_end = record_timeline ? aicore_scheduler_cycles_v1() : 0;
             if (timing != nullptr) timing->consume_cycles += operation_end - operation_start;
+            const uint64_t resolve_start_cycles = operation_end;
             bool direct_refilled = false;
             operation_start = operation_end;
             uint64_t ready_publish_cycles = 0;
             uint64_t refill_cycles = 0;
             uint64_t finalize_cycles = 0;
+            uint64_t refill_start_cycles = 0;
+            uint64_t refill_end_cycles = 0;
             if (gang) {
                 if (cohort_index >= AICORE_GANG_COHORT_COUNT_V1) return false;
                 __gm__ AicoreGangParticipantV1 *participant =
@@ -846,7 +851,7 @@ inline __aicore__ bool aicore_service_cluster_completions_v1(
                     finalize_cycles = aicore_scheduler_cycles_v1() - resolved_count_start;
                     timing->finalize_cycles += finalize_cycles;
                 }
-                uint64_t refill_start = timing == nullptr ? 0 : aicore_scheduler_cycles_v1();
+                refill_start_cycles = record_timeline ? aicore_scheduler_cycles_v1() : 0;
                 if (ready_victim_cursors != nullptr) {
                     __gm__ AicoreGangCoordinatorV1 *coordinator = aicore_gang_coordinator_at_v1(sidecar_base, resolver);
                     bool normal_fill_allowed = coordinator->gang_task_count == 0;
@@ -877,12 +882,15 @@ inline __aicore__ bool aicore_service_cluster_completions_v1(
                         }
                     }
                 }
+                refill_end_cycles = record_timeline ? aicore_scheduler_cycles_v1() : 0;
                 if (timing != nullptr) {
-                    refill_cycles = aicore_scheduler_cycles_v1() - refill_start;
+                    refill_cycles = refill_end_cycles - refill_start_cycles;
                     timing->refill_cycles += refill_cycles;
                 }
             }
-            operation_end = timing == nullptr ? 0 : aicore_scheduler_cycles_v1();
+            operation_end = record_timeline ? aicore_scheduler_cycles_v1() : 0;
+            if (refill_start_cycles == 0) refill_start_cycles = operation_end;
+            if (refill_end_cycles == 0) refill_end_cycles = operation_end;
             if (timing != nullptr) {
                 uint64_t resolve_total = operation_end - operation_start;
                 uint64_t excluded = ready_publish_cycles + refill_cycles + finalize_cycles;
@@ -897,7 +905,21 @@ inline __aicore__ bool aicore_service_cluster_completions_v1(
                     aicore_dispatch_publication_v1(slot->generation, AicoreDispatchPublicationV1::FREE)
                 );
             }
-            if (timing != nullptr) timing->finalize_cycles += aicore_scheduler_cycles_v1() - operation_start;
+            const uint64_t completion_end = record_timeline ? aicore_scheduler_cycles_v1() : 0;
+            if (timing != nullptr) timing->finalize_cycles += completion_end - operation_start;
+            if (trace_enabled && !gang) {
+                __gm__ AicoreTaskTraceCellV1 *cells =
+                    aicore_sidecar_at_v1<AicoreTaskTraceCellV1>(sidecar_base, resolver->trace_cells_offset);
+                __gm__ AicoreTaskTraceCellV1 *trace = &cells[task_id];
+                aicore_observe_cache_line_v0(&trace->resolver_completion_worker_id);
+                trace->resolver_completion_worker_id = resolver->worker_index;
+                trace->resolver_completion_consume_start_cycles = completion_start;
+                trace->resolver_completion_resolve_start_cycles = resolve_start_cycles;
+                trace->resolver_completion_refill_start_cycles = refill_start_cycles;
+                trace->resolver_completion_refill_end_cycles = refill_end_cycles;
+                trace->resolver_completion_end_cycles = completion_end;
+                aicore_publish_cache_line_v0(&trace->resolver_completion_worker_id);
+            }
             progress = true;
         }
     }
