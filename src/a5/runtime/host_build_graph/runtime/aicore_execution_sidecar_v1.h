@@ -342,6 +342,26 @@ struct alignas(128) AicpuCoreLifecycleTraceV1 {
     uint64_t reserved[2];
 };
 
+struct alignas(128) AicoreSchedulerTailTraceV1 {
+    volatile uint64_t valid;
+    uint64_t start_cycles;
+    uint64_t end_cycles;
+    uint64_t completion_scan_cycles;
+    uint64_t completion_consume_cycles;
+    uint64_t completion_resolve_cycles;
+    uint64_t completion_ready_publish_cycles;
+    uint64_t completion_refill_cycles;
+    uint64_t completion_finalize_cycles;
+    uint64_t gang_service_cycles;
+    uint64_t dispatch_probe_cycles[AICORE_CORE_TYPE_COUNT_V1];
+    uint64_t dispatch_claim_cycles[AICORE_CORE_TYPE_COUNT_V1];
+    uint64_t dispatch_prepare_cycles[AICORE_CORE_TYPE_COUNT_V1];
+    uint64_t dispatch_materialize_cycles[AICORE_CORE_TYPE_COUNT_V1];
+    uint64_t dispatch_publish_cycles[AICORE_CORE_TYPE_COUNT_V1];
+    uint64_t ready_poll_cycles;
+    uint64_t backoff_cycles;
+};
+
 struct alignas(128) AicoreWorkerContextV1 {
     volatile int32_t core_type;
     int32_t physical_core_id;
@@ -440,6 +460,8 @@ struct alignas(128) AicoreWorkerContextV1 {
     uint64_t bootstrap_free_advertise_aic_cycles;
     uint64_t bootstrap_free_advertise_aiv_cycles;
     uint64_t termination_reserved[2];
+
+    AicoreSchedulerTailTraceV1 scheduler_tail_trace;
 };
 
 struct alignas(128) AicoreTaskTraceCellV1 {
@@ -559,12 +581,14 @@ static_assert(sizeof(AicoreRunControlV1) == 384, "run control layout changed");
 static_assert(offsetof(AicoreRunControlV1, executed_task_count) == 128, "lifecycle atomics need their own line");
 static_assert(offsetof(AicoreRunControlV1, error_claimed) == 256, "error state needs its own line");
 static_assert(sizeof(AicpuCoreLifecycleTraceV1) == 128, "AICPU lifecycle trace layout changed");
-static_assert(sizeof(AicoreWorkerContextV1) == 768, "worker context layout changed");
+static_assert(sizeof(AicoreSchedulerTailTraceV1) == 256, "scheduler tail trace layout changed");
+static_assert(sizeof(AicoreWorkerContextV1) == 1024, "worker context layout changed");
 static_assert(offsetof(AicoreWorkerContextV1, task_metadata_offset) == 128, "runtime offsets changed");
 static_assert(offsetof(AicoreWorkerContextV1, gang_coordinator_offset) == 256, "topology offsets changed");
 static_assert(offsetof(AicoreWorkerContextV1, bootstrap_task_count) == 384, "worker stats offset changed");
 static_assert(offsetof(AicoreWorkerContextV1, wake_cas_retry_count) == 512, "wake stats offset changed");
 static_assert(offsetof(AicoreWorkerContextV1, completion_enqueue_cycles) == 640, "termination stats offset changed");
+static_assert(offsetof(AicoreWorkerContextV1, scheduler_tail_trace) == 768, "scheduler tail trace offset changed");
 static_assert(sizeof(AicoreTaskTraceCellV1) == 384, "task trace layout changed");
 
 #if !defined(__CCE_AICORE__)
@@ -595,6 +619,9 @@ static_assert(
 static_assert(std::is_standard_layout_v<AicoreDispatchSlotV1> && std::is_trivially_copyable_v<AicoreDispatchSlotV1>);
 static_assert(std::is_standard_layout_v<AicoreRunControlV1> && std::is_trivially_copyable_v<AicoreRunControlV1>);
 static_assert(std::is_standard_layout_v<AicoreWorkerContextV1> && std::is_trivially_copyable_v<AicoreWorkerContextV1>);
+static_assert(
+    std::is_standard_layout_v<AicoreSchedulerTailTraceV1> && std::is_trivially_copyable_v<AicoreSchedulerTailTraceV1>
+);
 #endif
 
 inline bool aicore_sidecar_checked_add_v1(uint64_t lhs, uint64_t rhs, uint64_t *out) {

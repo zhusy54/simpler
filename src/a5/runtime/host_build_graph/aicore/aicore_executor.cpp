@@ -71,6 +71,34 @@ struct AicoreInterTaskTimingV1 {
     __aicore__ void reset() { *this = {}; }
 };
 
+__aicore__ __attribute__((always_inline)) void publish_scheduler_tail_trace(
+    __gm__ AicoreWorkerContextV1 *context, uint64_t start_cycles, uint64_t end_cycles,
+    const AicoreInterTaskTimingV1 &timing
+) {
+    __gm__ AicoreSchedulerTailTraceV1 *trace = &context->scheduler_tail_trace;
+    trace->start_cycles = start_cycles;
+    trace->end_cycles = end_cycles;
+    trace->completion_scan_cycles = timing.completion.scan_cycles;
+    trace->completion_consume_cycles = timing.completion.consume_cycles;
+    trace->completion_resolve_cycles = timing.completion.resolve_cycles;
+    trace->completion_ready_publish_cycles = timing.completion.ready_publish_cycles;
+    trace->completion_refill_cycles = timing.completion.refill_cycles;
+    trace->completion_finalize_cycles = timing.completion.finalize_cycles;
+    trace->gang_service_cycles = timing.gang_service_cycles;
+    for (uint32_t type = 0; type < AICORE_CORE_TYPE_COUNT_V1; ++type) {
+        trace->dispatch_probe_cycles[type] = timing.dispatch.probe_cycles[type];
+        trace->dispatch_claim_cycles[type] = timing.dispatch.claim_cycles[type];
+        trace->dispatch_prepare_cycles[type] = timing.dispatch.prepare_cycles[type];
+        trace->dispatch_materialize_cycles[type] = timing.dispatch.materialize_cycles[type];
+        trace->dispatch_publish_cycles[type] = timing.dispatch.publish_cycles[type];
+    }
+    trace->ready_poll_cycles = timing.ready_poll_cycles;
+    trace->backoff_cycles = timing.backoff_cycles;
+    aicore_publish_cache_line_v0(&trace->start_cycles);
+    aicore_publish_cache_line_v0(&trace->dispatch_materialize_cycles[0]);
+    aicore_gm_publish_v0(trace->valid, UINT64_C(1));
+}
+
 struct AicoreExecutionRecordV1 {
     int64_t task_id{AICORE_TASK_ID_INVALID_V1};
     uint64_t claim_worker_id{0};
@@ -344,6 +372,7 @@ __aicore__ bool run_ready_dispatch_loop(
     };
     uint64_t seen_publication[AICORE_PENDING_SLOT_COUNT_V1]{};
     uint64_t previous_trace_commit_end = 0;
+    uint64_t inter_task_start_cycles = register_release_cycles;
     uint32_t scan_start = 0;
     uint32_t backoff_iterations = kInitialBackoffIterations;
     uint32_t scheduler_error_poll_count = 0;
@@ -353,7 +382,12 @@ __aicore__ bool run_ready_dispatch_loop(
     bool common_profile_recorded = false;
     while (true) {
         if (static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE)) == AICORE_EXIT_SIGNAL) {
-            if (trace_enabled) stats->exit_observed_cycles = get_sys_cnt_aicore();
+            if (trace_enabled) {
+                stats->exit_observed_cycles = get_sys_cnt_aicore();
+                publish_scheduler_tail_trace(
+                    context, inter_task_start_cycles, stats->exit_observed_cycles, inter_task_timing
+                );
+            }
             break;
         }
         if (++scheduler_error_poll_count == kSchedulerErrorPollInterval) {
@@ -508,6 +542,9 @@ __aicore__ bool run_ready_dispatch_loop(
                     completion_inbox_index, inter_task_timing
                 );
                 previous_trace_commit_end = get_sys_cnt_aicore();
+                inter_task_start_cycles = previous_trace_commit_end;
+            } else if (trace_enabled) {
+                inter_task_start_cycles = get_sys_cnt_aicore();
             }
             inter_task_timing.reset();
             continue;

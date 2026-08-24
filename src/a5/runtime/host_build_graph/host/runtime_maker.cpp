@@ -9,9 +9,9 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Runtime Builder - rt2 Implementation (host_build_graph: Host Orchestration)
+ * Runtime Builder - host_build_graph Host Orchestration
  *
- * Provides init_runtime_impl and validate_runtime_impl functions for rt2 runtime.
+ * Provides init_runtime_impl and validate_runtime_impl functions for the host_build_graph runtime.
  * The HOST runs the orchestrator to completion, populates shared memory + the
  * prebuilt arena, and H2Ds the image; the device boots scheduler-only.
  *
@@ -35,6 +35,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cinttypes>
 #include <cstddef>
@@ -698,6 +699,74 @@ bool append_aicore_scheduler_trace(
         }
         emit(context.worker_index, core_type, UINT64_MAX, "BootstrapTargetOther", cursor, target_end);
     }
+    constexpr size_t kSchedulerDetailCount = 19;
+    const std::array<const char *, kSchedulerDetailCount> resolver_detailed_phases{
+        "ResolverCompletionScan",
+        "ResolverCompletionConsume",
+        "ResolverCompletionResolve",
+        "ResolverCompletionReadyPublish",
+        "ResolverCompletionRefill",
+        "ResolverCompletionFinalize",
+        "ResolverGangService",
+        "ResolverDispatchAICProbe",
+        "ResolverDispatchAICClaim",
+        "ResolverDispatchAICPrepare",
+        "ResolverDispatchAICMaterialize",
+        "ResolverDispatchAICPublish",
+        "ResolverDispatchAIVProbe",
+        "ResolverDispatchAIVClaim",
+        "ResolverDispatchAIVPrepare",
+        "ResolverDispatchAIVMaterialize",
+        "ResolverDispatchAIVPublish",
+        "ResolverReadyPoll",
+        "ResolverBackoff",
+    };
+    const std::array<const char *, kSchedulerDetailCount> worker_detailed_phases{
+        "InterTaskCompletionScan",
+        "InterTaskCompletionConsume",
+        "InterTaskCompletionResolve",
+        "InterTaskCompletionReadyPublish",
+        "InterTaskCompletionRefill",
+        "InterTaskCompletionFinalize",
+        "InterTaskGangService",
+        "InterTaskDispatchAICProbe",
+        "InterTaskDispatchAICClaim",
+        "InterTaskDispatchAICPrepare",
+        "InterTaskDispatchAICMaterialize",
+        "InterTaskDispatchAICPublish",
+        "InterTaskDispatchAIVProbe",
+        "InterTaskDispatchAIVClaim",
+        "InterTaskDispatchAIVPrepare",
+        "InterTaskDispatchAIVMaterialize",
+        "InterTaskDispatchAIVPublish",
+        "InterTaskReadyPoll",
+        "InterTaskBackoff",
+    };
+    auto emit_scheduler_phases = [&](uint64_t worker_id, uint64_t core_type, uint64_t task_id, bool is_resolver,
+                                     uint64_t scheduler_start, uint64_t scheduler_end,
+                                     const std::array<uint64_t, kSchedulerDetailCount> &detailed_cycles) {
+        if (scheduler_end < scheduler_start) return;
+        const auto &detailed_phases = is_resolver ? resolver_detailed_phases : worker_detailed_phases;
+        const bool has_detail = std::any_of(detailed_cycles.begin(), detailed_cycles.end(), [](uint64_t cycles) {
+            return cycles != 0;
+        });
+        if (!has_detail) {
+            emit(
+                worker_id, core_type, task_id, is_resolver ? "ResolverSchedule" : "InterTaskSchedule", scheduler_start,
+                scheduler_end
+            );
+            return;
+        }
+        uint64_t cursor = scheduler_start;
+        for (size_t detail = 0; detail < detailed_cycles.size() && cursor < scheduler_end; ++detail) {
+            if (detailed_cycles[detail] == 0) continue;
+            const uint64_t detail_end = std::min(scheduler_end, cursor + detailed_cycles[detail]);
+            emit(worker_id, core_type, task_id, detailed_phases[detail], cursor, detail_end);
+            cursor = detail_end;
+        }
+        emit(worker_id, core_type, task_id, is_resolver ? "ResolverOther" : "InterTaskOther", cursor, scheduler_end);
+    };
+
     for (auto &worker_trace : worker_traces) {
         std::sort(
             worker_trace.begin(), worker_trace.end(),
@@ -726,7 +795,7 @@ bool append_aicore_scheduler_trace(
             }
             if (current.ready_scan_start_cycles < scheduler_start) continue;
             const uint64_t scheduler_end = current.ready_scan_start_cycles;
-            const uint64_t detailed_cycles[] = {
+            const std::array<uint64_t, kSchedulerDetailCount> detailed_cycles{
                 current.inter_task_completion_scan_cycles,
                 current.inter_task_completion_consume_cycles,
                 current.inter_task_completion_resolve_cycles,
@@ -747,84 +816,52 @@ bool append_aicore_scheduler_trace(
                 current.inter_task_ready_poll_cycles,
                 current.inter_task_backoff_cycles,
             };
-            const char *resolver_detailed_phases[] = {
-                "ResolverCompletionScan",
-                "ResolverCompletionConsume",
-                "ResolverCompletionResolve",
-                "ResolverCompletionReadyPublish",
-                "ResolverCompletionRefill",
-                "ResolverCompletionFinalize",
-                "ResolverGangService",
-                "ResolverDispatchAICProbe",
-                "ResolverDispatchAICClaim",
-                "ResolverDispatchAICPrepare",
-                "ResolverDispatchAICMaterialize",
-                "ResolverDispatchAICPublish",
-                "ResolverDispatchAIVProbe",
-                "ResolverDispatchAIVClaim",
-                "ResolverDispatchAIVPrepare",
-                "ResolverDispatchAIVMaterialize",
-                "ResolverDispatchAIVPublish",
-                "ResolverReadyPoll",
-                "ResolverBackoff",
-            };
-            const char *worker_detailed_phases[] = {
-                "InterTaskCompletionScan",
-                "InterTaskCompletionConsume",
-                "InterTaskCompletionResolve",
-                "InterTaskCompletionReadyPublish",
-                "InterTaskCompletionRefill",
-                "InterTaskCompletionFinalize",
-                "InterTaskGangService",
-                "InterTaskDispatchAICProbe",
-                "InterTaskDispatchAICClaim",
-                "InterTaskDispatchAICPrepare",
-                "InterTaskDispatchAICMaterialize",
-                "InterTaskDispatchAICPublish",
-                "InterTaskDispatchAIVProbe",
-                "InterTaskDispatchAIVClaim",
-                "InterTaskDispatchAIVPrepare",
-                "InterTaskDispatchAIVMaterialize",
-                "InterTaskDispatchAIVPublish",
-                "InterTaskReadyPoll",
-                "InterTaskBackoff",
-            };
-            static_assert(
-                sizeof(detailed_cycles) / sizeof(detailed_cycles[0]) ==
-                    sizeof(resolver_detailed_phases) / sizeof(resolver_detailed_phases[0]),
-                "inter-task phase tables must match"
-            );
-            static_assert(
-                sizeof(detailed_cycles) / sizeof(detailed_cycles[0]) ==
-                    sizeof(worker_detailed_phases) / sizeof(worker_detailed_phases[0]),
-                "inter-task phase tables must match"
-            );
-            const char *const *detailed_phases = is_resolver ? resolver_detailed_phases : worker_detailed_phases;
-            bool has_detail = false;
-            for (uint64_t cycles : detailed_cycles)
-                has_detail = has_detail || cycles != 0;
-            if (!has_detail) {
-                emit(
-                    current.worker_id, current_core_type, current.task_id,
-                    is_resolver ? "ResolverSchedule" : "InterTaskSchedule", scheduler_start, scheduler_end
-                );
-                continue;
-            }
-            uint64_t cursor = scheduler_start;
-            for (size_t detail = 0;
-                 detail < sizeof(detailed_cycles) / sizeof(detailed_cycles[0]) && cursor < scheduler_end; ++detail) {
-                if (detailed_cycles[detail] == 0) continue;
-                uint64_t detail_end = std::min(scheduler_end, cursor + detailed_cycles[detail]);
-                emit(
-                    current.worker_id, current_core_type, current.task_id, detailed_phases[detail], cursor, detail_end
-                );
-                cursor = detail_end;
-            }
-            emit(
-                current.worker_id, current_core_type, current.task_id, is_resolver ? "ResolverOther" : "InterTaskOther",
-                cursor, scheduler_end
+            emit_scheduler_phases(
+                current.worker_id, current_core_type, current.task_id, is_resolver, scheduler_start, scheduler_end,
+                detailed_cycles
             );
         }
+    }
+    for (int32_t worker = 0; worker < runtime->worker_count; ++worker) {
+        const AicoreWorkerContextV1 &context = contexts[worker];
+        const AicoreSchedulerTailTraceV1 &tail = context.scheduler_tail_trace;
+        if (context.active == 0 || tail.valid == 0 || tail.end_cycles < tail.start_cycles) continue;
+        const uint64_t worker_id = context.worker_index;
+        const uint64_t core_type = static_cast<uint64_t>(context.core_type);
+        if (!worker_traces[worker].empty()) {
+            const AicoreTaskTraceCellV1 &last = *worker_traces[worker].back();
+            if (tail.start_cycles >= last.completion_bookkeeping_end_cycles) {
+                emit(
+                    worker_id, core_type, UINT64_MAX, "TraceCommit", last.completion_bookkeeping_end_cycles,
+                    tail.start_cycles
+                );
+            }
+        }
+        const std::array<uint64_t, kSchedulerDetailCount> detailed_cycles{
+            tail.completion_scan_cycles,
+            tail.completion_consume_cycles,
+            tail.completion_resolve_cycles,
+            tail.completion_ready_publish_cycles,
+            tail.completion_refill_cycles,
+            tail.completion_finalize_cycles,
+            tail.gang_service_cycles,
+            tail.dispatch_probe_cycles[0],
+            tail.dispatch_claim_cycles[0],
+            tail.dispatch_prepare_cycles[0],
+            tail.dispatch_materialize_cycles[0],
+            tail.dispatch_publish_cycles[0],
+            tail.dispatch_probe_cycles[1],
+            tail.dispatch_claim_cycles[1],
+            tail.dispatch_prepare_cycles[1],
+            tail.dispatch_materialize_cycles[1],
+            tail.dispatch_publish_cycles[1],
+            tail.ready_poll_cycles,
+            tail.backoff_cycles,
+        };
+        emit_scheduler_phases(
+            worker_id, core_type, UINT64_MAX, context.is_resolver != 0, tail.start_cycles, tail.end_cycles,
+            detailed_cycles
+        );
     }
     for (int32_t worker = 0; worker < runtime->worker_count; ++worker) {
         if (contexts[worker].active == 0) continue;

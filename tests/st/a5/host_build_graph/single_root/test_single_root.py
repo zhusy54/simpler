@@ -151,6 +151,51 @@ class TestHbgSingleAivRoot(SceneTestCase):
     def compute_golden(self, args, params):
         args.out[:] = args.a + args.b
 
+    def _build_config(self, config_dict, *args, **kwargs):
+        config = super()._build_config(config_dict, *args, **kwargs)
+        self._profiling_level = int(kwargs.get("enable_chip_swimlane", args[0] if args else 0))
+        output_prefix = kwargs.get("output_prefix", "")
+        self._profiling_path = Path(output_prefix) / "chip_swimlane_records.json" if output_prefix else None
+        return config
+
+    def compare_outputs(self, test_args, golden_args, output_names, params):
+        super().compare_outputs(test_args, golden_args, output_names, params)
+        if getattr(self, "_profiling_level", 0) == 0:
+            return
+        path = self._profiling_path
+        assert path is not None and path.exists()
+        with path.open() as f:
+            phases = json.load(f)["aicore_scheduler_phases"]
+
+        kernel = next(phase for phase in phases if phase["phase"] == "Kernel")
+        post_completion = next(
+            phase
+            for phase in phases
+            if phase["phase"] == "PostCompletion" and phase["worker_id"] == kernel["worker_id"]
+        )
+        trailing = sorted(
+            (
+                phase
+                for phase in phases
+                if phase["worker_id"] == kernel["worker_id"]
+                and phase["task_id"] == (1 << 64) - 1
+                and phase["phase"].startswith("Resolver")
+                and phase["start_cycles"] >= post_completion["end_cycles"]
+            ),
+            key=lambda phase: phase["start_cycles"],
+        )
+        assert trailing
+        trace_commit = next(
+            phase
+            for phase in phases
+            if phase["worker_id"] == kernel["worker_id"]
+            and phase["task_id"] == (1 << 64) - 1
+            and phase["phase"] == "TraceCommit"
+        )
+        assert trace_commit["start_cycles"] == post_completion["end_cycles"]
+        assert trace_commit["end_cycles"] == trailing[0]["start_cycles"]
+        assert all(left["end_cycles"] == right["start_cycles"] for left, right in zip(trailing, trailing[1:]))
+
 
 if __name__ == "__main__":
     SceneTestCase.run_module(__name__)
