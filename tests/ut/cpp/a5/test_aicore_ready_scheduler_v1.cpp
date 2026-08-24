@@ -930,20 +930,9 @@ TEST(AicoreClusterCompletionV1, DirectlyRefillsCompletedSlotWhenReadyTaskExists)
     AicoreCompletionStatsV1 completion_stats{};
     uint64_t ready_victim_cursors[AICORE_CORE_TYPE_COUNT_V1]{};
     uint64_t direct_refilled_slot_mask = 0;
-    auto *traces =
-        aicore_sidecar_at_v1<AicoreTaskTraceCellV1>(storage.sidecar->base(), storage.layout.trace_cells_offset);
-    traces[0].resolver_completion_consume_start_cycles = UINT64_MAX;
-    traces[0].resolver_completion_resolve_start_cycles = UINT64_MAX;
-    traces[0].resolver_completion_refill_start_cycles = UINT64_MAX;
-    traces[0].resolver_completion_refill_end_cycles = UINT64_MAX;
-    traces[0].resolver_completion_end_cycles = UINT64_MAX;
-    traces[1].resolver_dispatch_prepare_start_cycles = UINT64_MAX;
-    traces[1].resolver_dispatch_materialize_start_cycles = UINT64_MAX;
-    traces[1].resolver_dispatch_publish_start_cycles = UINT64_MAX;
-    traces[1].resolver_dispatch_end_cycles = UINT64_MAX;
     ASSERT_TRUE(aicore_service_cluster_completions_v1(
         graph.graph(), storage.sidecar->base(), &resolver, storage.run_control, &wake_stats, &ready_stats,
-        &completion_stats, ready_victim_cursors, true, &direct_refilled_slot_mask
+        &completion_stats, ready_victim_cursors, false, &direct_refilled_slot_mask
     ));
 
     EXPECT_EQ(completion_line->completed_generations[0], 0u);
@@ -953,16 +942,6 @@ TEST(AicoreClusterCompletionV1, DirectlyRefillsCompletedSlotWhenReadyTaskExists)
     EXPECT_EQ(completed_control->state, static_cast<int64_t>(AicoreTaskStateV1::DONE));
     EXPECT_EQ(storage.run_control->resolved_task_count, 1u);
     EXPECT_EQ(direct_refilled_slot_mask, 1u);
-    EXPECT_EQ(traces[0].resolver_completion_worker_id, resolver.worker_index);
-    EXPECT_NE(traces[0].resolver_completion_consume_start_cycles, UINT64_MAX);
-    EXPECT_GE(traces[0].resolver_completion_resolve_start_cycles, traces[0].resolver_completion_consume_start_cycles);
-    EXPECT_GE(traces[0].resolver_completion_refill_start_cycles, traces[0].resolver_completion_resolve_start_cycles);
-    EXPECT_GE(traces[0].resolver_completion_refill_end_cycles, traces[0].resolver_completion_refill_start_cycles);
-    EXPECT_GE(traces[0].resolver_completion_end_cycles, traces[0].resolver_completion_refill_end_cycles);
-    EXPECT_NE(traces[1].resolver_dispatch_prepare_start_cycles, UINT64_MAX);
-    EXPECT_GE(traces[1].resolver_dispatch_materialize_start_cycles, traces[1].resolver_dispatch_prepare_start_cycles);
-    EXPECT_GE(traces[1].resolver_dispatch_publish_start_cycles, traces[1].resolver_dispatch_materialize_start_cycles);
-    EXPECT_GE(traces[1].resolver_dispatch_end_cycles, traces[1].resolver_dispatch_publish_start_cycles);
 }
 
 TEST(AicoreSyncStartV1, DrainsStagesAndReleasesBeforeCompletion) {
@@ -1024,14 +1003,10 @@ TEST(AicoreSyncStartV1, DrainsStagesAndReleasesBeforeCompletion) {
         aicore_completion_inbox_at_v1(storage.sidecar->base(), &resolver, worker)->completed_generations[0] =
             slot->generation;
     }
-    auto *trace =
-        aicore_sidecar_at_v1<AicoreTaskTraceCellV1>(storage.sidecar->base(), storage.layout.trace_cells_offset);
-    trace[0].resolver_completion_consume_start_cycles = UINT64_MAX;
     ASSERT_TRUE(aicore_service_cluster_completions_v1(
         graph.graph(), storage.sidecar->base(), &resolver, storage.run_control, &wake_stats, &ready_stats,
-        &completion_stats, nullptr, true
+        &completion_stats
     ));
-    EXPECT_EQ(trace[0].resolver_completion_consume_start_cycles, UINT64_MAX);
     ASSERT_TRUE(aicore_service_gang_scheduler_v1(
         graph.graph(), storage.sidecar->base(), &resolver, storage.run_control, &wake_stats, &ready_stats,
         &completion_stats

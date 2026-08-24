@@ -857,7 +857,7 @@ inline __aicore__ bool aicore_fill_dispatch_slot_v1(
     if (ready_claim.task_id < 0 || static_cast<uint64_t>(ready_claim.task_id) >= graph.task_count ||
         slot_claim.worker_id >= resolver->runtime_worker_count || slot_claim.slot_index >= AICORE_PENDING_SLOT_COUNT_V1)
         return false;
-    const bool record_timeline = trace_enabled || timing != nullptr;
+    const bool record_timeline = timing != nullptr;
     uint64_t operation_start = record_timeline ? aicore_scheduler_cycles_v1() : 0;
     __gm__ AicoreTaskMetadataV1 *metadata_source =
         aicore_task_metadata_at_v1(sidecar_base, resolver, ready_claim.task_id);
@@ -969,18 +969,6 @@ inline __aicore__ bool aicore_fill_dispatch_slot_v1(
     }
     uint64_t publish_end = record_timeline ? aicore_scheduler_cycles_v1() : 0;
     if (timing != nullptr) timing->publish_cycles += publish_end - materialize_end;
-    if (trace_enabled) {
-        // Completion timestamps share this cache line, so commit dispatch tracing before exposing the READY slot.
-        __gm__ AicoreTaskTraceCellV1 *cells =
-            aicore_sidecar_at_v1<AicoreTaskTraceCellV1>(sidecar_base, resolver->trace_cells_offset);
-        __gm__ AicoreTaskTraceCellV1 *trace = &cells[ready_claim.task_id];
-        aicore_observe_cache_line_v0(&trace->resolver_completion_worker_id);
-        trace->resolver_dispatch_prepare_start_cycles = operation_start;
-        trace->resolver_dispatch_materialize_start_cycles = operation_end;
-        trace->resolver_dispatch_publish_start_cycles = materialize_end;
-        trace->resolver_dispatch_end_cycles = publish_end;
-        aicore_publish_cache_line_v0(&trace->resolver_completion_worker_id);
-    }
     aicore_gm_publish_v0(
         slot->publication, aicore_dispatch_publication_v1(generation, AicoreDispatchPublicationV1::READY)
     );

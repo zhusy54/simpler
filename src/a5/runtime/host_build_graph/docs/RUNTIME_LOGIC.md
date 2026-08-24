@@ -116,6 +116,6 @@ After EXIT, host validation requires:
 - bootstrap, Ready enqueue/pop, execution, completion enqueue/resolve, and
   wake registration/migration counts to agree.
 
-Level-1 profiling records `ReadyPop`/`ReadySteal`, payload, kernel, completion,
-WakeResolve, refill, bootstrap wait, resolution wait, and exit phases. Normal
-execution does not write per-task trace cells.
+Level-1 profiling records a gap-free Resolver phase budget, payload, kernel,
+completion, WakeResolve, refill, bootstrap wait, resolution wait, and exit
+phases. Normal execution does not write per-task trace cells.

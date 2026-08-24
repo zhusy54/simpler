@@ -24,54 +24,42 @@ A successful level-1 run writes
 The AICore phases are:
 
 - startup: `AICoreEntryToHandshake`, `HandshakeToRegisterRelease`,
-  `RegisterReleaseToDescriptorReady`, `DescriptorReadyToReadyClaim`,
-  `ExecutionStartToFirstReady`, `FirstReadyToReadyClaim`,
+  `ContextPublishToDescriptorReady`, `HandshakeToDescriptorReady`,
+  `ReadyClaimToRegisterRelease`,
   `BootstrapGraphScan`, `BootstrapBarrier`, and the
   `Bootstrap{AIC,AIV}{ReadyClaim,SlotFill,FreeAdvertise,Other}` breakdown;
-- scheduling: `ReadyPop`, `ReadySteal`, `ReadyScan`, `ReadyPublish`,
-  `SlotRefill`, and the
-  `InterTaskCompletion{Scan,Consume,Resolve,ReadyPublish,Refill,Finalize}`,
-  `InterTaskGangService`,
-  `InterTaskDispatch{AIC,AIV}{Probe,Claim,Prepare,Materialize,Publish}`, and
-  `InterTask{ReadyPoll,Backoff,Other}`
+- scheduling: `ReadyScan`, `ReadyPublish`, `SlotRefill`, and the
+  `ResolverCompletion{Scan,Consume,Resolve,ReadyPublish,Refill,Finalize}`,
+  `ResolverGangService`,
+  `ResolverDispatch{AIC,AIV}{Probe,Claim,Prepare,Materialize,Publish}`, and
+  `Resolver{ReadyPoll,Backoff,Other}`
   breakdown;
 - execution: `Payload`, `Kernel`, `CompletionEnqueue`, `PostCompletion`;
-- resolution: `CompletionBatchPrepare`, `CompletionBatchClaim`, `WakeResolve`,
-  `ResolverCompletion{Consume,Resolve,Refill,Finalize}`, and
-  `ResolverDispatch{Prepare,Materialize,Publish}`;
+- resolution: `CompletionBatchPrepare`, `CompletionBatchClaim`, `WakeResolve`;
 - teardown: `TraceCommit`, `WaitForExit`, `FinalStatsPublish`,
   `ExitAckPublish`, `Drain`.
 
-`ReadyPop` and `ReadySteal` execute on the resolver that claimed the unbound
-task; `Kernel` executes on the target slot's worker. Only AIV resolvers emit
+`Kernel` executes on the target slot's worker. Only AIV resolvers emit
 completion-resolution phases. Payload construction remains part of the
-resolver refill path, while `Payload` on the executor measures observing the
-published dispatch payload before kernel entry.
+resolver dispatch path, while `Payload` on the executor measures observing
+the published dispatch payload before kernel entry.
 
-All `DescriptorReadyToReadyClaim` spans end at the earliest first-task claim,
-which is the global execution start. `ExecutionStartToFirstReady` measures
-dependency/bootstrap delay until that worker's first task enters Ready state;
-`FirstReadyToReadyClaim` measures the subsequent Ready-inbox and placement
-delay. Resolver bootstrap phases independently show graph scan, the global
-barrier, and target-slot initialization. Per-target component durations are
-accumulated on device and rendered contiguously, so their widths are exact but
-their display order does not represent individual slot-operation order.
+Resolver bootstrap phases independently show graph scan, the global barrier,
+and target-slot initialization. Per-target component durations are accumulated
+on device and rendered contiguously, so their widths are exact but their
+display order does not represent individual slot-operation order.
 
-Long inter-task gaps, including the interval before each worker's first task,
-are split by accumulated time in completion scan/consume/resolve/refill,
+Resolver inter-task gaps, including the interval before a resolver's first
+task, are split by accumulated time in completion scan/consume/resolve/refill,
 Gang service, AIC/AIV probe/claim/prepare/materialize/publish, unsuccessful
-slot polling, and idle backoff. The residual `InterTaskOther` contains loop
-control and instrumentation overhead.
-Old traces without these counters retain the aggregate `InterTaskSchedule`.
-
-The `ResolverCompletion*` and `ResolverDispatch*` phases retain their actual
-device timestamps and therefore appear at the precise position between
-`ReadyPop`/`ReadySteal` claims. The `InterTask*` phases are accumulated and
-rendered contiguously before the Resolver's next task; they account for failed
-probes and idle iterations that cannot be attached to a successfully claimed
-or completed task, but their display order is not an operation timeline.
-Gang participant completions remain in `InterTaskGangService`; a gang task has
-one task-indexed trace cell and cannot retain every participant's exact span.
+slot polling, and idle backoff. The residual `ResolverOther` contains loop
+control and instrumentation overhead. These phases form one budget projection
+between consecutive resolver tasks: each phase begins at the previous phase's
+end, no phase overlaps another, and `ResolverOther` closes any residual before
+`ReadyScan`. Their widths are measured device cycles; accumulated categories
+are rendered in a fixed order and are not an individual-operation call tree.
+Non-resolver workers retain the `InterTask*` names and the aggregate
+`InterTaskSchedule` fallback.
 
 `CompletionEnqueue` records include `completion_id` and `inbox_index`. The ID
 is based on per-worker execution order rather than graph task ID, so Ready
@@ -89,6 +77,6 @@ enqueue/batch/resolve/steal and link waits; wake registration/migration; and
 READY-to-kernel/completion-resolution lag. These are diagnostic measurements,
 not performance merge gates.
 
-Each task has one 512-byte trace cell indexed by task ID. Trace writes occur
+Each task has one 384-byte trace cell indexed by task ID. Trace writes occur
 only at level 1. The common collector publishes its JSON first; HBG inserts the
 scheduler arrays through a temporary file and atomic rename.

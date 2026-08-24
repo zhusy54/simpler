@@ -355,7 +355,7 @@ def test_aicore_ticket_scheduler_phases_replace_common_anchors_and_render_once(t
     }
 
 
-def test_hbg_startup_phase_separates_execution_start_from_first_task_claim(tmp_path):
+def test_hbg_startup_omits_redundant_phases(tmp_path):
     input_path = tmp_path / "chip_swimlane_records.json"
     input_path.write_text(
         json.dumps(
@@ -365,6 +365,14 @@ def test_hbg_startup_phase_separates_execution_start_from_first_task_claim(tmp_p
                 "aicore_tasks": [],
                 "aicpu_tasks": [],
                 "aicore_scheduler_phases": [
+                    {
+                        "worker_id": 0,
+                        "core_type": 0,
+                        "task_id": 1,
+                        "phase": "HandshakeToAicpuObserve",
+                        "start_cycles": 90,
+                        "end_cycles": 100,
+                    },
                     {
                         "worker_id": 0,
                         "core_type": 0,
@@ -403,30 +411,35 @@ def test_hbg_startup_phase_separates_execution_start_from_first_task_claim(tmp_p
     )
 
     parsed = sc.read_perf_data(input_path)
-    startup = [
-        phase
-        for phase in parsed["aicore_scheduler_phases"]
-        if phase["phase"] in {"DescriptorReadyToReadyClaim", "ExecutionStartToFirstReadyClaim"}
-    ]
-
-    assert [(phase["core_id"], phase["phase"], phase["start_time_us"], phase["end_time_us"]) for phase in startup] == [
-        (0, "DescriptorReadyToReadyClaim", 0.0, 100.0),
-        (1, "DescriptorReadyToReadyClaim", 10.0, 100.0),
-        (0, "ExecutionStartToFirstReadyClaim", 100.0, 100.0),
-        (1, "ExecutionStartToFirstReadyClaim", 100.0, 400.0),
-    ]
+    phase_names = {phase["phase"] for phase in parsed["aicore_scheduler_phases"]}
+    assert "DescriptorReadyToReadyClaim" not in phase_names
+    assert "HandshakeToAicpuObserve" not in phase_names
 
 
 def test_hbg_resolver_timeline_phases_keep_distinct_colors(tmp_path):
     output_path = tmp_path / "trace.json"
     colors = {
+        "ResolverCompletionScan": "thread_state_iowait",
         "ResolverCompletionConsume": "thread_state_iowait",
         "ResolverCompletionResolve": "cq_build_running",
+        "ResolverCompletionReadyPublish": "cq_build_passed",
         "ResolverCompletionRefill": "thread_state_runnable",
         "ResolverCompletionFinalize": "cq_build_passed",
-        "ResolverDispatchPrepare": "thread_state_running",
-        "ResolverDispatchMaterialize": "cq_build_running",
-        "ResolverDispatchPublish": "cq_build_passed",
+        "ResolverGangService": "thread_state_runnable",
+        "ResolverDispatchAICProbe": "thread_state_iowait",
+        "ResolverDispatchAICClaim": "thread_state_runnable",
+        "ResolverDispatchAICPrepare": "thread_state_running",
+        "ResolverDispatchAICMaterialize": "cq_build_running",
+        "ResolverDispatchAICPublish": "cq_build_passed",
+        "ResolverDispatchAIVProbe": "thread_state_iowait",
+        "ResolverDispatchAIVClaim": "thread_state_runnable",
+        "ResolverDispatchAIVPrepare": "thread_state_running",
+        "ResolverDispatchAIVMaterialize": "cq_build_running",
+        "ResolverDispatchAIVPublish": "cq_build_passed",
+        "ResolverReadyPoll": "thread_state_iowait",
+        "ResolverBackoff": "thread_state_iowait",
+        "ResolverOther": "generic_work",
+        "ResolverSchedule": "generic_work",
     }
     phases = [
         {
@@ -490,7 +503,6 @@ def test_hbg_detailed_startup_phases_are_not_resplit(tmp_path):
 
     phases = sc.read_perf_data(input_path)["aicore_scheduler_phases"]
     assert [phase["phase"] for phase in phases] == [
-        "DescriptorReadyToReadyClaim",
         "ExecutionStartToFirstReady",
         "FirstReadyToReadyClaim",
     ]

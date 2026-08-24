@@ -554,34 +554,6 @@ bool append_aicore_scheduler_trace(
         const uint64_t trace_core_type = trace.worker_id < static_cast<uint64_t>(runtime->worker_count) ?
                                              static_cast<uint64_t>(contexts[trace.worker_id].core_type) :
                                              UINT64_MAX;
-        const char *claim_phase =
-            trace.ready_source == static_cast<uint64_t>(AicoreReadySourceV1::STOLEN) ? "ReadySteal" : "ReadyPop";
-        uint64_t claim_core_type = trace_core_type;
-        if (trace.claim_worker_id < static_cast<uint64_t>(runtime->worker_count)) {
-            claim_core_type = static_cast<uint64_t>(contexts[trace.claim_worker_id].core_type);
-        }
-        emit(
-            trace.claim_worker_id, claim_core_type, trace.task_id, claim_phase, trace.claim_start_cycles,
-            trace.claim_end_cycles
-        );
-        if (trace.claim_worker_id < static_cast<uint64_t>(runtime->worker_count) &&
-            trace.resolver_dispatch_prepare_start_cycles != 0 &&
-            trace.resolver_dispatch_materialize_start_cycles >= trace.resolver_dispatch_prepare_start_cycles &&
-            trace.resolver_dispatch_publish_start_cycles >= trace.resolver_dispatch_materialize_start_cycles &&
-            trace.resolver_dispatch_end_cycles >= trace.resolver_dispatch_publish_start_cycles) {
-            emit(
-                trace.claim_worker_id, claim_core_type, trace.task_id, "ResolverDispatchPrepare",
-                trace.resolver_dispatch_prepare_start_cycles, trace.resolver_dispatch_materialize_start_cycles
-            );
-            emit(
-                trace.claim_worker_id, claim_core_type, trace.task_id, "ResolverDispatchMaterialize",
-                trace.resolver_dispatch_materialize_start_cycles, trace.resolver_dispatch_publish_start_cycles
-            );
-            emit(
-                trace.claim_worker_id, claim_core_type, trace.task_id, "ResolverDispatchPublish",
-                trace.resolver_dispatch_publish_start_cycles, trace.resolver_dispatch_end_cycles
-            );
-        }
         if (trace.aicore_entry_cycles != 0) {
             emit(
                 trace.worker_id, trace_core_type, trace.task_id, "AICoreEntryToHandshake", trace.aicore_entry_cycles,
@@ -594,10 +566,6 @@ bool append_aicore_scheduler_trace(
             if (trace.worker_id < static_cast<uint64_t>(runtime->worker_count)) {
                 const AicpuCoreLifecycleTraceV1 &lifecycle = lifecycle_traces[trace.worker_id];
                 emit(
-                    trace.worker_id, trace_core_type, trace.task_id, "HandshakeToAicpuObserve",
-                    trace.handshake_publish_cycles, lifecycle.handshake_observed_cycles
-                );
-                emit(
                     trace.worker_id, trace_core_type, trace.task_id, "ContextPublishToDescriptorReady",
                     lifecycle.context_publish_complete_cycles, trace.descriptor_cache_observed_cycles
                 );
@@ -606,12 +574,6 @@ bool append_aicore_scheduler_trace(
                 trace.worker_id, trace_core_type, trace.task_id, "HandshakeToDescriptorReady",
                 trace.handshake_publish_cycles, trace.descriptor_cache_observed_cycles
             );
-            if (trace.claim_start_cycles != 0) {
-                emit(
-                    trace.worker_id, trace_core_type, trace.task_id, "DescriptorReadyToReadyClaim",
-                    trace.descriptor_cache_observed_cycles, trace.claim_start_cycles
-                );
-            }
             if (trace.claim_end_cycles != 0) {
                 emit(
                     trace.worker_id, trace_core_type, trace.task_id, "ReadyClaimToRegisterRelease",
@@ -640,31 +602,6 @@ bool append_aicore_scheduler_trace(
             trace.ready_observe_cycles
         );
         const AicoreTaskControlV1 &control = task_controls[task_id];
-        if (trace.resolver_completion_worker_id < static_cast<uint64_t>(runtime->worker_count) &&
-            trace.resolver_completion_consume_start_cycles != 0 &&
-            trace.resolver_completion_resolve_start_cycles >= trace.resolver_completion_consume_start_cycles &&
-            trace.resolver_completion_refill_start_cycles >= trace.resolver_completion_resolve_start_cycles &&
-            trace.resolver_completion_refill_end_cycles >= trace.resolver_completion_refill_start_cycles &&
-            trace.resolver_completion_end_cycles >= trace.resolver_completion_refill_end_cycles) {
-            const uint64_t resolver_worker_id = trace.resolver_completion_worker_id;
-            const uint64_t resolver_core_type = static_cast<uint64_t>(contexts[resolver_worker_id].core_type);
-            emit(
-                resolver_worker_id, resolver_core_type, trace.task_id, "ResolverCompletionConsume",
-                trace.resolver_completion_consume_start_cycles, trace.resolver_completion_resolve_start_cycles
-            );
-            emit(
-                resolver_worker_id, resolver_core_type, trace.task_id, "ResolverCompletionResolve",
-                trace.resolver_completion_resolve_start_cycles, trace.resolver_completion_refill_start_cycles
-            );
-            emit(
-                resolver_worker_id, resolver_core_type, trace.task_id, "ResolverCompletionRefill",
-                trace.resolver_completion_refill_start_cycles, trace.resolver_completion_refill_end_cycles
-            );
-            emit(
-                resolver_worker_id, resolver_core_type, trace.task_id, "ResolverCompletionFinalize",
-                trace.resolver_completion_refill_end_cycles, trace.resolver_completion_end_cycles
-            );
-        }
         if (trace.completion_prepare_start_cycles != 0 &&
             trace.refill_resolver_worker_id < static_cast<uint64_t>(runtime->worker_count)) {
             const uint64_t resolver_worker_id = trace.refill_resolver_worker_id;
@@ -770,7 +707,9 @@ bool append_aicore_scheduler_trace(
         );
         for (size_t index = 0; index < worker_trace.size(); ++index) {
             const AicoreTaskTraceCellV1 &current = *worker_trace[index];
-            const uint64_t current_core_type = static_cast<uint64_t>(contexts[current.worker_id].core_type);
+            const AicoreWorkerContextV1 &context = contexts[current.worker_id];
+            const uint64_t current_core_type = static_cast<uint64_t>(context.core_type);
+            const bool is_resolver = context.is_resolver != 0;
             uint64_t scheduler_start = current.register_release_cycles;
             if (index != 0) {
                 const AicoreTaskTraceCellV1 &previous = *worker_trace[index - 1];
@@ -808,7 +747,28 @@ bool append_aicore_scheduler_trace(
                 current.inter_task_ready_poll_cycles,
                 current.inter_task_backoff_cycles,
             };
-            const char *detailed_phases[] = {
+            const char *resolver_detailed_phases[] = {
+                "ResolverCompletionScan",
+                "ResolverCompletionConsume",
+                "ResolverCompletionResolve",
+                "ResolverCompletionReadyPublish",
+                "ResolverCompletionRefill",
+                "ResolverCompletionFinalize",
+                "ResolverGangService",
+                "ResolverDispatchAICProbe",
+                "ResolverDispatchAICClaim",
+                "ResolverDispatchAICPrepare",
+                "ResolverDispatchAICMaterialize",
+                "ResolverDispatchAICPublish",
+                "ResolverDispatchAIVProbe",
+                "ResolverDispatchAIVClaim",
+                "ResolverDispatchAIVPrepare",
+                "ResolverDispatchAIVMaterialize",
+                "ResolverDispatchAIVPublish",
+                "ResolverReadyPoll",
+                "ResolverBackoff",
+            };
+            const char *worker_detailed_phases[] = {
                 "InterTaskCompletionScan",
                 "InterTaskCompletionConsume",
                 "InterTaskCompletionResolve",
@@ -831,16 +791,22 @@ bool append_aicore_scheduler_trace(
             };
             static_assert(
                 sizeof(detailed_cycles) / sizeof(detailed_cycles[0]) ==
-                    sizeof(detailed_phases) / sizeof(detailed_phases[0]),
+                    sizeof(resolver_detailed_phases) / sizeof(resolver_detailed_phases[0]),
                 "inter-task phase tables must match"
             );
+            static_assert(
+                sizeof(detailed_cycles) / sizeof(detailed_cycles[0]) ==
+                    sizeof(worker_detailed_phases) / sizeof(worker_detailed_phases[0]),
+                "inter-task phase tables must match"
+            );
+            const char *const *detailed_phases = is_resolver ? resolver_detailed_phases : worker_detailed_phases;
             bool has_detail = false;
             for (uint64_t cycles : detailed_cycles)
                 has_detail = has_detail || cycles != 0;
             if (!has_detail) {
                 emit(
-                    current.worker_id, current_core_type, current.task_id, "InterTaskSchedule", scheduler_start,
-                    scheduler_end
+                    current.worker_id, current_core_type, current.task_id,
+                    is_resolver ? "ResolverSchedule" : "InterTaskSchedule", scheduler_start, scheduler_end
                 );
                 continue;
             }
@@ -854,7 +820,10 @@ bool append_aicore_scheduler_trace(
                 );
                 cursor = detail_end;
             }
-            emit(current.worker_id, current_core_type, current.task_id, "InterTaskOther", cursor, scheduler_end);
+            emit(
+                current.worker_id, current_core_type, current.task_id, is_resolver ? "ResolverOther" : "InterTaskOther",
+                cursor, scheduler_end
+            );
         }
     }
     for (int32_t worker = 0; worker < runtime->worker_count; ++worker) {

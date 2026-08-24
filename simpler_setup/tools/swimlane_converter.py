@@ -36,6 +36,11 @@ from pathlib import Path
 from typing import Any
 
 
+_OMITTED_AICORE_SCHEDULER_PHASES = frozenset(
+    {"DescriptorReadyToReadyClaim", "HandshakeToAicpuObserve"}
+)
+
+
 def _func_id_to_letter(func_id):
     """Map a non-negative integer func_id to a numeric+letter label.
 
@@ -212,34 +217,6 @@ def _collect_graph_execution_instances(tasks, scheduler_phases):  # noqa: PLR091
     return instances
 
 
-def _split_hbg_first_claim_startup(phases):
-    """Separate global scheduler startup from each core's first-task wait."""
-    startup = [phase for phase in phases if phase["phase"] == "DescriptorReadyToReadyClaim"]
-    detailed = {"ExecutionStartToFirstReady", "FirstReadyToReadyClaim"}
-    if (
-        not startup
-        or any(phase["phase"] == "ExecutionStartToFirstReadyClaim" for phase in phases)
-        or any(phase["phase"] in detailed for phase in phases)
-    ):
-        return
-
-    all_descriptors_ready_us = max(phase["start_time_us"] for phase in startup)
-    first_claim_us = min(phase["end_time_us"] for phase in startup)
-    execution_start_us = max(all_descriptors_ready_us, first_claim_us)
-    first_claim_waits = []
-    for phase in startup:
-        worker_first_claim_us = max(execution_start_us, phase["end_time_us"])
-        phase["end_time_us"] = execution_start_us
-        phase["duration_us"] = execution_start_us - phase["start_time_us"]
-        first_claim_wait = dict(phase)
-        first_claim_wait["phase"] = "ExecutionStartToFirstReadyClaim"
-        first_claim_wait["start_time_us"] = execution_start_us
-        first_claim_wait["end_time_us"] = worker_first_claim_us
-        first_claim_wait["duration_us"] = worker_first_claim_us - execution_start_us
-        first_claim_waits.append(first_claim_wait)
-    phases.extend(first_claim_waits)
-
-
 def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
     """Read performance data from a swimlane JSON file.
 
@@ -364,6 +341,8 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
         _track(int(start_c))
         _track(int(end_c))
     for phase in aicore_scheduler_rows:
+        if phase.get("phase") in _OMITTED_AICORE_SCHEDULER_PHASES:
+            continue
         _track(int(phase.get("start_cycles", 0)))
         _track(int(phase.get("end_cycles", 0)))
     for phase in aicpu_lifecycle_rows:
@@ -466,6 +445,8 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
     aicore_scheduler_phases = []
     scheduler_tasks = []
     for phase in aicore_scheduler_rows:
+        if phase.get("phase") in _OMITTED_AICORE_SCHEDULER_PHASES:
+            continue
         worker_id = int(phase.get("worker_id", -1))
         task_id = int(phase.get("task_id", -1))
         start_us = _to_us(int(phase.get("start_cycles", 0)))
@@ -513,7 +494,6 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
             )
     if level == 1 and scheduler_tasks:
         tasks = scheduler_tasks
-    _split_hbg_first_claim_startup(aicore_scheduler_phases)
     aicore_scheduler_phases.sort(key=lambda phase: (phase["start_time_us"], phase["core_id"]))
 
     aicpu_lifecycle_phases = []
@@ -1568,7 +1548,6 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         "SeedClaim": "thread_state_running",
         "TicketClaim": "thread_state_runnable",
         "PendingWait": "thread_state_iowait",
-        "ExecutionStartToFirstReadyClaim": "thread_state_iowait",
         "ExecutionStartToFirstReady": "thread_state_iowait",
         "FirstReadyToReadyClaim": "thread_state_runnable",
         "BootstrapGraphScan": "cq_build_running",
@@ -1595,11 +1574,25 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         "InterTaskDispatchAIVPublish": "cq_build_passed",
         "ResolverCompletionConsume": "thread_state_iowait",
         "ResolverCompletionResolve": "cq_build_running",
+        "ResolverCompletionScan": "thread_state_iowait",
+        "ResolverCompletionReadyPublish": "cq_build_passed",
         "ResolverCompletionRefill": "thread_state_runnable",
         "ResolverCompletionFinalize": "cq_build_passed",
-        "ResolverDispatchPrepare": "thread_state_running",
-        "ResolverDispatchMaterialize": "cq_build_running",
-        "ResolverDispatchPublish": "cq_build_passed",
+        "ResolverGangService": "thread_state_runnable",
+        "ResolverDispatchAICProbe": "thread_state_iowait",
+        "ResolverDispatchAICClaim": "thread_state_runnable",
+        "ResolverDispatchAICPrepare": "thread_state_running",
+        "ResolverDispatchAICMaterialize": "cq_build_running",
+        "ResolverDispatchAICPublish": "cq_build_passed",
+        "ResolverDispatchAIVProbe": "thread_state_iowait",
+        "ResolverDispatchAIVClaim": "thread_state_runnable",
+        "ResolverDispatchAIVPrepare": "thread_state_running",
+        "ResolverDispatchAIVMaterialize": "cq_build_running",
+        "ResolverDispatchAIVPublish": "cq_build_passed",
+        "ResolverReadyPoll": "thread_state_iowait",
+        "ResolverBackoff": "thread_state_iowait",
+        "ResolverOther": "generic_work",
+        "ResolverSchedule": "generic_work",
         "InterTaskReadyPoll": "thread_state_iowait",
         "InterTaskBackoff": "thread_state_iowait",
         "InterTaskOther": "generic_work",
