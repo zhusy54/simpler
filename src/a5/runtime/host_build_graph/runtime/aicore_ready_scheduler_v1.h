@@ -86,6 +86,21 @@ struct AicoreRefillTimingV1 {
     uint64_t free_advertise_cycles{0};
 };
 
+struct AicoreCompletionServiceTimingV1 {
+    uint64_t scan_cycles{0};
+    uint64_t consume_cycles{0};
+    uint64_t resolve_cycles{0};
+    uint64_t ready_publish_cycles{0};
+    uint64_t refill_cycles{0};
+    uint64_t finalize_cycles{0};
+};
+
+struct AicoreDispatchFillTimingV1 {
+    uint64_t prepare_cycles{0};
+    uint64_t materialize_cycles{0};
+    uint64_t publish_cycles{0};
+};
+
 inline __host__ __aicore__ uint64_t aicore_scheduler_cycles_v1() {
 #if defined(__CCE_AICORE__)
     return get_sys_cnt_aicore();
@@ -433,8 +448,7 @@ inline __aicore__ void aicore_bootstrap_ready_directory_publish_v1(
             if (shard_end > resolver_count) shard_end = resolver_count;
             for (uint64_t inbox_index = shard_begin; inbox_index < shard_end; ++inbox_index) {
                 uint64_t ready_types = directory->bootstrap_ready_types[inbox_index];
-                if ((ready_types & (UINT64_C(1) << type)) != 0)
-                    bits |= UINT64_C(1) << (inbox_index - shard_begin);
+                if ((ready_types & (UINT64_C(1) << type)) != 0) bits |= UINT64_C(1) << (inbox_index - shard_begin);
             }
             directory->core_types[type][shard].bits = bits;
             aicore_publish_cache_line_v0(&directory->core_types[type][shard]);
@@ -585,8 +599,7 @@ inline __aicore__ bool aicore_ready_pop_from_inbox_v1(
 }
 
 inline __aicore__ uint64_t aicore_load_ready_directory_shard_v1(
-    __gm__ AicoreReadyDirectoryV1 *directory, uint64_t resolver_count, uint32_t core_type_index,
-    uint64_t inbox_index
+    __gm__ AicoreReadyDirectoryV1 *directory, uint64_t resolver_count, uint32_t core_type_index, uint64_t inbox_index
 ) {
     uint64_t shard = inbox_index / AICORE_READY_DIRECTORY_RESOLVERS_PER_SHARD_V1;
     uint64_t shard_begin = shard * AICORE_READY_DIRECTORY_RESOLVERS_PER_SHARD_V1;
@@ -660,9 +673,8 @@ inline __aicore__ bool aicore_claim_ready_for_slot_v1(
     if (shard_end > resolver_count) shard_end = resolver_count;
     uint64_t start = *victim_cursor;
     if (start < shard_begin || start >= shard_end) start = shard_begin;
-    uint64_t bits = aicore_load_ready_directory_shard_v1(
-        directory, resolver_count, core_type_index, context->inbox_index
-    );
+    uint64_t bits =
+        aicore_load_ready_directory_shard_v1(directory, resolver_count, core_type_index, context->inbox_index);
     if (bits != 0 && !aicore_steal_ready_from_shard_v1(
                          graph, sidecar_base, context, run_control, core_type_index, shard_begin, shard_end, start,
                          victim_cursor, bits, stats, claim, trace_enabled
@@ -678,9 +690,7 @@ inline __aicore__ bool aicore_ready_directory_nonempty_v1(
     __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *context, uint64_t resolver_count, uint32_t core_type_index
 ) {
     __gm__ AicoreReadyDirectoryV1 *directory = aicore_ready_directory_at_v1(sidecar_base, context);
-    return aicore_load_ready_directory_shard_v1(
-               directory, resolver_count, core_type_index, context->inbox_index
-           ) != 0;
+    return aicore_load_ready_directory_shard_v1(directory, resolver_count, core_type_index, context->inbox_index) != 0;
 }
 
 inline __aicore__ void aicore_advertise_free_slot_v1(
@@ -708,8 +718,7 @@ inline __aicore__ bool aicore_load_free_slot_directory_masks_v1(
     uint64_t combined = 0;
     for (uint32_t word = 0; word < word_count; ++word) {
         masks[word] = aicore_gm_query_v0(directory->words[core_type_index][word]);
-        if (word + 1 == word_count && capacity % 64 != 0)
-            masks[word] &= (UINT64_C(1) << (capacity % 64)) - 1;
+        if (word + 1 == word_count && capacity % 64 != 0) masks[word] &= (UINT64_C(1) << (capacity % 64)) - 1;
         combined |= masks[word];
     }
     return combined != 0;
@@ -738,10 +747,8 @@ inline __aicore__ bool aicore_try_claim_free_slot_v1(
         uint32_t last_word = static_cast<uint32_t>((range_end - 1) / 64);
         for (uint32_t word = first_word; word <= last_word; ++word) {
             uint64_t candidates = masks[word];
-            if (word == first_word && range_begin % 64 != 0)
-                candidates &= ~((UINT64_C(1) << (range_begin % 64)) - 1);
-            if (word == last_word && range_end % 64 != 0)
-                candidates &= (UINT64_C(1) << (range_end % 64)) - 1;
+            if (word == first_word && range_begin % 64 != 0) candidates &= ~((UINT64_C(1) << (range_begin % 64)) - 1);
+            if (word == last_word && range_end % 64 != 0) candidates &= (UINT64_C(1) << (range_end % 64)) - 1;
             while (candidates != 0) {
                 uint32_t bit_index = static_cast<uint32_t>(__builtin_ctzll(candidates));
                 candidates &= candidates - 1;
@@ -845,11 +852,12 @@ inline __aicore__ bool aicore_observe_claim_binding_v1(
 inline __aicore__ bool aicore_fill_dispatch_slot_v1(
     const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver,
     __gm__ AicoreRunControlV1 *run_control, const AicoreFreeSlotClaimV1 &slot_claim,
-    const AicoreReadyClaimV1 &ready_claim, bool trace_enabled = false
+    const AicoreReadyClaimV1 &ready_claim, bool trace_enabled = false, AicoreDispatchFillTimingV1 *timing = nullptr
 ) {
     if (ready_claim.task_id < 0 || static_cast<uint64_t>(ready_claim.task_id) >= graph.task_count ||
         slot_claim.worker_id >= resolver->runtime_worker_count || slot_claim.slot_index >= AICORE_PENDING_SLOT_COUNT_V1)
         return false;
+    uint64_t operation_start = timing == nullptr ? 0 : aicore_scheduler_cycles_v1();
     __gm__ AicoreTaskMetadataV1 *metadata_source =
         aicore_task_metadata_at_v1(sidecar_base, resolver, ready_claim.task_id);
     aicore_observe_cache_line_v0(metadata_source);
@@ -933,6 +941,9 @@ inline __aicore__ bool aicore_fill_dispatch_slot_v1(
     binding_destination->ready_claim_resolver_worker_id = binding.ready_claim_resolver_worker_id;
     aicore_writeback_cache_line_v0(binding_destination);
 
+    uint64_t operation_end = timing == nullptr ? 0 : aicore_scheduler_cycles_v1();
+    if (timing != nullptr) timing->prepare_cycles += operation_end - operation_start;
+
     AicoreTaskInfoV0 task{
         ready_claim.task_id,
         static_cast<int32_t>(kernel_id),
@@ -946,6 +957,8 @@ inline __aicore__ bool aicore_fill_dispatch_slot_v1(
         aicore_record_scheduler_error_v1(run_control, ready_claim.task_id, status, &graph, resolver, UINT64_C(46));
         return false;
     }
+    uint64_t materialize_end = timing == nullptr ? 0 : aicore_scheduler_cycles_v1();
+    if (timing != nullptr) timing->materialize_cycles += materialize_end - operation_end;
     aicore_publish_dispatch_payload_v1(payload);
     __gm__ AicoreTaskControlV1 *control = aicore_task_control_at_v1(sidecar_base, resolver, ready_claim.task_id);
     if (trace_enabled) {
@@ -956,6 +969,7 @@ inline __aicore__ bool aicore_fill_dispatch_slot_v1(
     aicore_gm_publish_v0(
         slot->publication, aicore_dispatch_publication_v1(generation, AicoreDispatchPublicationV1::READY)
     );
+    if (timing != nullptr) timing->publish_cycles += aicore_scheduler_cycles_v1() - materialize_end;
     return true;
 }
 
@@ -1029,11 +1043,10 @@ inline __aicore__ bool aicore_resolve_completion_v1(
     const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *context,
     __gm__ AicoreRunControlV1 *run_control, int64_t task_id, AicoreWakeStatsV1 *wake_stats,
     AicoreReadyStatsV1 *ready_stats, AicoreCompletionStatsV1 *completion_stats, bool trace_enabled = false,
-    bool validate_done_state = true
+    bool validate_done_state = true, uint64_t *ready_publish_cycles = nullptr
 ) {
     __gm__ AicoreTaskControlV1 *control = aicore_task_control_at_v1(sidecar_base, context, task_id);
-    if (validate_done_state &&
-        aicore_gm_query_v0(control->state) != static_cast<int64_t>(AicoreTaskStateV1::DONE)) {
+    if (validate_done_state && aicore_gm_query_v0(control->state) != static_cast<int64_t>(AicoreTaskStateV1::DONE)) {
         aicore_record_scheduler_error_v1(
             run_control, task_id, AicoreRootStatusV0::INVALID_ARGUMENTS, &graph, context, UINT64_C(61)
         );
@@ -1097,6 +1110,7 @@ inline __aicore__ bool aicore_resolve_completion_v1(
         }
         waiter = next;
     }
+    uint64_t ready_publish_start = ready_publish_cycles == nullptr ? 0 : aicore_scheduler_cycles_v1();
     for (uint32_t type = 0; type < AICORE_CORE_TYPE_COUNT_V1; ++type) {
         if (!aicore_ready_batch_push_v1(
                 sidecar_base, context, type, context->inbox_index, &batches[type], ready_stats
@@ -1107,6 +1121,7 @@ inline __aicore__ bool aicore_resolve_completion_v1(
             return false;
         }
     }
+    if (ready_publish_cycles != nullptr) *ready_publish_cycles += aicore_scheduler_cycles_v1() - ready_publish_start;
     if (trace_enabled) {
         control->completion_resolve_end_cycles = aicore_scheduler_cycles_v1();
         aicore_publish_cache_line_v0(&control->next_waiter);

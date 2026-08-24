@@ -30,7 +30,10 @@ The AICore phases are:
   `Bootstrap{AIC,AIV}{ReadyClaim,SlotFill,FreeAdvertise,Other}` breakdown;
 - scheduling: `ReadyPop`, `ReadySteal`, `ReadyScan`, `ReadyPublish`,
   `SlotRefill`, and the
-  `InterTask{CompletionService,DispatchAIC,DispatchAIV,ReadyPoll,Backoff,Other}`
+  `InterTaskCompletion{Scan,Consume,Resolve,ReadyPublish,Refill,Finalize}`,
+  `InterTaskGangService`,
+  `InterTaskDispatch{AIC,AIV}{Probe,Claim,Prepare,Materialize,Publish}`, and
+  `InterTask{ReadyPoll,Backoff,Other}`
   breakdown;
 - execution: `Payload`, `Kernel`, `CompletionEnqueue`, `PostCompletion`;
 - resolution: `CompletionBatchPrepare`, `CompletionBatchClaim`, `WakeResolve`;
@@ -52,9 +55,11 @@ barrier, and target-slot initialization. Per-target component durations are
 accumulated on device and rendered contiguously, so their widths are exact but
 their display order does not represent individual slot-operation order.
 
-Long inter-task gaps are split by accumulated time in completion service,
-AIC/AIV overflow dispatch, unsuccessful slot polling, and idle backoff. The
-residual `InterTaskOther` contains loop control and instrumentation overhead.
+Long inter-task gaps, including the interval before each worker's first task,
+are split by accumulated time in completion scan/consume/resolve/refill,
+Gang service, AIC/AIV probe/claim/prepare/materialize/publish, unsuccessful
+slot polling, and idle backoff. The residual `InterTaskOther` contains loop
+control and instrumentation overhead.
 Old traces without these counters retain the aggregate `InterTaskSchedule`.
 
 `CompletionEnqueue` records include `completion_id` and `inbox_index`. The ID

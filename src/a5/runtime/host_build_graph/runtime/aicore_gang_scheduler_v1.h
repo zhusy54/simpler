@@ -47,8 +47,8 @@ inline __host__ __aicore__ __gm__ AicoreGangCommandV1 *aicore_gang_command_at_v1
 }
 
 inline __aicore__ void aicore_gang_publish_command_v1(
-    __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver, uint64_t resolver_index,
-    uint32_t cohort_index, uint64_t generation, AicoreGangCohortStateV1 state
+    __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver, uint64_t resolver_index, uint32_t cohort_index,
+    uint64_t generation, AicoreGangCohortStateV1 state
 ) {
     __gm__ AicoreGangCommandV1 *command = aicore_gang_command_at_v1(sidecar_base, resolver, resolver_index);
     command->generation[cohort_index] = generation;
@@ -57,19 +57,15 @@ inline __aicore__ void aicore_gang_publish_command_v1(
 }
 
 inline __aicore__ bool aicore_gang_forward_command_v1(
-    __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver,
-    __gm__ AicoreGangParticipantV1 *participant, uint32_t cohort_index, uint64_t generation,
-    AicoreGangCohortStateV1 state
+    __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver, __gm__ AicoreGangParticipantV1 *participant,
+    uint32_t cohort_index, uint64_t generation, AicoreGangCohortStateV1 state
 ) {
-    if (participant->forwarded_generation == generation &&
-        participant->forwarded_state == static_cast<uint32_t>(state))
+    if (participant->forwarded_generation == generation && participant->forwarded_state == static_cast<uint32_t>(state))
         return false;
     const uint64_t children[2] = {resolver->resolver_index * 2 + 1, resolver->resolver_index * 2 + 2};
     for (uint32_t child_slot = 0; child_slot < 2; ++child_slot) {
         if (children[child_slot] >= participant->participant_count) continue;
-        aicore_gang_publish_command_v1(
-            sidecar_base, resolver, children[child_slot], cohort_index, generation, state
-        );
+        aicore_gang_publish_command_v1(sidecar_base, resolver, children[child_slot], cohort_index, generation, state);
     }
     participant->forwarded_generation = generation;
     participant->forwarded_state = static_cast<uint32_t>(state);
@@ -81,18 +77,16 @@ inline __host__ __aicore__ uint32_t aicore_gang_popcount_v1(uint32_t mask) {
     return static_cast<uint32_t>(__builtin_popcount(mask));
 }
 
-inline __aicore__ __gm__ volatile uint64_t *aicore_gang_local_token_v1(
-    __gm__ AicoreGangParticipantV1 *participant, AicoreGangTokenPhaseV1 phase
-) {
+inline __aicore__ __gm__ volatile uint64_t *
+aicore_gang_local_token_v1(__gm__ AicoreGangParticipantV1 *participant, AicoreGangTokenPhaseV1 phase) {
     if (phase == AicoreGangTokenPhaseV1::DRAIN) return &participant->drain_local_token;
     if (phase == AicoreGangTokenPhaseV1::STAGE) return &participant->stage_local_token;
     if (phase == AicoreGangTokenPhaseV1::DISPATCH) return &participant->dispatch_local_token;
     return &participant->completion_local_token;
 }
 
-inline __aicore__ __gm__ volatile uint64_t *aicore_gang_subtree_token_v1(
-    __gm__ AicoreGangParticipantV1 *participant, AicoreGangTokenPhaseV1 phase
-) {
+inline __aicore__ __gm__ volatile uint64_t *
+aicore_gang_subtree_token_v1(__gm__ AicoreGangParticipantV1 *participant, AicoreGangTokenPhaseV1 phase) {
     if (phase == AicoreGangTokenPhaseV1::DRAIN) return &participant->drain_subtree_token;
     if (phase == AicoreGangTokenPhaseV1::STAGE) return &participant->stage_subtree_token;
     if (phase == AicoreGangTokenPhaseV1::DISPATCH) return &participant->dispatch_subtree_token;
@@ -137,8 +131,8 @@ inline __aicore__ bool aicore_gang_update_subtree_token_v1(
 }
 
 inline __aicore__ bool aicore_gang_root_token_ready_v1(
-    __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver, uint32_t cohort_index,
-    uint64_t generation, AicoreGangTokenPhaseV1 phase
+    __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver, uint32_t cohort_index, uint64_t generation,
+    AicoreGangTokenPhaseV1 phase
 ) {
     __gm__ AicoreGangParticipantV1 *root = aicore_gang_participant_at_v1(sidecar_base, resolver, cohort_index, 0);
     __gm__ volatile uint64_t *token = aicore_gang_subtree_token_v1(root, phase);
@@ -146,13 +140,11 @@ inline __aicore__ bool aicore_gang_root_token_ready_v1(
     return *token == generation;
 }
 
-inline __host__ __aicore__ uint64_t aicore_gang_retire_token_v1(uint64_t generation) {
-    return ~generation;
-}
+inline __host__ __aicore__ uint64_t aicore_gang_retire_token_v1(uint64_t generation) { return ~generation; }
 
 inline __aicore__ void aicore_gang_publish_retire_v1(
-    __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver,
-    __gm__ AicoreGangParticipantV1 *participant, uint32_t cohort_index, uint64_t generation
+    __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver, __gm__ AicoreGangParticipantV1 *participant,
+    uint32_t cohort_index, uint64_t generation
 ) {
     const uint64_t retire_token = aicore_gang_retire_token_v1(generation);
     aicore_gang_publish_local_token_v1(participant, AicoreGangTokenPhaseV1::COMPLETION, retire_token);
@@ -190,8 +182,7 @@ inline __aicore__ bool aicore_fill_explicit_dispatch_slot_v1(
 
     __gm__ AicoreWorkerContextV1 *target = aicore_worker_context_at_v1(sidecar_base, resolver, worker_id);
     aicore_observe_cache_line_v0(target);
-    __gm__ AicoreDispatchSlotV1 *slot =
-        aicore_dispatch_slot_at_v1(sidecar_base, resolver, worker_id, pending_slot);
+    __gm__ AicoreDispatchSlotV1 *slot = aicore_dispatch_slot_at_v1(sidecar_base, resolver, worker_id, pending_slot);
     aicore_observe_cache_line_v0(slot);
     uint32_t generation = slot->generation + 1;
     if (generation == 0) generation = 1;
@@ -214,11 +205,14 @@ inline __aicore__ bool aicore_fill_explicit_dispatch_slot_v1(
     aicore_writeback_cache_line_v0(slot);
 
     AicoreTaskInfoV0 task{
-        task_id, static_cast<int32_t>(kernel_id), static_cast<int32_t>(subtask_slot),
+        task_id,
+        static_cast<int32_t>(kernel_id),
+        static_cast<int32_t>(subtask_slot),
         subtask_slot == 0 ? AicoreRootCoreTypeV0::AIC : AicoreRootCoreTypeV0::AIV,
     };
     __gm__ PTO2DispatchPayload *payload = aicore_sidecar_at_v1<PTO2DispatchPayload>(
-        sidecar_base, target->dispatch_payload_offset + static_cast<uint64_t>(pending_slot) * sizeof(PTO2DispatchPayload)
+        sidecar_base,
+        target->dispatch_payload_offset + static_cast<uint64_t>(pending_slot) * sizeof(PTO2DispatchPayload)
     );
     AicoreRootStatusV0 status = aicore_materialize_task_payload_resolved_v0(
         graph, task, callable_address, payload, static_cast<int32_t>(block_idx), static_cast<int32_t>(block_num)
@@ -236,8 +230,7 @@ inline __aicore__ int32_t aicore_gang_find_free_pending_slot_v1(
     __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver, uint64_t worker_id
 ) {
     for (uint32_t pending_slot = 0; pending_slot < AICORE_PENDING_SLOT_COUNT_V1; ++pending_slot) {
-        __gm__ AicoreDispatchSlotV1 *slot =
-            aicore_dispatch_slot_at_v1(sidecar_base, resolver, worker_id, pending_slot);
+        __gm__ AicoreDispatchSlotV1 *slot = aicore_dispatch_slot_at_v1(sidecar_base, resolver, worker_id, pending_slot);
         if (aicore_dispatch_state_v1(aicore_gm_query_v0(slot->publication)) == AicoreDispatchPublicationV1::FREE)
             return static_cast<int32_t>(pending_slot);
     }
@@ -317,12 +310,10 @@ inline __aicore__ bool aicore_gang_fill_mix_block_v1(
         for (uint8_t subtask_slot = 0; subtask_slot < 3; ++subtask_slot) {
             if ((participant->active_mask & (1U << subtask_slot)) == 0) continue;
             __gm__ AicoreDispatchSlotV1 *slot = aicore_dispatch_slot_at_v1(
-                sidecar_base, resolver, resolver->cluster_worker_ids[subtask_slot],
-                static_cast<uint32_t>(pending_slot)
+                sidecar_base, resolver, resolver->cluster_worker_ids[subtask_slot], static_cast<uint32_t>(pending_slot)
             );
             aicore_gm_store_v0(
-                slot->publication,
-                aicore_dispatch_publication_v1(slot->generation, AicoreDispatchPublicationV1::READY)
+                slot->publication, aicore_dispatch_publication_v1(slot->generation, AicoreDispatchPublicationV1::READY)
             );
         }
     }
@@ -335,8 +326,8 @@ inline __aicore__ bool aicore_gang_local_slots_drained_v1(
 ) {
     const bool single_aiv = aicore_gang_popcount_v1(active_mask) == 1 && (active_mask & 6U) != 0;
     for (uint32_t cluster_lane = 0; cluster_lane < 3; ++cluster_lane) {
-        const bool used = cluster_lane == 0 ? (active_mask & 1U) != 0 :
-                                             (single_aiv || (active_mask & (1U << cluster_lane)) != 0);
+        const bool used =
+            cluster_lane == 0 ? (active_mask & 1U) != 0 : (single_aiv || (active_mask & (1U << cluster_lane)) != 0);
         if (!used) continue;
         for (uint32_t pending_slot = 0; pending_slot < AICORE_PENDING_SLOT_COUNT_V1; ++pending_slot) {
             __gm__ AicoreDispatchSlotV1 *slot = aicore_dispatch_slot_at_v1(
@@ -404,8 +395,7 @@ inline __aicore__ void aicore_gang_release_local_slots_v1(
             aicore_observe_cache_line_v0(slot);
             if (slot->cohort_index != cohort_index || slot->cohort_generation != generation) continue;
             aicore_gm_store_v0(
-                slot->publication,
-                aicore_dispatch_publication_v1(slot->generation, AicoreDispatchPublicationV1::READY)
+                slot->publication, aicore_dispatch_publication_v1(slot->generation, AicoreDispatchPublicationV1::READY)
             );
         }
     }
@@ -427,9 +417,7 @@ inline __aicore__ int64_t aicore_gang_select_ready_task_v1(
     return AICORE_TASK_ID_INVALID_V1;
 }
 
-inline __aicore__ uint32_t aicore_gang_assigned_blocks_v1(
-    uint32_t first, uint32_t stride, uint32_t logical_block_num
-) {
+inline __aicore__ uint32_t aicore_gang_assigned_blocks_v1(uint32_t first, uint32_t stride, uint32_t logical_block_num) {
     if (first >= logical_block_num) return 0;
     return 1 + (logical_block_num - 1 - first) / stride;
 }
@@ -509,12 +497,8 @@ inline __aicore__ bool aicore_gang_admit_one_v1(
             participant->next_block[0] = participant_index * 2;
             participant->next_block[1] = participant_index * 2 + 1;
             participant->local_expected_subtasks =
-                aicore_gang_assigned_blocks_v1(
-                    participant->next_block[0], participant->block_stride, block_num
-                ) +
-                aicore_gang_assigned_blocks_v1(
-                    participant->next_block[1], participant->block_stride, block_num
-                );
+                aicore_gang_assigned_blocks_v1(participant->next_block[0], participant->block_stride, block_num) +
+                aicore_gang_assigned_blocks_v1(participant->next_block[1], participant->block_stride, block_num);
         } else {
             participant->block_stride = static_cast<uint32_t>(resolver->resolver_count);
             participant->next_block[0] = participant_index;
@@ -536,9 +520,10 @@ inline __aicore__ bool aicore_gang_admit_one_v1(
     cohort->participant_count = participant_count;
     cohort->local_stride = single_aiv ? resolver->resolver_count * 2 : resolver->resolver_count;
     cohort->admitted_cycles = aicore_scheduler_cycles_v1();
-    cohort->state = static_cast<uint64_t>(aicore_task_requires_sync_start_v1(metadata->flags) ?
-                                              AicoreGangCohortStateV1::DRAINING :
-                                              AicoreGangCohortStateV1::DISPATCHING);
+    cohort->state = static_cast<uint64_t>(
+        aicore_task_requires_sync_start_v1(metadata->flags) ? AicoreGangCohortStateV1::DRAINING :
+                                                              AicoreGangCohortStateV1::DISPATCHING
+    );
     aicore_publish_cache_line_v0(cohort);
     __gm__ AicoreTaskControlV1 *control = aicore_task_control_at_v1(sidecar_base, resolver, task_id);
     aicore_gm_store_v0(control->state, static_cast<int64_t>(AicoreTaskStateV1::DISPATCHING));
@@ -572,10 +557,9 @@ inline __aicore__ bool aicore_gang_service_participant_v1(
         aicore_gang_forward_command_v1(sidecar_base, resolver, participant, cohort_index, cohort_generation, state);
     if (state == AicoreGangCohortStateV1::DRAINING) {
         if (aicore_gang_local_slots_drained_v1(sidecar_base, resolver, participant->active_mask)) {
-            progress = aicore_gang_publish_local_token_v1(
-                           participant, AicoreGangTokenPhaseV1::DRAIN, cohort_generation
-                       ) ||
-                       progress;
+            progress =
+                aicore_gang_publish_local_token_v1(participant, AicoreGangTokenPhaseV1::DRAIN, cohort_generation) ||
+                progress;
         }
         (void)aicore_gang_update_subtree_token_v1(
             sidecar_base, resolver, cohort_index, participant->participant_count, cohort_generation,
@@ -584,8 +568,7 @@ inline __aicore__ bool aicore_gang_service_participant_v1(
     } else if (state == AicoreGangCohortStateV1::STAGING) {
         const uint32_t before = participant->local_published_subtasks;
         aicore_gang_fill_participant_v1(
-            graph, sidecar_base, resolver, run_control, participant, cohort_index,
-            AicoreDispatchPublicationV1::GATED
+            graph, sidecar_base, resolver, run_control, participant, cohort_index, AicoreDispatchPublicationV1::GATED
         );
         progress = participant->local_published_subtasks != before;
         if (participant->local_published_subtasks == participant->local_expected_subtasks)
@@ -596,10 +579,9 @@ inline __aicore__ bool aicore_gang_service_participant_v1(
         );
     } else if (state == AicoreGangCohortStateV1::RELEASING) {
         aicore_gang_release_local_slots_v1(sidecar_base, resolver, cohort_index, cohort_generation);
-        progress = aicore_gang_publish_local_token_v1(
-                       participant, AicoreGangTokenPhaseV1::DISPATCH, cohort_generation
-                   ) ||
-                   progress;
+        progress =
+            aicore_gang_publish_local_token_v1(participant, AicoreGangTokenPhaseV1::DISPATCH, cohort_generation) ||
+            progress;
         (void)aicore_gang_update_subtree_token_v1(
             sidecar_base, resolver, cohort_index, participant->participant_count, cohort_generation,
             AicoreGangTokenPhaseV1::DISPATCH
@@ -607,8 +589,7 @@ inline __aicore__ bool aicore_gang_service_participant_v1(
     } else if (state == AicoreGangCohortStateV1::DISPATCHING) {
         const uint32_t before = participant->local_published_subtasks;
         aicore_gang_fill_participant_v1(
-            graph, sidecar_base, resolver, run_control, participant, cohort_index,
-            AicoreDispatchPublicationV1::READY
+            graph, sidecar_base, resolver, run_control, participant, cohort_index, AicoreDispatchPublicationV1::READY
         );
         progress = participant->local_published_subtasks != before;
         if (participant->local_published_subtasks == participant->local_expected_subtasks)
@@ -665,8 +646,7 @@ inline __aicore__ bool aicore_gang_service_owner_v1(
             sidecar_base, resolver, 0, cohort_index, generation, AicoreGangCohortStateV1::RELEASING
         );
         progress = true;
-    } else if ((state == AicoreGangCohortStateV1::RELEASING ||
-                state == AicoreGangCohortStateV1::DISPATCHING) &&
+    } else if ((state == AicoreGangCohortStateV1::RELEASING || state == AicoreGangCohortStateV1::DISPATCHING) &&
                aicore_gang_root_token_ready_v1(
                    sidecar_base, resolver, cohort_index, generation, AicoreGangTokenPhaseV1::DISPATCH
                )) {
@@ -686,12 +666,11 @@ inline __aicore__ bool aicore_gang_service_owner_v1(
         aicore_gang_root_token_ready_v1(
             sidecar_base, resolver, cohort_index, generation, AicoreGangTokenPhaseV1::COMPLETION
         )) {
-        __gm__ AicoreTaskControlV1 *control =
-            aicore_task_control_at_v1(sidecar_base, resolver, cohort->task_id);
+        __gm__ AicoreTaskControlV1 *control = aicore_task_control_at_v1(sidecar_base, resolver, cohort->task_id);
         aicore_gm_store_v0(control->state, static_cast<int64_t>(AicoreTaskStateV1::DONE));
         if (!aicore_resolve_completion_v1(
-                graph, sidecar_base, resolver, run_control, cohort->task_id, wake_stats, ready_stats,
-                completion_stats, false, false
+                graph, sidecar_base, resolver, run_control, cohort->task_id, wake_stats, ready_stats, completion_stats,
+                false, false
             )) {
             return false;
         }
@@ -702,8 +681,7 @@ inline __aicore__ bool aicore_gang_service_owner_v1(
         aicore_gang_publish_command_v1(
             sidecar_base, resolver, 0, cohort_index, generation, AicoreGangCohortStateV1::FREE
         );
-        __gm__ AicoreGangParticipantV1 *root =
-            aicore_gang_participant_at_v1(sidecar_base, resolver, cohort_index, 0);
+        __gm__ AicoreGangParticipantV1 *root = aicore_gang_participant_at_v1(sidecar_base, resolver, cohort_index, 0);
         aicore_observe_cache_line_v0(root);
         (void)aicore_gang_forward_command_v1(
             sidecar_base, resolver, root, cohort_index, generation, AicoreGangCohortStateV1::FREE
@@ -763,9 +741,8 @@ inline __aicore__ bool aicore_service_gang_scheduler_v1(
         }
         if (state == AicoreGangCohortStateV1::FREE) {
             if (!owner && generation != 0) {
-                __gm__ AicoreGangParticipantV1 *participant = aicore_gang_participant_at_v1(
-                    sidecar_base, resolver, cohort_index, resolver->resolver_index
-                );
+                __gm__ AicoreGangParticipantV1 *participant =
+                    aicore_gang_participant_at_v1(sidecar_base, resolver, cohort_index, resolver->resolver_index);
                 // This Resolver necessarily observed its participant config in
                 // an earlier active phase before the cohort could complete.
                 // Keep that owner-local line hot after FREE instead of forcing
@@ -776,9 +753,7 @@ inline __aicore__ bool aicore_service_gang_scheduler_v1(
                                    sidecar_base, resolver, participant, cohort_index, generation, state
                                ) ||
                                progress;
-                    aicore_gang_publish_retire_v1(
-                        sidecar_base, resolver, participant, cohort_index, generation
-                    );
+                    aicore_gang_publish_retire_v1(sidecar_base, resolver, participant, cohort_index, generation);
                 }
             }
             continue;
@@ -795,8 +770,7 @@ inline __aicore__ bool aicore_service_gang_scheduler_v1(
                        progress;
         }
     }
-    if (owner)
-        progress = aicore_gang_admit_one_v1(graph, sidecar_base, resolver, run_control) || progress;
+    if (owner) progress = aicore_gang_admit_one_v1(graph, sidecar_base, resolver, run_control) || progress;
     return progress;
 }
 
@@ -804,7 +778,7 @@ inline __aicore__ bool aicore_service_cluster_completions_v1(
     const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver,
     __gm__ AicoreRunControlV1 *run_control, AicoreWakeStatsV1 *wake_stats, AicoreReadyStatsV1 *ready_stats,
     AicoreCompletionStatsV1 *completion_stats, uint64_t *ready_victim_cursors = nullptr, bool trace_enabled = false,
-    uint64_t *direct_refilled_slot_mask = nullptr
+    uint64_t *direct_refilled_slot_mask = nullptr, AicoreCompletionServiceTimingV1 *timing = nullptr
 ) {
     if (resolver->is_resolver == 0) return false;
     if (direct_refilled_slot_mask != nullptr) *direct_refilled_slot_mask = 0;
@@ -827,6 +801,7 @@ inline __aicore__ bool aicore_service_cluster_completions_v1(
                 );
                 return false;
             }
+            uint64_t operation_start = timing == nullptr ? 0 : aicore_scheduler_cycles_v1();
             aicore_observe_cache_line_v0(slot);
             const int64_t task_id = slot->task_id;
             const bool gang = slot->gang != 0;
@@ -834,12 +809,17 @@ inline __aicore__ bool aicore_service_cluster_completions_v1(
             const uint32_t cohort_index = slot->cohort_index;
             const uint32_t cohort_generation = slot->cohort_generation;
             aicore_gm_store_v0(completion_line->completed_generations[pending_slot], UINT64_C(0));
+            uint64_t operation_end = timing == nullptr ? 0 : aicore_scheduler_cycles_v1();
+            if (timing != nullptr) timing->consume_cycles += operation_end - operation_start;
             bool direct_refilled = false;
+            operation_start = operation_end;
+            uint64_t ready_publish_cycles = 0;
+            uint64_t refill_cycles = 0;
+            uint64_t finalize_cycles = 0;
             if (gang) {
                 if (cohort_index >= AICORE_GANG_COHORT_COUNT_V1) return false;
-                __gm__ AicoreGangParticipantV1 *participant = aicore_gang_participant_at_v1(
-                    sidecar_base, resolver, cohort_index, resolver->resolver_index
-                );
+                __gm__ AicoreGangParticipantV1 *participant =
+                    aicore_gang_participant_at_v1(sidecar_base, resolver, cohort_index, resolver->resolver_index);
                 aicore_observe_cache_line_v0(participant);
                 if (participant->config_generation != cohort_generation || participant->task_id != task_id ||
                     participant->local_completed_subtasks >= participant->local_expected_subtasks) {
@@ -855,24 +835,29 @@ inline __aicore__ bool aicore_service_cluster_completions_v1(
                 aicore_gm_store_v0(control->state, static_cast<int64_t>(AicoreTaskStateV1::DONE));
                 if (!aicore_resolve_completion_v1(
                         graph, sidecar_base, resolver, run_control, task_id, wake_stats, ready_stats, completion_stats,
-                        false, false
+                        false, false, timing == nullptr ? nullptr : &ready_publish_cycles
                     ))
                     return false;
+                if (timing != nullptr) timing->ready_publish_cycles += ready_publish_cycles;
                 if (completion_stats != nullptr) ++completion_stats->resolve_count;
+                uint64_t resolved_count_start = timing == nullptr ? 0 : aicore_scheduler_cycles_v1();
                 aicore_gm_fetch_add_v0(run_control->resolved_task_count, UINT64_C(1));
+                if (timing != nullptr) {
+                    finalize_cycles = aicore_scheduler_cycles_v1() - resolved_count_start;
+                    timing->finalize_cycles += finalize_cycles;
+                }
+                uint64_t refill_start = timing == nullptr ? 0 : aicore_scheduler_cycles_v1();
                 if (ready_victim_cursors != nullptr) {
-                    __gm__ AicoreGangCoordinatorV1 *coordinator =
-                        aicore_gang_coordinator_at_v1(sidecar_base, resolver);
+                    __gm__ AicoreGangCoordinatorV1 *coordinator = aicore_gang_coordinator_at_v1(sidecar_base, resolver);
                     bool normal_fill_allowed = coordinator->gang_task_count == 0;
                     if (!normal_fill_allowed) {
                         aicore_observe_cache_line_v0(coordinator);
                         aicore_observe_cache_line_v0(&coordinator->active_dispatch_cohort);
-                        normal_fill_allowed = coordinator->ready_priority_bits == 0 &&
-                                              coordinator->active_dispatch_cohort == UINT64_MAX;
+                        normal_fill_allowed =
+                            coordinator->ready_priority_bits == 0 && coordinator->active_dispatch_cohort == UINT64_MAX;
                     }
                     if (normal_fill_allowed) {
-                        const uint32_t core_type =
-                            aicore_metadata_core_type_index_v1(completed_subtask_slot);
+                        const uint32_t core_type = aicore_metadata_core_type_index_v1(completed_subtask_slot);
                         AicoreReadyClaimV1 ready{};
                         if (!aicore_claim_ready_for_slot_v1(
                                 graph, sidecar_base, resolver, run_control, resolver->resolver_count, core_type,
@@ -892,7 +877,18 @@ inline __aicore__ bool aicore_service_cluster_completions_v1(
                         }
                     }
                 }
+                if (timing != nullptr) {
+                    refill_cycles = aicore_scheduler_cycles_v1() - refill_start;
+                    timing->refill_cycles += refill_cycles;
+                }
             }
+            operation_end = timing == nullptr ? 0 : aicore_scheduler_cycles_v1();
+            if (timing != nullptr) {
+                uint64_t resolve_total = operation_end - operation_start;
+                uint64_t excluded = ready_publish_cycles + refill_cycles + finalize_cycles;
+                timing->resolve_cycles += resolve_total > excluded ? resolve_total - excluded : 0;
+            }
+            operation_start = operation_end;
             if (!direct_refilled) {
                 slot->task_id = AICORE_TASK_ID_INVALID_V1;
                 aicore_writeback_cache_line_v0(slot);
@@ -901,10 +897,34 @@ inline __aicore__ bool aicore_service_cluster_completions_v1(
                     aicore_dispatch_publication_v1(slot->generation, AicoreDispatchPublicationV1::FREE)
                 );
             }
+            if (timing != nullptr) timing->finalize_cycles += aicore_scheduler_cycles_v1() - operation_start;
             progress = true;
         }
     }
     return progress;
+}
+
+struct AicoreNormalDispatchTimingV1 {
+    uint64_t probe_cycles[AICORE_CORE_TYPE_COUNT_V1]{};
+    uint64_t claim_cycles[AICORE_CORE_TYPE_COUNT_V1]{};
+    uint64_t prepare_cycles[AICORE_CORE_TYPE_COUNT_V1]{};
+    uint64_t materialize_cycles[AICORE_CORE_TYPE_COUNT_V1]{};
+    uint64_t publish_cycles[AICORE_CORE_TYPE_COUNT_V1]{};
+};
+
+inline __aicore__ uint64_t
+aicore_normal_dispatch_detail_cycles_v1(const AicoreNormalDispatchTimingV1 &timing, uint32_t core_type) {
+    return timing.claim_cycles[core_type] + timing.prepare_cycles[core_type] + timing.materialize_cycles[core_type] +
+           timing.publish_cycles[core_type];
+}
+
+inline __aicore__ void aicore_finish_normal_dispatch_stage_v1(
+    AicoreNormalDispatchTimingV1 *timing, uint32_t core_type, uint64_t stage_start, uint64_t detail_start
+) {
+    if (timing == nullptr) return;
+    uint64_t stage_cycles = aicore_scheduler_cycles_v1() - stage_start;
+    uint64_t detail_cycles = aicore_normal_dispatch_detail_cycles_v1(*timing, core_type) - detail_start;
+    timing->probe_cycles[core_type] += stage_cycles > detail_cycles ? stage_cycles - detail_cycles : 0;
 }
 
 inline __host__ __aicore__ bool aicore_normal_aiv_worker_precedes_v1(
@@ -918,30 +938,33 @@ inline __host__ __aicore__ bool aicore_normal_aiv_worker_precedes_v1(
 inline __aicore__ bool aicore_fill_cluster_normal_slots_v1(
     const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver,
     __gm__ AicoreRunControlV1 *run_control, uint64_t *ready_victim_cursors, AicoreReadyStatsV1 *ready_stats,
-    bool trace_enabled, uint64_t skip_slot_mask = 0
+    bool trace_enabled, uint64_t skip_slot_mask = 0, AicoreNormalDispatchTimingV1 *timing = nullptr
 ) {
     if (resolver->is_resolver == 0) return false;
+    const uint32_t aic_core_type = static_cast<uint32_t>(AicoreRootCoreTypeV0::AIC);
+    uint64_t stage_start = timing == nullptr ? 0 : aicore_scheduler_cycles_v1();
+    uint64_t detail_start = timing == nullptr ? 0 : aicore_normal_dispatch_detail_cycles_v1(*timing, aic_core_type);
     __gm__ AicoreGangCoordinatorV1 *coordinator = aicore_gang_coordinator_at_v1(sidecar_base, resolver);
     if (coordinator->gang_task_count != 0) {
         aicore_observe_cache_line_v0(coordinator);
         aicore_observe_cache_line_v0(&coordinator->active_dispatch_cohort);
-        if (coordinator->ready_priority_bits != 0 || coordinator->active_dispatch_cohort != UINT64_MAX) return false;
+        if (coordinator->ready_priority_bits != 0 || coordinator->active_dispatch_cohort != UINT64_MAX) {
+            aicore_finish_normal_dispatch_stage_v1(timing, aic_core_type, stage_start, detail_start);
+            return false;
+        }
     }
     bool progress = false;
 
     // AIC has no peer lane in its Cluster, so preserve the existing slot order.
-    const uint32_t aic_core_type = static_cast<uint32_t>(AicoreRootCoreTypeV0::AIC);
-    if (aicore_ready_directory_nonempty_v1(
-            sidecar_base, resolver, resolver->resolver_count, aic_core_type
-        )) {
+    if (aicore_ready_directory_nonempty_v1(sidecar_base, resolver, resolver->resolver_count, aic_core_type)) {
         bool aic_ready_available = true;
         for (uint32_t cluster_lane = 0; cluster_lane < 3 && aic_ready_available; ++cluster_lane) {
             const uint64_t worker_id = resolver->cluster_worker_ids[cluster_lane];
             __gm__ AicoreWorkerContextV1 *target = aicore_worker_context_at_v1(sidecar_base, resolver, worker_id);
             if (target->active == 0 || target->core_type != static_cast<int32_t>(AicoreRootCoreTypeV0::AIC)) continue;
             for (uint32_t pending_slot = 0; pending_slot < AICORE_PENDING_SLOT_COUNT_V1; ++pending_slot) {
-                if ((skip_slot_mask &
-                     (UINT64_C(1) << (cluster_lane * AICORE_PENDING_SLOT_COUNT_V1 + pending_slot))) != 0)
+                if ((skip_slot_mask & (UINT64_C(1) << (cluster_lane * AICORE_PENDING_SLOT_COUNT_V1 + pending_slot))) !=
+                    0)
                     continue;
                 __gm__ AicoreDispatchSlotV1 *slot =
                     aicore_dispatch_slot_at_v1(sidecar_base, resolver, worker_id, pending_slot);
@@ -953,25 +976,37 @@ inline __aicore__ bool aicore_fill_cluster_normal_slots_v1(
                         &ready_victim_cursors[aic_core_type], ready_stats, &ready, trace_enabled
                     ))
                     return progress;
+                if (timing != nullptr && ready.claim_end_cycles >= ready.claim_start_cycles)
+                    timing->claim_cycles[aic_core_type] += ready.claim_end_cycles - ready.claim_start_cycles;
                 if (ready.task_id < 0) {
                     aic_ready_available = false;
                     break;
                 }
                 AicoreFreeSlotClaimV1 claim{
-                    worker_id, pending_slot, aicore_dispatch_generation_v1(publication),
+                    worker_id,
+                    pending_slot,
+                    aicore_dispatch_generation_v1(publication),
                 };
                 aicore_gm_store_v0(
                     slot->publication,
                     aicore_dispatch_publication_v1(claim.generation, AicoreDispatchPublicationV1::FILLING)
                 );
+                AicoreDispatchFillTimingV1 fill_timing{};
                 if (!aicore_fill_dispatch_slot_v1(
-                        graph, sidecar_base, resolver, run_control, claim, ready, trace_enabled
+                        graph, sidecar_base, resolver, run_control, claim, ready, trace_enabled,
+                        timing == nullptr ? nullptr : &fill_timing
                     ))
                     return false;
+                if (timing != nullptr) {
+                    timing->prepare_cycles[aic_core_type] += fill_timing.prepare_cycles;
+                    timing->materialize_cycles[aic_core_type] += fill_timing.materialize_cycles;
+                    timing->publish_cycles[aic_core_type] += fill_timing.publish_cycles;
+                }
                 progress = true;
             }
         }
     }
+    aicore_finish_normal_dispatch_stage_v1(timing, aic_core_type, stage_start, detail_start);
 
     // A Resolver shares its AIV with Executor work. Exhaust the non-Resolver
     // peer's free slots before using the Resolver, leaving the Resolver
@@ -984,9 +1019,9 @@ inline __aicore__ bool aicore_fill_cluster_normal_slots_v1(
         bool is_resolver{false};
     };
     const uint32_t aiv_core_type = static_cast<uint32_t>(AicoreRootCoreTypeV0::AIV);
-    if (aicore_ready_directory_nonempty_v1(
-            sidecar_base, resolver, resolver->resolver_count, aiv_core_type
-        )) {
+    stage_start = timing == nullptr ? 0 : aicore_scheduler_cycles_v1();
+    detail_start = timing == nullptr ? 0 : aicore_normal_dispatch_detail_cycles_v1(*timing, aiv_core_type);
+    if (aicore_ready_directory_nonempty_v1(sidecar_base, resolver, resolver->resolver_count, aiv_core_type)) {
         AivWorkerSlots aiv_workers[2]{};
         uint32_t aiv_worker_count = 0;
         for (uint32_t cluster_lane = 0; cluster_lane < 3; ++cluster_lane) {
@@ -998,8 +1033,8 @@ inline __aicore__ bool aicore_fill_cluster_normal_slots_v1(
             worker.worker_id = worker_id;
             worker.is_resolver = worker_id == resolver->worker_index;
             for (uint32_t pending_slot = 0; pending_slot < AICORE_PENDING_SLOT_COUNT_V1; ++pending_slot) {
-                if ((skip_slot_mask &
-                     (UINT64_C(1) << (cluster_lane * AICORE_PENDING_SLOT_COUNT_V1 + pending_slot))) != 0) {
+                if ((skip_slot_mask & (UINT64_C(1) << (cluster_lane * AICORE_PENDING_SLOT_COUNT_V1 + pending_slot))) !=
+                    0) {
                     ++worker.occupied_slots;
                     continue;
                 }
@@ -1009,8 +1044,7 @@ inline __aicore__ bool aicore_fill_cluster_normal_slots_v1(
                 worker.publications[pending_slot] = publication;
                 if (aicore_dispatch_state_v1(publication) == AicoreDispatchPublicationV1::FREE)
                     worker.free_mask |= 1U << pending_slot;
-                else
-                    ++worker.occupied_slots;
+                else ++worker.occupied_slots;
             }
         }
         for (uint32_t attempt = 0; attempt < aiv_worker_count * AICORE_PENDING_SLOT_COUNT_V1; ++attempt) {
@@ -1035,10 +1069,14 @@ inline __aicore__ bool aicore_fill_cluster_normal_slots_v1(
                     &ready_victim_cursors[aiv_core_type], ready_stats, &ready, trace_enabled
                 ))
                 return progress;
+            if (timing != nullptr && ready.claim_end_cycles >= ready.claim_start_cycles)
+                timing->claim_cycles[aiv_core_type] += ready.claim_end_cycles - ready.claim_start_cycles;
             if (ready.task_id < 0) break;
             const uint64_t publication = worker.publications[pending_slot];
             AicoreFreeSlotClaimV1 claim{
-                worker.worker_id, pending_slot, aicore_dispatch_generation_v1(publication),
+                worker.worker_id,
+                pending_slot,
+                aicore_dispatch_generation_v1(publication),
             };
             __gm__ AicoreDispatchSlotV1 *slot =
                 aicore_dispatch_slot_at_v1(sidecar_base, resolver, worker.worker_id, pending_slot);
@@ -1046,13 +1084,21 @@ inline __aicore__ bool aicore_fill_cluster_normal_slots_v1(
                 slot->publication,
                 aicore_dispatch_publication_v1(claim.generation, AicoreDispatchPublicationV1::FILLING)
             );
+            AicoreDispatchFillTimingV1 fill_timing{};
             if (!aicore_fill_dispatch_slot_v1(
-                    graph, sidecar_base, resolver, run_control, claim, ready, trace_enabled
+                    graph, sidecar_base, resolver, run_control, claim, ready, trace_enabled,
+                    timing == nullptr ? nullptr : &fill_timing
                 ))
                 return false;
+            if (timing != nullptr) {
+                timing->prepare_cycles[aiv_core_type] += fill_timing.prepare_cycles;
+                timing->materialize_cycles[aiv_core_type] += fill_timing.materialize_cycles;
+                timing->publish_cycles[aiv_core_type] += fill_timing.publish_cycles;
+            }
             ++worker.occupied_slots;
             progress = true;
         }
     }
+    aicore_finish_normal_dispatch_stage_v1(timing, aiv_core_type, stage_start, detail_start);
     return progress;
 }
