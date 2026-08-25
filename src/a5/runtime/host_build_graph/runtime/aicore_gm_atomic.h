@@ -142,6 +142,19 @@ inline __aicore__ uint64_t aicore_gm_query_v0(__gm__ volatile uint64_t &value, i
 #endif
 }
 
+inline __aicore__ uint64_t aicore_gm_query_u32_pair_v0(__gm__ volatile uint32_t *values, int order = __ATOMIC_ACQUIRE) {
+#if defined(__CCE_AICORE__)
+    (void)order;
+    __gm__ uint32_t *first = const_cast<__gm__ uint32_t *>(values);
+    __gm__ uint64_t *address = reinterpret_cast<__gm__ uint64_t *>(first);
+    return static_cast<uint64_t>(__builtin_cce_ld_dev(address, 0));
+#else
+    const uint64_t low = __atomic_load_n(&values[0], order);
+    const uint64_t high = __atomic_load_n(&values[1], order);
+    return low | (high << 32);
+#endif
+}
+
 inline __aicore__ void
 aicore_gm_store_v0(__gm__ volatile int64_t &value, int64_t desired, int order = __ATOMIC_RELEASE) {
 #if defined(__CCE_AICORE__)
@@ -160,6 +173,17 @@ aicore_gm_store_v0(__gm__ volatile uint64_t &value, uint64_t desired, int order 
 #if defined(__CCE_AICORE__)
     (void)order;
     st_dev(desired, const_cast<__gm__ uint64_t *>(&value), 0);
+    OUT_OF_ORDER_STORE_BARRIER();
+#else
+    __atomic_store_n(&value, desired, order);
+#endif
+}
+
+inline __aicore__ void
+aicore_gm_store_v0(__gm__ volatile uint32_t &value, uint32_t desired, int order = __ATOMIC_RELEASE) {
+#if defined(__CCE_AICORE__)
+    (void)order;
+    st_dev(desired, const_cast<__gm__ uint32_t *>(&value), 0);
     OUT_OF_ORDER_STORE_BARRIER();
 #else
     __atomic_store_n(&value, desired, order);

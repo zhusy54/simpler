@@ -134,8 +134,8 @@ struct alignas(128) AicoreTaskControlV1 {
 struct alignas(128) AicoreCompletionInboxV1 {
     volatile int64_t head;
     uint8_t legacy_line_padding[56];
-    volatile uint64_t completed_generations[AICORE_PENDING_SLOT_COUNT_V1];
-    uint8_t completion_line_padding[48];
+    volatile uint32_t completed_generations[AICORE_PENDING_SLOT_COUNT_V1];
+    uint8_t completion_line_padding[56];
 };
 
 struct alignas(128) AicoreReadyInboxV1 {
@@ -551,6 +551,10 @@ static_assert(offsetof(AicoreTaskControlV1, inbox_next) == 80, "inbox link offse
 static_assert(sizeof(AicoreCompletionInboxV1) == 128, "completion inbox layout changed");
 static_assert(
     offsetof(AicoreCompletionInboxV1, completed_generations) == 64, "SPSC completion line must be cache aligned"
+);
+static_assert(
+    sizeof(decltype(AicoreCompletionInboxV1::completed_generations)) == sizeof(uint64_t),
+    "completion generations must fit one 64-bit device load"
 );
 static_assert(sizeof(AicoreReadyInboxV1) == 128, "ready inbox layout changed");
 static_assert(sizeof(AicoreGangCoordinatorV1) == 256, "gang coordinator layout changed");

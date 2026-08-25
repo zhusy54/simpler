@@ -787,9 +787,9 @@ inline __aicore__ bool aicore_service_cluster_completions_v1(
         const uint64_t worker_id = resolver->cluster_worker_ids[cluster_lane];
         __gm__ AicoreCompletionInboxV1 *completion_line =
             aicore_completion_inbox_at_v1(sidecar_base, resolver, worker_id);
+        const uint64_t completed_generations = aicore_gm_query_u32_pair_v0(completion_line->completed_generations);
         for (uint32_t pending_slot = 0; pending_slot < AICORE_PENDING_SLOT_COUNT_V1; ++pending_slot) {
-            const uint64_t completed_generation =
-                aicore_gm_query_v0(completion_line->completed_generations[pending_slot]);
+            const uint32_t completed_generation = static_cast<uint32_t>(completed_generations >> (pending_slot * 32));
             if (completed_generation == 0) continue;
             __gm__ AicoreDispatchSlotV1 *slot =
                 aicore_dispatch_slot_at_v1(sidecar_base, resolver, worker_id, pending_slot);
@@ -809,7 +809,7 @@ inline __aicore__ bool aicore_service_cluster_completions_v1(
             const uint8_t completed_subtask_slot = slot->subtask_slot;
             const uint32_t cohort_index = slot->cohort_index;
             const uint32_t cohort_generation = slot->cohort_generation;
-            aicore_gm_store_v0(completion_line->completed_generations[pending_slot], UINT64_C(0));
+            aicore_gm_store_v0(completion_line->completed_generations[pending_slot], UINT32_C(0));
             uint64_t operation_end = record_timeline ? aicore_scheduler_cycles_v1() : 0;
             if (timing != nullptr) timing->consume_cycles += operation_end - operation_start;
             bool direct_refilled = false;

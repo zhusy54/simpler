@@ -734,6 +734,15 @@ TEST(AicoreCompletionInboxV1, ConcurrentPublishAndDetachNeverExposeUnpublishedLi
         EXPECT_EQ(count.load(), 1u);
 }
 
+TEST(AicoreCompletionInboxV1, PacksBothGenerationSlotsInOneDeviceWord) {
+    alignas(uint64_t) volatile uint32_t generations[AICORE_PENDING_SLOT_COUNT_V1] = {
+        UINT32_C(0x11223344), UINT32_C(0x55667788)
+    };
+    EXPECT_EQ(aicore_gm_query_u32_pair_v0(generations), UINT64_C(0x5566778811223344));
+    aicore_gm_store_v0(generations[1], UINT32_C(0));
+    EXPECT_EQ(aicore_gm_query_u32_pair_v0(generations), UINT64_C(0x0000000011223344));
+}
+
 TEST(AicoreCompletionInboxV1, PerWorkerCompletionIdRotatesInitialAicWaveAcrossResolvers) {
     constexpr uint64_t kRuntimeWorkers = 84;
     constexpr uint64_t kResolvers = 56;

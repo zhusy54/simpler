@@ -1860,8 +1860,8 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
                     completion_inboxes[worker].completed_generations[0] != 0 ||
                     completion_inboxes[worker].completed_generations[1] != 0) {
                     LOG_ERROR(
-                        "A5 HBG AICore scheduler: completion line=%d not empty head=%" PRId64 " generations={%" PRIu64
-                        ",%" PRIu64 "}",
+                        "A5 HBG AICore scheduler: completion line=%d not empty head=%" PRId64 " generations={%" PRIu32
+                        ",%" PRIu32 "}",
                         worker, completion_inboxes[worker].head, completion_inboxes[worker].completed_generations[0],
                         completion_inboxes[worker].completed_generations[1]
                     );
