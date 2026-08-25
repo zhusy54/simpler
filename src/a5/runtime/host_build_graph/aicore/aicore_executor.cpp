@@ -252,7 +252,8 @@ __aicore__ __attribute__((always_inline)) void commit_task_trace(
 
 __aicore__ bool bootstrap_ready_graph(
     const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver,
-    __gm__ AicoreRunControlV1 *run_control, uint64_t resolver_count, AicoreWorkerStatsV1 *stats, bool trace_enabled
+    __gm__ AicoreRunControlV1 *run_control, uint64_t resolver_count, AicoreWorkerStatsV1 *stats, bool trace_enabled,
+    AicoreDeferredAivQueueV1 *deferred_aiv
 ) {
     if (resolver_count == 0 || resolver->inbox_index >= resolver_count) return false;
     if (trace_enabled) stats->bootstrap_start_cycles = aicore_scheduler_cycles_v1();
@@ -346,7 +347,8 @@ __aicore__ bool bootstrap_ready_graph(
         graph, sidecar_base, resolver, run_control, &stats->wake, &stats->ready, &stats->completion
     );
     (void)aicore_fill_cluster_normal_slots_v1(
-        graph, sidecar_base, resolver, run_control, ready_victim_cursors, &stats->ready, trace_enabled
+        graph, sidecar_base, resolver, run_control, ready_victim_cursors, &stats->ready, trace_enabled, 0, nullptr,
+        deferred_aiv
     );
 
     // This completion publication is observed by AICPU before it emits the
@@ -361,7 +363,7 @@ __aicore__ bool run_ready_dispatch_loop(
     const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *context,
     __gm__ AicoreRunControlV1 *run_control, AicoreTaskProfilingStateV1 *task_profiling, AicoreWorkerStatsV1 *stats,
     bool trace_enabled, uint64_t aicore_entry_cycles, uint64_t handshake_publish_cycles,
-    uint64_t register_release_cycles, uint64_t descriptor_cache_observed_cycles
+    uint64_t register_release_cycles, uint64_t descriptor_cache_observed_cycles, AicoreDeferredAivQueueV1 *deferred_aiv
 ) {
     uint64_t resolver_count = aicore_gm_query_v0(run_control->resolver_count);
     bool resolver_worker = context->is_resolver != 0;
@@ -396,7 +398,22 @@ __aicore__ bool run_ready_dispatch_loop(
         }
 
         bool scheduler_progress = false;
-        if (resolver_worker) {
+        uint32_t preferred_ready_slot = UINT32_MAX;
+        if (resolver_worker && deferred_aiv != nullptr && deferred_aiv->count != 0) {
+            const uint32_t deferred_before = deferred_aiv->count;
+            if (!aicore_drain_deferred_aiv_to_peer_v1(
+                    graph, sidecar_base, context, run_control, deferred_aiv, &stats->wake, &stats->ready,
+                    &stats->completion, trace_enabled
+                ))
+                return false;
+            scheduler_progress = deferred_aiv->count != deferred_before;
+            if (deferred_aiv->count != 0 &&
+                !aicore_publish_deferred_aiv_to_resolver_v1(
+                    graph, sidecar_base, context, run_control, deferred_aiv, trace_enabled, &preferred_ready_slot
+                ))
+                return false;
+        }
+        if (resolver_worker && preferred_ready_slot == UINT32_MAX) {
             uint64_t operation_start = trace_enabled ? get_sys_cnt_aicore() : 0;
             uint64_t direct_refilled_slot_mask = 0;
             AicoreCompletionServiceTimingV1 completion_timing{};
@@ -422,18 +439,18 @@ __aicore__ bool run_ready_dispatch_loop(
             }
             scheduler_progress = completion_progress;
             operation_start = trace_enabled ? get_sys_cnt_aicore() : 0;
-            scheduler_progress =
-                aicore_service_gang_scheduler_v1(
-                    graph, sidecar_base, context, run_control, &stats->wake, &stats->ready, &stats->completion
-                ) ||
-                scheduler_progress;
+            scheduler_progress = aicore_service_gang_scheduler_v1(
+                                     graph, sidecar_base, context, run_control, &stats->wake, &stats->ready,
+                                     &stats->completion
+                                 ) ||
+                                 scheduler_progress;
             if (trace_enabled) inter_task_timing.gang_service_cycles += get_sys_cnt_aicore() - operation_start;
             operation_start = trace_enabled ? get_sys_cnt_aicore() : 0;
             AicoreNormalDispatchTimingV1 dispatch_timing{};
             scheduler_progress =
                 aicore_fill_cluster_normal_slots_v1(
                     graph, sidecar_base, context, run_control, ready_victim_cursors, &stats->ready, trace_enabled,
-                    direct_refilled_slot_mask, trace_enabled ? &dispatch_timing : nullptr
+                    direct_refilled_slot_mask, trace_enabled ? &dispatch_timing : nullptr, deferred_aiv
                 ) ||
                 scheduler_progress;
             if (trace_enabled) {
@@ -446,22 +463,52 @@ __aicore__ bool run_ready_dispatch_loop(
                     inter_task_timing.dispatch.publish_cycles[type] += dispatch_timing.publish_cycles[type];
                 }
             }
+            if (deferred_aiv != nullptr && deferred_aiv->count != 0) {
+                const uint32_t deferred_before = deferred_aiv->count;
+                if (!aicore_drain_deferred_aiv_to_peer_v1(
+                        graph, sidecar_base, context, run_control, deferred_aiv, &stats->wake, &stats->ready,
+                        &stats->completion, trace_enabled
+                    ))
+                    return false;
+                scheduler_progress = scheduler_progress || deferred_aiv->count != deferred_before;
+                if (deferred_aiv->count != 0 &&
+                    !aicore_publish_deferred_aiv_to_resolver_v1(
+                        graph, sidecar_base, context, run_control, deferred_aiv, trace_enabled, &preferred_ready_slot
+                    ))
+                    return false;
+            }
         }
 
         int32_t ready_slot = -1;
         uint64_t ready_publication = 0;
         uint64_t ready_scan_start = trace_enabled ? get_sys_cnt_aicore() : 0;
-        for (uint32_t offset = 0; offset < AICORE_PENDING_SLOT_COUNT_V1; ++offset) {
-            uint32_t slot_index = (scan_start + offset) % AICORE_PENDING_SLOT_COUNT_V1;
+        if (preferred_ready_slot != UINT32_MAX) {
             __gm__ AicoreDispatchSlotV1 *slot =
-                aicore_dispatch_slot_at_v1(sidecar_base, context, context->worker_index, slot_index);
-            uint64_t publication = aicore_gm_query_v0(slot->publication);
+                aicore_dispatch_slot_at_v1(sidecar_base, context, context->worker_index, preferred_ready_slot);
+            const uint64_t publication = aicore_gm_query_v0(slot->publication);
             ++stats->task_state_poll_count;
-            if (publication != seen_publication[slot_index] &&
-                aicore_dispatch_state_v1(publication) == AicoreDispatchPublicationV1::READY) {
-                ready_slot = static_cast<int32_t>(slot_index);
-                ready_publication = publication;
-                break;
+            if (publication == seen_publication[preferred_ready_slot] ||
+                aicore_dispatch_state_v1(publication) != AicoreDispatchPublicationV1::READY) {
+                aicore_record_scheduler_error_v1(
+                    run_control, slot->task_id, AicoreRootStatusV0::INVALID_ARGUMENTS, &graph, context, UINT64_C(78)
+                );
+                return false;
+            }
+            ready_slot = static_cast<int32_t>(preferred_ready_slot);
+            ready_publication = publication;
+        } else {
+            for (uint32_t offset = 0; offset < AICORE_PENDING_SLOT_COUNT_V1; ++offset) {
+                uint32_t slot_index = (scan_start + offset) % AICORE_PENDING_SLOT_COUNT_V1;
+                __gm__ AicoreDispatchSlotV1 *slot =
+                    aicore_dispatch_slot_at_v1(sidecar_base, context, context->worker_index, slot_index);
+                uint64_t publication = aicore_gm_query_v0(slot->publication);
+                ++stats->task_state_poll_count;
+                if (publication != seen_publication[slot_index] &&
+                    aicore_dispatch_state_v1(publication) == AicoreDispatchPublicationV1::READY) {
+                    ready_slot = static_cast<int32_t>(slot_index);
+                    ready_publication = publication;
+                    break;
+                }
             }
         }
         uint64_t ready_poll_end = trace_enabled ? get_sys_cnt_aicore() : 0;
@@ -616,14 +663,16 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         context->task_window_mask,
     };
     AicoreWorkerStatsV1 stats{};
+    AicoreDeferredAivQueueV1 deferred_aiv{};
     uint64_t descriptor_cache_observed_cycles = 0;
     if (context->active != 0) {
         aicore_observe_data_cache_v0(reinterpret_cast<__gm__ void *>(graph.descriptors_address));
         descriptor_cache_observed_cycles = trace_enabled ? get_sys_cnt_aicore() : 0;
-        if (context->is_resolver != 0 && !bootstrap_ready_graph(
-                                             graph, sidecar_base, context, run_control,
-                                             aicore_gm_query_v0(run_control->resolver_count), &stats, trace_enabled
-                                         )) {
+        if (context->is_resolver != 0 &&
+            !bootstrap_ready_graph(
+                graph, sidecar_base, context, run_control, aicore_gm_query_v0(run_control->resolver_count), &stats,
+                trace_enabled, &deferred_aiv
+            )) {
             aicore_record_scheduler_error_v1(
                 run_control, AICORE_TASK_ID_INVALID_V1, AicoreRootStatusV0::INVALID_ARGUMENTS, &graph, context,
                 UINT64_C(90)
@@ -645,7 +694,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         if (context->active != 0) {
             (void)run_ready_dispatch_loop(
                 graph, sidecar_base, context, run_control, &task_profiling, &stats, trace_enabled, aicore_entry_cycles,
-                handshake_publish_cycles, register_release_cycles, descriptor_cache_observed_cycles
+                handshake_publish_cycles, register_release_cycles, descriptor_cache_observed_cycles, &deferred_aiv
             );
         }
     }

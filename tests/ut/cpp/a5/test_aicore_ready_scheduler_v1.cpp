@@ -139,6 +139,60 @@ struct FixtureStorage {
     AicoreTaskMetadataV1 *metadata{nullptr};
 };
 
+void configure_normal_aiv_cluster(FixtureStorage &storage, uint64_t task_count) {
+    storage.contexts[0].core_type = static_cast<int32_t>(AicoreRootCoreTypeV0::AIC);
+    AicoreWorkerContextV1 &resolver = storage.contexts[1];
+    resolver.is_resolver = 1;
+    resolver.resolver_index = 0;
+    resolver.resolver_count = 1;
+    resolver.inbox_index = 0;
+    resolver.cluster_worker_ids[0] = 0;
+    resolver.cluster_worker_ids[1] = 1;
+    resolver.cluster_worker_ids[2] = 2;
+    storage.run_control->resolver_count = 1;
+    auto *callables = aicore_sidecar_at_v1<uint64_t>(storage.sidecar->base(), storage.layout.callable_addresses_offset);
+    callables[1] = 0x1000;
+    for (uint64_t worker = 0; worker < 3; ++worker) {
+        for (uint32_t slot = 0; slot < AICORE_PENDING_SLOT_COUNT_V1; ++slot)
+            aicore_initialize_free_slot_v1(
+                aicore_dispatch_slot_at_v1(storage.sidecar->base(), &resolver, worker, slot)
+            );
+    }
+    for (uint64_t task = 0; task < task_count; ++task) {
+        storage.metadata[task].kernel_ids[0] = UINT16_MAX;
+        storage.metadata[task].kernel_ids[1] = 1;
+        storage.metadata[task].active_mask = 2;
+        storage.metadata[task].flags = AICORE_TASK_EXECUTABLE_V1;
+    }
+}
+
+void enqueue_normal_aiv_tasks(
+    FixtureStorage &storage, AicoreWorkerContextV1 &resolver, uint64_t task_begin, uint64_t task_end
+) {
+    AicoreReadyBatchV1 batch{};
+    AicoreReadyStatsV1 ready_stats{};
+    for (uint64_t task = task_begin; task < task_end; ++task) {
+        auto *control = aicore_task_control_at_v1(storage.sidecar->base(), &resolver, static_cast<int64_t>(task));
+        control->state = static_cast<int64_t>(AicoreTaskStateV1::READY);
+        ASSERT_TRUE(aicore_ready_batch_append_v1(
+            storage.sidecar->base(), &resolver, static_cast<int64_t>(task), &batch, &ready_stats
+        ));
+    }
+    ASSERT_TRUE(aicore_ready_batch_push_v1(storage.sidecar->base(), &resolver, 1, 0, &batch, &ready_stats));
+}
+
+void occupy_normal_slot(
+    FixtureStorage &storage, AicoreWorkerContextV1 &resolver, uint64_t worker_id, uint32_t pending_slot, int64_t task_id
+) {
+    auto *slot = aicore_dispatch_slot_at_v1(storage.sidecar->base(), &resolver, worker_id, pending_slot);
+    slot->task_id = task_id;
+    slot->subtask_slot = 1;
+    slot->gang = 0;
+    aicore_gm_store_v0(
+        slot->publication, aicore_dispatch_publication_v1(slot->generation, AicoreDispatchPublicationV1::READY)
+    );
+}
+
 TEST(AicoreReadySidecarV1, PlansAndInitializesReadyState) {
     AicoreExecutionSidecarLayoutV1 layout{};
     ASSERT_TRUE(aicore_sidecar_plan_v1(5, 3, 2, &layout));
@@ -951,6 +1005,213 @@ TEST(AicoreClusterCompletionV1, DirectlyRefillsCompletedSlotWhenReadyTaskExists)
     EXPECT_EQ(completed_control->state, static_cast<int64_t>(AicoreTaskStateV1::DONE));
     EXPECT_EQ(storage.run_control->resolved_task_count, 1u);
     EXPECT_EQ(direct_refilled_slot_mask, 1u);
+}
+
+TEST(AicoreDeferredAivV1, ReservesOnlyAvailableResolverSlotsBeforeClaiming) {
+    FixtureStorage storage(3, 3);
+    GraphBuffer graph(3);
+    for (uint64_t task = 0; task < 3; ++task)
+        graph.executable(task, 1);
+    configure_normal_aiv_cluster(storage, 3);
+    AicoreWorkerContextV1 &resolver = storage.contexts[1];
+    occupy_normal_slot(storage, resolver, 2, 0, AICORE_TASK_ID_INVALID_V1);
+    occupy_normal_slot(storage, resolver, 2, 1, AICORE_TASK_ID_INVALID_V1);
+    enqueue_normal_aiv_tasks(storage, resolver, 0, 3);
+
+    uint64_t victim_cursors[AICORE_CORE_TYPE_COUNT_V1]{};
+    AicoreReadyStatsV1 ready_stats{};
+    AicoreDeferredAivQueueV1 deferred{};
+    ASSERT_TRUE(aicore_fill_cluster_normal_slots_v1(
+        graph.graph(), storage.sidecar->base(), &resolver, storage.run_control, victim_cursors, &ready_stats, false, 0,
+        nullptr, &deferred
+    ));
+
+    ASSERT_EQ(deferred.count, AICORE_PENDING_SLOT_COUNT_V1);
+    for (uint32_t slot_index = 0; slot_index < AICORE_PENDING_SLOT_COUNT_V1; ++slot_index) {
+        auto *slot = aicore_dispatch_slot_at_v1(storage.sidecar->base(), &resolver, 1, slot_index);
+        EXPECT_EQ(aicore_dispatch_state_v1(slot->publication), AicoreDispatchPublicationV1::FILLING);
+        EXPECT_EQ(slot->task_id, AICORE_TASK_ID_INVALID_V1);
+    }
+    auto *ready_inbox = aicore_ready_inbox_at_v1(storage.sidecar->base(), &resolver, 1, 0);
+    EXPECT_NE(ready_inbox->head, AICORE_INBOX_EMPTY_V1);
+}
+
+TEST(AicoreDeferredAivV1, DoesNotClaimWithoutResolverReservation) {
+    FixtureStorage storage(1, 3);
+    GraphBuffer graph(1);
+    graph.executable(0, 1);
+    configure_normal_aiv_cluster(storage, 1);
+    AicoreWorkerContextV1 &resolver = storage.contexts[1];
+    for (uint64_t worker = 1; worker <= 2; ++worker) {
+        for (uint32_t slot = 0; slot < AICORE_PENDING_SLOT_COUNT_V1; ++slot)
+            occupy_normal_slot(storage, resolver, worker, slot, AICORE_TASK_ID_INVALID_V1);
+    }
+    enqueue_normal_aiv_tasks(storage, resolver, 0, 1);
+
+    uint64_t victim_cursors[AICORE_CORE_TYPE_COUNT_V1]{};
+    AicoreReadyStatsV1 ready_stats{};
+    AicoreDeferredAivQueueV1 deferred{};
+    EXPECT_FALSE(aicore_fill_cluster_normal_slots_v1(
+        graph.graph(), storage.sidecar->base(), &resolver, storage.run_control, victim_cursors, &ready_stats, false, 0,
+        nullptr, &deferred
+    ));
+    EXPECT_EQ(deferred.count, 0u);
+    auto *ready_inbox = aicore_ready_inbox_at_v1(storage.sidecar->base(), &resolver, 1, 0);
+    EXPECT_EQ(ready_inbox->head, 0);
+}
+
+TEST(AicoreDeferredAivV1, PrefersNewPeerCapacityAndSelfPublishesOnlyOne) {
+    FixtureStorage storage(2, 3);
+    GraphBuffer graph(2);
+    for (uint64_t task = 0; task < 2; ++task)
+        graph.executable(task, 1);
+    configure_normal_aiv_cluster(storage, 2);
+    AicoreWorkerContextV1 &resolver = storage.contexts[1];
+    occupy_normal_slot(storage, resolver, 2, 0, AICORE_TASK_ID_INVALID_V1);
+    occupy_normal_slot(storage, resolver, 2, 1, AICORE_TASK_ID_INVALID_V1);
+    enqueue_normal_aiv_tasks(storage, resolver, 0, 2);
+    uint64_t victim_cursors[AICORE_CORE_TYPE_COUNT_V1]{};
+    AicoreReadyStatsV1 ready_stats{};
+    AicoreDeferredAivQueueV1 deferred{};
+    ASSERT_TRUE(aicore_fill_cluster_normal_slots_v1(
+        graph.graph(), storage.sidecar->base(), &resolver, storage.run_control, victim_cursors, &ready_stats, false, 0,
+        nullptr, &deferred
+    ));
+    ASSERT_EQ(deferred.count, 2u);
+    const AicoreFreeSlotClaimV1 first_reservation = deferred.entries[0].reserved_slot;
+
+    auto *peer_slot = aicore_dispatch_slot_at_v1(storage.sidecar->base(), &resolver, 2, 0);
+    peer_slot->task_id = AICORE_TASK_ID_INVALID_V1;
+    aicore_gm_store_v0(
+        peer_slot->publication, aicore_dispatch_publication_v1(peer_slot->generation, AicoreDispatchPublicationV1::FREE)
+    );
+    AicoreWakeStatsV1 wake_stats{};
+    AicoreCompletionStatsV1 completion_stats{};
+    ASSERT_TRUE(aicore_drain_deferred_aiv_to_peer_v1(
+        graph.graph(), storage.sidecar->base(), &resolver, storage.run_control, &deferred, &wake_stats, &ready_stats,
+        &completion_stats, false
+    ));
+    ASSERT_EQ(deferred.count, 1u);
+    EXPECT_EQ(aicore_dispatch_state_v1(peer_slot->publication), AicoreDispatchPublicationV1::READY);
+    auto *released = aicore_dispatch_slot_at_v1(
+        storage.sidecar->base(), &resolver, first_reservation.worker_id, first_reservation.slot_index
+    );
+    EXPECT_EQ(aicore_dispatch_state_v1(released->publication), AicoreDispatchPublicationV1::FREE);
+
+    uint32_t self_slot = UINT32_MAX;
+    ASSERT_TRUE(aicore_publish_deferred_aiv_to_resolver_v1(
+        graph.graph(), storage.sidecar->base(), &resolver, storage.run_control, &deferred, false, &self_slot
+    ));
+    EXPECT_EQ(deferred.count, 0u);
+    ASSERT_LT(self_slot, AICORE_PENDING_SLOT_COUNT_V1);
+    auto *published = aicore_dispatch_slot_at_v1(storage.sidecar->base(), &resolver, 1, self_slot);
+    EXPECT_EQ(aicore_dispatch_state_v1(published->publication), AicoreDispatchPublicationV1::READY);
+}
+
+TEST(AicoreDeferredAivV1, KeepsSecondReservationAfterOneSelfPublish) {
+    FixtureStorage storage(2, 3);
+    GraphBuffer graph(2);
+    for (uint64_t task = 0; task < 2; ++task)
+        graph.executable(task, 1);
+    configure_normal_aiv_cluster(storage, 2);
+    AicoreWorkerContextV1 &resolver = storage.contexts[1];
+    occupy_normal_slot(storage, resolver, 2, 0, AICORE_TASK_ID_INVALID_V1);
+    occupy_normal_slot(storage, resolver, 2, 1, AICORE_TASK_ID_INVALID_V1);
+    enqueue_normal_aiv_tasks(storage, resolver, 0, 2);
+    uint64_t victim_cursors[AICORE_CORE_TYPE_COUNT_V1]{};
+    AicoreReadyStatsV1 ready_stats{};
+    AicoreDeferredAivQueueV1 deferred{};
+    ASSERT_TRUE(aicore_fill_cluster_normal_slots_v1(
+        graph.graph(), storage.sidecar->base(), &resolver, storage.run_control, victim_cursors, &ready_stats, false, 0,
+        nullptr, &deferred
+    ));
+    ASSERT_EQ(deferred.count, 2u);
+
+    uint32_t self_slot = UINT32_MAX;
+    ASSERT_TRUE(aicore_publish_deferred_aiv_to_resolver_v1(
+        graph.graph(), storage.sidecar->base(), &resolver, storage.run_control, &deferred, false, &self_slot
+    ));
+    ASSERT_EQ(deferred.count, 1u);
+    auto *published = aicore_dispatch_slot_at_v1(storage.sidecar->base(), &resolver, 1, self_slot);
+    EXPECT_EQ(aicore_dispatch_state_v1(published->publication), AicoreDispatchPublicationV1::READY);
+    const AicoreFreeSlotClaimV1 remaining = deferred.entries[0].reserved_slot;
+    auto *reserved =
+        aicore_dispatch_slot_at_v1(storage.sidecar->base(), &resolver, remaining.worker_id, remaining.slot_index);
+    EXPECT_EQ(aicore_dispatch_state_v1(reserved->publication), AicoreDispatchPublicationV1::FILLING);
+    EXPECT_EQ(reserved->task_id, AICORE_TASK_ID_INVALID_V1);
+}
+
+TEST(AicoreDeferredAivV1, RetiresCompletedPeerAndRefillsWithoutFreeDecision) {
+    FixtureStorage storage(2, 3);
+    GraphBuffer graph(2);
+    graph.executable(0, 1);
+    graph.executable(1, 1);
+    configure_normal_aiv_cluster(storage, 2);
+    AicoreWorkerContextV1 &resolver = storage.contexts[1];
+    occupy_normal_slot(storage, resolver, 2, 0, 0);
+    occupy_normal_slot(storage, resolver, 2, 1, AICORE_TASK_ID_INVALID_V1);
+    occupy_normal_slot(storage, resolver, 1, 1, AICORE_TASK_ID_INVALID_V1);
+    auto *completed_control = aicore_task_control_at_v1(storage.sidecar->base(), &resolver, 0);
+    completed_control->state = static_cast<int64_t>(AicoreTaskStateV1::READY);
+    enqueue_normal_aiv_tasks(storage, resolver, 1, 2);
+
+    uint64_t victim_cursors[AICORE_CORE_TYPE_COUNT_V1]{};
+    AicoreReadyStatsV1 ready_stats{};
+    AicoreDeferredAivQueueV1 deferred{};
+    ASSERT_TRUE(aicore_fill_cluster_normal_slots_v1(
+        graph.graph(), storage.sidecar->base(), &resolver, storage.run_control, victim_cursors, &ready_stats, false, 0,
+        nullptr, &deferred
+    ));
+    ASSERT_EQ(deferred.count, 1u);
+    auto *peer_slot = aicore_dispatch_slot_at_v1(storage.sidecar->base(), &resolver, 2, 0);
+    const uint32_t completed_generation = peer_slot->generation;
+    auto *completion_line = aicore_completion_inbox_at_v1(storage.sidecar->base(), &resolver, 2);
+    completion_line->completed_generations[0] = completed_generation;
+
+    AicoreWakeStatsV1 wake_stats{};
+    AicoreCompletionStatsV1 completion_stats{};
+    ASSERT_TRUE(aicore_drain_deferred_aiv_to_peer_v1(
+        graph.graph(), storage.sidecar->base(), &resolver, storage.run_control, &deferred, &wake_stats, &ready_stats,
+        &completion_stats, false
+    ));
+    EXPECT_EQ(deferred.count, 0u);
+    EXPECT_EQ(completion_line->completed_generations[0], 0u);
+    EXPECT_EQ(completed_control->state, static_cast<int64_t>(AicoreTaskStateV1::DONE));
+    EXPECT_EQ(storage.run_control->resolved_task_count, 1u);
+    EXPECT_EQ(peer_slot->task_id, 1);
+    EXPECT_EQ(peer_slot->generation, completed_generation + 1);
+    EXPECT_EQ(aicore_dispatch_state_v1(peer_slot->publication), AicoreDispatchPublicationV1::READY);
+}
+
+TEST(AicoreDeferredAivV1, ResolverCompletionDoesNotDirectRefillItself) {
+    FixtureStorage storage(2, 3);
+    GraphBuffer graph(2);
+    graph.executable(0, 1);
+    graph.executable(1, 1);
+    configure_normal_aiv_cluster(storage, 2);
+    AicoreWorkerContextV1 &resolver = storage.contexts[1];
+    occupy_normal_slot(storage, resolver, 1, 0, 0);
+    auto *completed_slot = aicore_dispatch_slot_at_v1(storage.sidecar->base(), &resolver, 1, 0);
+    auto *completion_line = aicore_completion_inbox_at_v1(storage.sidecar->base(), &resolver, 1);
+    completion_line->completed_generations[0] = completed_slot->generation;
+    auto *completed_control = aicore_task_control_at_v1(storage.sidecar->base(), &resolver, 0);
+    completed_control->state = static_cast<int64_t>(AicoreTaskStateV1::READY);
+    enqueue_normal_aiv_tasks(storage, resolver, 1, 2);
+
+    AicoreWakeStatsV1 wake_stats{};
+    AicoreReadyStatsV1 ready_stats{};
+    AicoreCompletionStatsV1 completion_stats{};
+    uint64_t victim_cursors[AICORE_CORE_TYPE_COUNT_V1]{};
+    uint64_t direct_refilled_slot_mask = 0;
+    ASSERT_TRUE(aicore_service_cluster_completions_v1(
+        graph.graph(), storage.sidecar->base(), &resolver, storage.run_control, &wake_stats, &ready_stats,
+        &completion_stats, victim_cursors, false, &direct_refilled_slot_mask
+    ));
+    EXPECT_EQ(direct_refilled_slot_mask, 0u);
+    EXPECT_EQ(completed_slot->task_id, AICORE_TASK_ID_INVALID_V1);
+    EXPECT_EQ(aicore_dispatch_state_v1(completed_slot->publication), AicoreDispatchPublicationV1::FREE);
+    auto *ready_inbox = aicore_ready_inbox_at_v1(storage.sidecar->base(), &resolver, 1, 0);
+    EXPECT_EQ(ready_inbox->head, 1);
 }
 
 TEST(AicoreSyncStartV1, DrainsStagesAndReleasesBeforeCompletion) {
