@@ -928,6 +928,11 @@ inline __aicore__ bool aicore_service_cluster_completion_slot_v1(
     return true;
 }
 
+inline __host__ __aicore__ uint32_t aicore_completion_catchup_mask_v1(uint32_t initial_completion_mask) {
+    constexpr uint32_t all_pending_slots_mask = (1U << AICORE_PENDING_SLOT_COUNT_V1) - 1;
+    return initial_completion_mask == 0 ? 0 : all_pending_slots_mask & ~initial_completion_mask;
+}
+
 inline __aicore__ bool aicore_service_cluster_completions_v1(
     const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver,
     __gm__ AicoreRunControlV1 *run_control, AicoreWakeStatsV1 *wake_stats, AicoreReadyStatsV1 *ready_stats,
@@ -942,21 +947,36 @@ inline __aicore__ bool aicore_service_cluster_completions_v1(
         const uint64_t worker_id = resolver->cluster_worker_ids[cluster_lane];
         __gm__ AicoreCompletionInboxV1 *completion_line =
             aicore_completion_inbox_at_v1(sidecar_base, resolver, worker_id);
-        const uint64_t completed_generations = aicore_gm_query_u32_pair_v0(completion_line->completed_generations);
+        uint64_t completed_generations = aicore_gm_query_u32_pair_v0(completion_line->completed_generations);
+        uint32_t initial_completion_mask = 0;
         for (uint32_t pending_slot = 0; pending_slot < AICORE_PENDING_SLOT_COUNT_V1; ++pending_slot) {
-            const uint32_t completed_generation = static_cast<uint32_t>(completed_generations >> (pending_slot * 32));
-            if (completed_generation == 0) continue;
-            bool direct_refilled = false;
-            if (!aicore_service_cluster_completion_slot_v1(
-                    graph, sidecar_base, resolver, run_control, cluster_lane, pending_slot, completed_generation,
-                    wake_stats, ready_stats, completion_stats, ready_victim_cursors, trace_enabled, nullptr,
-                    &direct_refilled, timing, owner_state
-                ))
-                return false;
-            if (direct_refilled && direct_refilled_slot_mask != nullptr)
-                *direct_refilled_slot_mask |= UINT64_C(1)
-                                              << (cluster_lane * AICORE_PENDING_SLOT_COUNT_V1 + pending_slot);
-            progress = true;
+            if (static_cast<uint32_t>(completed_generations >> (pending_slot * 32)) != 0)
+                initial_completion_mask |= 1U << pending_slot;
+        }
+        uint32_t scan_mask = initial_completion_mask;
+        // Completion processing can be much slower than the sibling kernel. Refresh the packed completion line once
+        // for slots that were incomplete in the initial scan, excluding newly refilled slots from the catch-up pass.
+        for (uint32_t scan_pass = 0; scan_pass < 2 && scan_mask != 0; ++scan_pass) {
+            for (uint32_t pending_slot = 0; pending_slot < AICORE_PENDING_SLOT_COUNT_V1; ++pending_slot) {
+                if ((scan_mask & (1U << pending_slot)) == 0) continue;
+                const uint32_t completed_generation =
+                    static_cast<uint32_t>(completed_generations >> (pending_slot * 32));
+                if (completed_generation == 0) continue;
+                bool direct_refilled = false;
+                if (!aicore_service_cluster_completion_slot_v1(
+                        graph, sidecar_base, resolver, run_control, cluster_lane, pending_slot, completed_generation,
+                        wake_stats, ready_stats, completion_stats, ready_victim_cursors, trace_enabled, nullptr,
+                        &direct_refilled, timing, owner_state
+                    ))
+                    return false;
+                if (direct_refilled && direct_refilled_slot_mask != nullptr)
+                    *direct_refilled_slot_mask |= UINT64_C(1)
+                                                  << (cluster_lane * AICORE_PENDING_SLOT_COUNT_V1 + pending_slot);
+                progress = true;
+            }
+            scan_mask = scan_pass == 0 ? aicore_completion_catchup_mask_v1(initial_completion_mask) : 0;
+            if (scan_mask != 0)
+                completed_generations = aicore_gm_query_u32_pair_v0(completion_line->completed_generations);
         }
     }
     return progress;

@@ -1143,6 +1143,13 @@ TEST(AicoreClusterCompletionV1, SpscGenerationCompletesNormalTask) {
     EXPECT_EQ(storage.run_control->resolved_task_count, 1u);
 }
 
+TEST(AicoreClusterCompletionV1, CatchupRefreshIsBoundedToInitiallyEmptySibling) {
+    EXPECT_EQ(aicore_completion_catchup_mask_v1(0), UINT32_C(0));
+    EXPECT_EQ(aicore_completion_catchup_mask_v1(1), UINT32_C(2));
+    EXPECT_EQ(aicore_completion_catchup_mask_v1(2), UINT32_C(1));
+    EXPECT_EQ(aicore_completion_catchup_mask_v1(3), UINT32_C(0));
+}
+
 TEST(AicoreClusterCompletionV1, DirectlyRefillsCompletedSlotWhenReadyTaskExists) {
     FixtureStorage storage(2, 3);
     GraphBuffer graph(2);
