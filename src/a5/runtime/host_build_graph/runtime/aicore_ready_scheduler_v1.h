@@ -66,6 +66,15 @@ struct AicoreReadyBatchV1 {
     uint64_t count{0};
 };
 
+struct AicoreReadyOwnerQueueV1 {
+    AicoreReadyBatchV1 pending{};
+    bool advertised{false};
+};
+
+struct AicoreReadyOwnerStateV1 {
+    AicoreReadyOwnerQueueV1 queues[AICORE_CORE_TYPE_COUNT_V1]{};
+};
+
 struct AicoreReadyClaimV1 {
     int64_t task_id{AICORE_TASK_ID_INVALID_V1};
     uint64_t inbox_index{UINT64_MAX};
@@ -394,20 +403,22 @@ inline __aicore__ bool aicore_bootstrap_ready_batch_append_v1(
     if (batch == nullptr || task_id < 0 || static_cast<uint64_t>(task_id) >= context->graph_task_count) return false;
     __gm__ AicoreTaskControlV1 *control = aicore_task_control_at_v1(sidecar_base, context, task_id);
     aicore_gm_store_v0(control->state, static_cast<int64_t>(AicoreTaskStateV1::READY));
-    if (batch->head == AICORE_INBOX_EMPTY_V1) {
-        control->next_waiter = AICORE_INBOX_EMPTY_V1;
-        batch->tail = task_id;
-    } else {
-        control->next_waiter = batch->head;
-    }
+    control->next_waiter = AICORE_INBOX_EMPTY_V1;
     aicore_writeback_cache_line_v0(&control->next_waiter);
+    if (batch->head == AICORE_INBOX_EMPTY_V1) {
+        batch->head = task_id;
+    } else {
+        __gm__ AicoreTaskControlV1 *tail = aicore_task_control_at_v1(sidecar_base, context, batch->tail);
+        tail->next_waiter = task_id;
+        aicore_writeback_cache_line_v0(&tail->next_waiter);
+    }
+    batch->tail = task_id;
     if (trace_enabled) {
         __gm__ AicoreTaskTraceCellV1 *cells =
             aicore_sidecar_at_v1<AicoreTaskTraceCellV1>(sidecar_base, context->trace_cells_offset);
         cells[task_id].ready_transition_cycles = aicore_scheduler_cycles_v1();
         aicore_writeback_cache_line_v0(&cells[task_id].ready_transition_cycles);
     }
-    batch->head = task_id;
     ++batch->count;
     if (stats != nullptr) ++stats->enqueue_count;
     return true;
@@ -463,13 +474,17 @@ inline __aicore__ bool aicore_ready_batch_append_v1(
     if (batch == nullptr || task_id < 0 || static_cast<uint64_t>(task_id) >= context->graph_task_count) return false;
     __gm__ AicoreTaskControlV1 *control = aicore_task_control_at_v1(sidecar_base, context, task_id);
     aicore_gm_store_v0(control->state, static_cast<int64_t>(AicoreTaskStateV1::READY));
-    if (batch->head == AICORE_INBOX_EMPTY_V1) {
-        control->next_waiter = AICORE_INBOX_LINK_UNPUBLISHED_V1;
-        batch->tail = task_id;
-    } else {
-        control->next_waiter = batch->head;
-    }
+    control->next_waiter = AICORE_INBOX_EMPTY_V1;
     aicore_publish_cache_line_v0(&control->next_waiter);
+    if (batch->head == AICORE_INBOX_EMPTY_V1) {
+        batch->head = task_id;
+    } else {
+        __gm__ AicoreTaskControlV1 *tail = aicore_task_control_at_v1(sidecar_base, context, batch->tail);
+        aicore_observe_cache_line_v0(&tail->next_waiter);
+        tail->next_waiter = task_id;
+        aicore_publish_cache_line_v0(&tail->next_waiter);
+    }
+    batch->tail = task_id;
     if (trace_enabled) {
         __gm__ AicoreTaskTraceCellV1 *cells =
             aicore_sidecar_at_v1<AicoreTaskTraceCellV1>(sidecar_base, context->trace_cells_offset);
@@ -478,7 +493,6 @@ inline __aicore__ bool aicore_ready_batch_append_v1(
         trace->ready_transition_cycles = aicore_scheduler_cycles_v1();
         aicore_publish_cache_line_v0(&trace->ready_transition_cycles);
     }
-    batch->head = task_id;
     ++batch->count;
     if (stats != nullptr) ++stats->enqueue_count;
     return true;
@@ -492,48 +506,140 @@ inline __aicore__ void aicore_ready_directory_set_v1(
     aicore_gm_fetch_or_v0(directory->core_types[core_type_index][shard].bits, bit);
 }
 
-inline __aicore__ void aicore_ready_directory_clear_and_recheck_v1(
-    __gm__ AicoreReadyDirectoryV1 *directory, __gm__ AicoreReadyInboxV1 *inbox, uint32_t core_type_index,
-    uint64_t inbox_index
+inline __aicore__ void aicore_ready_directory_clear_v1(
+    __gm__ AicoreReadyDirectoryV1 *directory, uint32_t core_type_index, uint64_t inbox_index
 ) {
     uint64_t shard = inbox_index / AICORE_READY_DIRECTORY_RESOLVERS_PER_SHARD_V1;
     uint64_t bit = UINT64_C(1) << (inbox_index % AICORE_READY_DIRECTORY_RESOLVERS_PER_SHARD_V1);
     aicore_gm_fetch_and_v0(directory->core_types[core_type_index][shard].bits, ~bit);
-    if (aicore_gm_query_v0(inbox->head) != AICORE_INBOX_EMPTY_V1)
-        aicore_gm_fetch_or_v0(directory->core_types[core_type_index][shard].bits, bit);
+}
+
+inline __aicore__ bool aicore_ready_batch_concat_v1(
+    __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *context, AicoreReadyBatchV1 *destination,
+    AicoreReadyBatchV1 *source
+) {
+    // Only the owner mutates pending links; links reachable from a shared inbox head stay immutable.
+    if (destination == nullptr || source == nullptr || source->head == AICORE_INBOX_EMPTY_V1) return true;
+    if (source->tail < 0) return false;
+    if (destination->head == AICORE_INBOX_EMPTY_V1) {
+        *destination = *source;
+        *source = {};
+        return true;
+    }
+    if (destination->tail < 0) return false;
+    __gm__ AicoreTaskControlV1 *tail = aicore_task_control_at_v1(sidecar_base, context, destination->tail);
+    aicore_observe_cache_line_v0(&tail->next_waiter);
+    tail->next_waiter = source->head;
+    aicore_publish_cache_line_v0(&tail->next_waiter);
+    destination->tail = source->tail;
+    destination->count += source->count;
+    *source = {};
+    return true;
+}
+
+inline __aicore__ bool aicore_ready_owner_maintain_type_v1(
+    __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *context, uint32_t core_type_index,
+    AicoreReadyOwnerStateV1 *owner_state
+) {
+    if (owner_state == nullptr || core_type_index >= AICORE_CORE_TYPE_COUNT_V1 ||
+        context->inbox_index >= AICORE_WORKER_CAPACITY_V1)
+        return false;
+    AicoreReadyOwnerQueueV1 &owner_queue = owner_state->queues[core_type_index];
+    __gm__ AicoreReadyInboxV1 *inbox =
+        aicore_ready_inbox_at_v1(sidecar_base, context, core_type_index, context->inbox_index);
+    __gm__ AicoreReadyDirectoryV1 *directory = aicore_ready_directory_at_v1(sidecar_base, context);
+    const int64_t head = aicore_gm_query_v0(inbox->head);
+    if (head < AICORE_INBOX_EMPTY_V1) return false;
+    if (head != AICORE_INBOX_EMPTY_V1) {
+        if (!owner_queue.advertised) {
+            aicore_ready_directory_set_v1(directory, core_type_index, context->inbox_index);
+            owner_queue.advertised = true;
+        }
+        return true;
+    }
+    if (owner_queue.pending.head != AICORE_INBOX_EMPTY_V1) {
+        if (owner_queue.pending.tail < 0) return false;
+        aicore_cache_barrier_v0();
+        aicore_gm_store_v0(inbox->head, owner_queue.pending.head);
+        owner_queue.pending = {};
+        if (!owner_queue.advertised) {
+            aicore_ready_directory_set_v1(directory, core_type_index, context->inbox_index);
+            owner_queue.advertised = true;
+        }
+        return true;
+    }
+    if (owner_queue.advertised) {
+        aicore_ready_directory_clear_v1(directory, core_type_index, context->inbox_index);
+        owner_queue.advertised = false;
+    }
+    return true;
+}
+
+inline __aicore__ bool aicore_ready_owner_maintain_v1(
+    __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *context, AicoreReadyOwnerStateV1 *owner_state
+) {
+    for (uint32_t type = 0; type < AICORE_CORE_TYPE_COUNT_V1; ++type) {
+        if (!aicore_ready_owner_maintain_type_v1(sidecar_base, context, type, owner_state)) return false;
+    }
+    return true;
 }
 
 inline __aicore__ bool aicore_ready_batch_push_v1(
     __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *context, uint32_t core_type_index, uint64_t inbox_index,
-    AicoreReadyBatchV1 *batch, AicoreReadyStatsV1 *stats
+    AicoreReadyBatchV1 *batch, AicoreReadyStatsV1 *stats, AicoreReadyOwnerStateV1 *owner_state = nullptr
 ) {
     if (batch == nullptr || batch->head == AICORE_INBOX_EMPTY_V1) return true;
     if (core_type_index >= AICORE_CORE_TYPE_COUNT_V1 || inbox_index >= AICORE_WORKER_CAPACITY_V1 || batch->tail < 0)
         return false;
-    aicore_cache_barrier_v0();
     __gm__ AicoreReadyInboxV1 *inbox = aicore_ready_inbox_at_v1(sidecar_base, context, core_type_index, inbox_index);
-    __gm__ AicoreTaskControlV1 *tail = aicore_task_control_at_v1(sidecar_base, context, batch->tail);
-    int64_t previous = aicore_gm_query_v0(inbox->head);
-    while (true) {
-        if (previous < AICORE_INBOX_EMPTY_V1) return false;
-        // Keep the link on the cache-coherent DCCI path. This line also carries
-        // trace fields, so mixing raw-GM link updates with later whole-line
-        // writeback could restore a stale UNPUBLISHED value.
-        aicore_observe_cache_line_v0(&tail->next_waiter);
-        tail->next_waiter = previous;
-        aicore_publish_cache_line_v0(&tail->next_waiter);
-        int64_t actual = aicore_gm_compare_exchange_v0(inbox->head, previous, batch->head);
-        if (actual == previous) break;
-        previous = actual;
-        if (stats != nullptr) ++stats->cas_retry_count;
-    }
-    if (previous == AICORE_INBOX_EMPTY_V1) {
+    if (owner_state == nullptr) {
+        if (aicore_gm_query_v0(inbox->head) != AICORE_INBOX_EMPTY_V1) return false;
+        aicore_cache_barrier_v0();
+        aicore_gm_store_v0(inbox->head, batch->head);
         aicore_ready_directory_set_v1(
             aicore_ready_directory_at_v1(sidecar_base, context), core_type_index, inbox_index
         );
+    } else {
+        if (inbox_index != context->inbox_index) return false;
+        AicoreReadyOwnerQueueV1 &owner_queue = owner_state->queues[core_type_index];
+        const int64_t head = aicore_gm_query_v0(inbox->head);
+        if (head < AICORE_INBOX_EMPTY_V1) return false;
+        if (head == AICORE_INBOX_EMPTY_V1 && owner_queue.pending.head != AICORE_INBOX_EMPTY_V1) {
+            if (owner_queue.pending.tail < 0) return false;
+            aicore_cache_barrier_v0();
+            aicore_gm_store_v0(inbox->head, owner_queue.pending.head);
+            owner_queue.pending = {};
+            if (!owner_queue.advertised) {
+                aicore_ready_directory_set_v1(
+                    aicore_ready_directory_at_v1(sidecar_base, context), core_type_index, inbox_index
+                );
+                owner_queue.advertised = true;
+            }
+        }
+        const int64_t published_head = aicore_gm_query_v0(inbox->head);
+        if (published_head == AICORE_INBOX_EMPTY_V1) {
+            aicore_cache_barrier_v0();
+            aicore_gm_store_v0(inbox->head, batch->head);
+            if (!owner_queue.advertised) {
+                aicore_ready_directory_set_v1(
+                    aicore_ready_directory_at_v1(sidecar_base, context), core_type_index, inbox_index
+                );
+                owner_queue.advertised = true;
+            }
+            *batch = {};
+        } else {
+            if (published_head < AICORE_INBOX_EMPTY_V1) return false;
+            if (!owner_queue.advertised) {
+                aicore_ready_directory_set_v1(
+                    aicore_ready_directory_at_v1(sidecar_base, context), core_type_index, inbox_index
+                );
+                owner_queue.advertised = true;
+            }
+            if (!aicore_ready_batch_concat_v1(sidecar_base, context, &owner_queue.pending, batch)) return false;
+        }
     }
     if (stats != nullptr) ++stats->batch_count;
-    *batch = {};
+    if (owner_state == nullptr) *batch = {};
     return true;
 }
 
@@ -545,13 +651,9 @@ inline __aicore__ bool aicore_ready_pop_from_inbox_v1(
     if (task_id == nullptr) return false;
     *task_id = AICORE_TASK_ID_INVALID_V1;
     __gm__ AicoreReadyInboxV1 *inbox = aicore_ready_inbox_at_v1(sidecar_base, context, core_type_index, inbox_index);
-    __gm__ AicoreReadyDirectoryV1 *directory = aicore_ready_directory_at_v1(sidecar_base, context);
     for (uint32_t attempt = 0; attempt < 64; ++attempt) {
         int64_t head = aicore_gm_query_v0(inbox->head);
-        if (head == AICORE_INBOX_EMPTY_V1) {
-            aicore_ready_directory_clear_and_recheck_v1(directory, inbox, core_type_index, inbox_index);
-            return true;
-        }
+        if (head == AICORE_INBOX_EMPTY_V1) return true;
         if (head < 0 || static_cast<uint64_t>(head) >= graph.task_count) {
             aicore_record_scheduler_error_v1(
                 run_control, head, AicoreRootStatusV0::INVALID_TASK_ID, &graph, context, UINT64_C(40)
@@ -589,8 +691,6 @@ inline __aicore__ bool aicore_ready_pop_from_inbox_v1(
             if (stats != nullptr) ++stats->cas_retry_count;
             continue;
         }
-        if (next == AICORE_INBOX_EMPTY_V1)
-            aicore_ready_directory_clear_and_recheck_v1(directory, inbox, core_type_index, inbox_index);
         if (stats != nullptr) ++stats->pop_count;
         *task_id = head;
         return true;
@@ -649,11 +749,15 @@ static __attribute__((noinline)) __aicore__ bool aicore_steal_ready_from_shard_v
 inline __aicore__ bool aicore_claim_ready_for_slot_v1(
     const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *context,
     __gm__ AicoreRunControlV1 *run_control, uint64_t resolver_count, uint32_t core_type_index, uint64_t *victim_cursor,
-    AicoreReadyStatsV1 *stats, AicoreReadyClaimV1 *claim, bool trace_enabled = false
+    AicoreReadyStatsV1 *stats, AicoreReadyClaimV1 *claim, bool trace_enabled = false,
+    AicoreReadyOwnerStateV1 *owner_state = nullptr
 ) {
     if (victim_cursor == nullptr || claim == nullptr || resolver_count == 0) return false;
     *claim = {};
     claim->claim_start_cycles = trace_enabled ? aicore_scheduler_cycles_v1() : 0;
+    if (owner_state != nullptr &&
+        !aicore_ready_owner_maintain_type_v1(sidecar_base, context, core_type_index, owner_state))
+        return false;
     int64_t task_id = AICORE_TASK_ID_INVALID_V1;
     if (!aicore_ready_pop_from_inbox_v1(
             graph, sidecar_base, context, run_control, core_type_index, context->inbox_index, &task_id, stats
@@ -1045,7 +1149,8 @@ inline __aicore__ bool aicore_resolve_completion_v1(
     const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *context,
     __gm__ AicoreRunControlV1 *run_control, int64_t task_id, AicoreWakeStatsV1 *wake_stats,
     AicoreReadyStatsV1 *ready_stats, AicoreCompletionStatsV1 *completion_stats, bool trace_enabled = false,
-    bool validate_done_state = true, uint64_t *ready_publish_cycles = nullptr
+    bool validate_done_state = true, uint64_t *ready_publish_cycles = nullptr,
+    AicoreReadyOwnerStateV1 *owner_state = nullptr
 ) {
     __gm__ AicoreTaskControlV1 *control = aicore_task_control_at_v1(sidecar_base, context, task_id);
     if (validate_done_state && aicore_gm_query_v0(control->state) != static_cast<int64_t>(AicoreTaskStateV1::DONE)) {
@@ -1115,7 +1220,7 @@ inline __aicore__ bool aicore_resolve_completion_v1(
     uint64_t ready_publish_start = ready_publish_cycles == nullptr ? 0 : aicore_scheduler_cycles_v1();
     for (uint32_t type = 0; type < AICORE_CORE_TYPE_COUNT_V1; ++type) {
         if (!aicore_ready_batch_push_v1(
-                sidecar_base, context, type, context->inbox_index, &batches[type], ready_stats
+                sidecar_base, context, type, context->inbox_index, &batches[type], ready_stats, owner_state
             )) {
             aicore_record_scheduler_error_v1(
                 run_control, task_id, AicoreRootStatusV0::INVALID_ARGUMENTS, &graph, context, UINT64_C(66)
@@ -1135,7 +1240,7 @@ inline __aicore__ bool aicore_refill_private_slot_v1(
     const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver,
     __gm__ AicoreRunControlV1 *run_control, uint64_t resolver_count, const AicoreFreeSlotClaimV1 &slot_claim,
     uint64_t *ready_victim_cursors, AicoreReadyStatsV1 *ready_stats, bool trace_enabled,
-    AicoreRefillTimingV1 *timing = nullptr
+    AicoreRefillTimingV1 *timing = nullptr, AicoreReadyOwnerStateV1 *owner_state = nullptr
 ) {
     __gm__ AicoreWorkerContextV1 *target = aicore_worker_context_at_v1(sidecar_base, resolver, slot_claim.worker_id);
     aicore_observe_cache_line_v0(target);
@@ -1144,7 +1249,7 @@ inline __aicore__ bool aicore_refill_private_slot_v1(
     uint64_t operation_start = timing == nullptr ? 0 : aicore_scheduler_cycles_v1();
     if (!aicore_claim_ready_for_slot_v1(
             graph, sidecar_base, resolver, run_control, resolver_count, type, &ready_victim_cursors[type], ready_stats,
-            &ready, trace_enabled
+            &ready, trace_enabled, owner_state
         ))
         return false;
     if (timing != nullptr) {
@@ -1170,7 +1275,8 @@ inline __aicore__ bool aicore_service_completion_inboxes_v1(
     const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *context,
     __gm__ AicoreRunControlV1 *run_control, uint64_t resolver_count, uint64_t *completion_victim_cursor,
     uint64_t *ready_victim_cursors, AicoreWakeStatsV1 *wake_stats, AicoreReadyStatsV1 *ready_stats,
-    AicoreCompletionStatsV1 *completion_stats, bool *made_progress, bool trace_enabled = false
+    AicoreCompletionStatsV1 *completion_stats, bool *made_progress, bool trace_enabled = false,
+    AicoreReadyOwnerStateV1 *owner_state = nullptr
 ) {
     if (made_progress != nullptr) *made_progress = false;
     if (context->core_type != static_cast<int32_t>(AicoreRootCoreTypeV0::AIV)) return true;
@@ -1217,11 +1323,11 @@ inline __aicore__ bool aicore_service_completion_inboxes_v1(
             ) ||
             !aicore_resolve_completion_v1(
                 graph, sidecar_base, context, run_control, task_id, wake_stats, ready_stats, completion_stats,
-                trace_enabled
+                trace_enabled, true, nullptr, owner_state
             ) ||
             !aicore_refill_private_slot_v1(
                 graph, sidecar_base, context, run_control, resolver_count, slot_claim, ready_victim_cursors,
-                ready_stats, trace_enabled
+                ready_stats, trace_enabled, nullptr, owner_state
             ))
             return false;
         ++count;
@@ -1237,7 +1343,8 @@ inline __aicore__ bool aicore_dispatch_one_overflow_v1(
     const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver,
     __gm__ AicoreRunControlV1 *run_control, uint64_t resolver_count, uint32_t core_type_index,
     uint64_t *ready_victim_cursor, uint64_t *free_slot_cursor, AicoreReadyStatsV1 *ready_stats,
-    AicoreFreeSlotStatsV1 *free_stats, bool *made_progress, bool trace_enabled = false
+    AicoreFreeSlotStatsV1 *free_stats, bool *made_progress, bool trace_enabled = false,
+    AicoreReadyOwnerStateV1 *owner_state = nullptr
 ) {
     if (made_progress != nullptr) *made_progress = false;
     if (!aicore_ready_directory_nonempty_v1(sidecar_base, resolver, resolver_count, core_type_index)) return true;
@@ -1250,7 +1357,7 @@ inline __aicore__ bool aicore_dispatch_one_overflow_v1(
     AicoreReadyClaimV1 ready{};
     if (!aicore_claim_ready_for_slot_v1(
             graph, sidecar_base, resolver, run_control, resolver_count, core_type_index, ready_victim_cursor,
-            ready_stats, &ready, trace_enabled
+            ready_stats, &ready, trace_enabled, owner_state
         ))
         return false;
     if (ready.task_id < 0) {

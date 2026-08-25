@@ -618,7 +618,8 @@ inline __aicore__ bool aicore_gang_service_participant_v1(
 inline __aicore__ bool aicore_gang_service_owner_v1(
     const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver,
     __gm__ AicoreRunControlV1 *run_control, uint32_t cohort_index, __gm__ AicoreGangCohortV1 *cohort,
-    AicoreWakeStatsV1 *wake_stats, AicoreReadyStatsV1 *ready_stats, AicoreCompletionStatsV1 *completion_stats
+    AicoreWakeStatsV1 *wake_stats, AicoreReadyStatsV1 *ready_stats, AicoreCompletionStatsV1 *completion_stats,
+    AicoreReadyOwnerStateV1 *owner_state = nullptr
 ) {
     if (resolver->resolver_index != 0 || cohort->participant_count == 0) return false;
     const uint64_t generation = cohort->generation;
@@ -672,7 +673,7 @@ inline __aicore__ bool aicore_gang_service_owner_v1(
         aicore_gm_store_v0(control->state, static_cast<int64_t>(AicoreTaskStateV1::DONE));
         if (!aicore_resolve_completion_v1(
                 graph, sidecar_base, resolver, run_control, cohort->task_id, wake_stats, ready_stats, completion_stats,
-                false, false
+                false, false, nullptr, owner_state
             )) {
             return false;
         }
@@ -713,7 +714,7 @@ inline __aicore__ bool aicore_gang_service_owner_v1(
 inline __aicore__ bool aicore_service_gang_scheduler_v1(
     const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver,
     __gm__ AicoreRunControlV1 *run_control, AicoreWakeStatsV1 *wake_stats, AicoreReadyStatsV1 *ready_stats,
-    AicoreCompletionStatsV1 *completion_stats
+    AicoreCompletionStatsV1 *completion_stats, AicoreReadyOwnerStateV1 *owner_state = nullptr
 ) {
     if (resolver->is_resolver == 0) return false;
     __gm__ AicoreGangCoordinatorV1 *coordinator = aicore_gang_coordinator_at_v1(sidecar_base, resolver);
@@ -767,7 +768,7 @@ inline __aicore__ bool aicore_service_gang_scheduler_v1(
         if (owner) {
             progress = aicore_gang_service_owner_v1(
                            graph, sidecar_base, resolver, run_control, cohort_index, cohort, wake_stats, ready_stats,
-                           completion_stats
+                           completion_stats, owner_state
                        ) ||
                        progress;
         }
@@ -801,7 +802,8 @@ inline __aicore__ bool aicore_service_cluster_completion_slot_v1(
     __gm__ AicoreRunControlV1 *run_control, uint32_t cluster_lane, uint32_t pending_slot, uint32_t completed_generation,
     AicoreWakeStatsV1 *wake_stats, AicoreReadyStatsV1 *ready_stats, AicoreCompletionStatsV1 *completion_stats,
     uint64_t *ready_victim_cursors, bool trace_enabled, const AicoreReadyClaimV1 *replacement_ready,
-    bool *direct_refilled, AicoreCompletionServiceTimingV1 *timing = nullptr
+    bool *direct_refilled, AicoreCompletionServiceTimingV1 *timing = nullptr,
+    AicoreReadyOwnerStateV1 *owner_state = nullptr
 ) {
     if (direct_refilled != nullptr) *direct_refilled = false;
     if (cluster_lane >= 3 || pending_slot >= AICORE_PENDING_SLOT_COUNT_V1 || completed_generation == 0) return false;
@@ -855,7 +857,7 @@ inline __aicore__ bool aicore_service_cluster_completion_slot_v1(
         aicore_gm_store_v0(control->state, static_cast<int64_t>(AicoreTaskStateV1::DONE));
         if (!aicore_resolve_completion_v1(
                 graph, sidecar_base, resolver, run_control, task_id, wake_stats, ready_stats, completion_stats, false,
-                false, timing == nullptr ? nullptr : &ready_publish_cycles
+                false, timing == nullptr ? nullptr : &ready_publish_cycles, owner_state
             ))
             return false;
         if (timing != nullptr) timing->ready_publish_cycles += ready_publish_cycles;
@@ -886,7 +888,7 @@ inline __aicore__ bool aicore_service_cluster_completion_slot_v1(
                 const uint32_t core_type = aicore_metadata_core_type_index_v1(completed_subtask_slot);
                 if (!aicore_claim_ready_for_slot_v1(
                         graph, sidecar_base, resolver, run_control, resolver->resolver_count, core_type,
-                        &ready_victim_cursors[core_type], ready_stats, &ready, trace_enabled
+                        &ready_victim_cursors[core_type], ready_stats, &ready, trace_enabled, owner_state
                     ))
                     return false;
                 ready_available = ready.task_id >= 0;
@@ -930,7 +932,8 @@ inline __aicore__ bool aicore_service_cluster_completions_v1(
     const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver,
     __gm__ AicoreRunControlV1 *run_control, AicoreWakeStatsV1 *wake_stats, AicoreReadyStatsV1 *ready_stats,
     AicoreCompletionStatsV1 *completion_stats, uint64_t *ready_victim_cursors = nullptr, bool trace_enabled = false,
-    uint64_t *direct_refilled_slot_mask = nullptr, AicoreCompletionServiceTimingV1 *timing = nullptr
+    uint64_t *direct_refilled_slot_mask = nullptr, AicoreCompletionServiceTimingV1 *timing = nullptr,
+    AicoreReadyOwnerStateV1 *owner_state = nullptr
 ) {
     if (resolver->is_resolver == 0) return false;
     if (direct_refilled_slot_mask != nullptr) *direct_refilled_slot_mask = 0;
@@ -947,7 +950,7 @@ inline __aicore__ bool aicore_service_cluster_completions_v1(
             if (!aicore_service_cluster_completion_slot_v1(
                     graph, sidecar_base, resolver, run_control, cluster_lane, pending_slot, completed_generation,
                     wake_stats, ready_stats, completion_stats, ready_victim_cursors, trace_enabled, nullptr,
-                    &direct_refilled, timing
+                    &direct_refilled, timing, owner_state
                 ))
                 return false;
             if (direct_refilled && direct_refilled_slot_mask != nullptr)
@@ -994,7 +997,7 @@ inline __aicore__ bool aicore_fill_cluster_normal_slots_v1(
     const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver,
     __gm__ AicoreRunControlV1 *run_control, uint64_t *ready_victim_cursors, AicoreReadyStatsV1 *ready_stats,
     bool trace_enabled, uint64_t skip_slot_mask = 0, AicoreNormalDispatchTimingV1 *timing = nullptr,
-    AicoreDeferredAivQueueV1 *deferred_aiv = nullptr
+    AicoreDeferredAivQueueV1 *deferred_aiv = nullptr, AicoreReadyOwnerStateV1 *owner_state = nullptr
 ) {
     if (resolver->is_resolver == 0) return false;
     const uint32_t aic_core_type = static_cast<uint32_t>(AicoreRootCoreTypeV0::AIC);
@@ -1029,7 +1032,7 @@ inline __aicore__ bool aicore_fill_cluster_normal_slots_v1(
                 AicoreReadyClaimV1 ready{};
                 if (!aicore_claim_ready_for_slot_v1(
                         graph, sidecar_base, resolver, run_control, resolver->resolver_count, aic_core_type,
-                        &ready_victim_cursors[aic_core_type], ready_stats, &ready, trace_enabled
+                        &ready_victim_cursors[aic_core_type], ready_stats, &ready, trace_enabled, owner_state
                     ))
                     return progress;
                 if (timing != nullptr && ready.claim_end_cycles >= ready.claim_start_cycles)
@@ -1137,7 +1140,7 @@ inline __aicore__ bool aicore_fill_cluster_normal_slots_v1(
             AicoreReadyClaimV1 ready{};
             if (!aicore_claim_ready_for_slot_v1(
                     graph, sidecar_base, resolver, run_control, resolver->resolver_count, aiv_core_type,
-                    &ready_victim_cursors[aiv_core_type], ready_stats, &ready, trace_enabled
+                    &ready_victim_cursors[aiv_core_type], ready_stats, &ready, trace_enabled, owner_state
                 )) {
                 aicore_gm_store_v0(
                     slot->publication,
@@ -1225,7 +1228,7 @@ inline __aicore__ bool aicore_drain_deferred_aiv_to_peer_v1(
     __gm__ AicoreRunControlV1 *run_control, AicoreDeferredAivQueueV1 *queue, AicoreWakeStatsV1 *wake_stats,
     AicoreReadyStatsV1 *ready_stats, AicoreCompletionStatsV1 *completion_stats, bool trace_enabled,
     AicoreCompletionServiceTimingV1 *completion_timing = nullptr,
-    AicoreNormalDispatchTimingV1 *dispatch_timing = nullptr
+    AicoreNormalDispatchTimingV1 *dispatch_timing = nullptr, AicoreReadyOwnerStateV1 *owner_state = nullptr
 ) {
     if (queue == nullptr || queue->count == 0) return true;
     const int32_t peer_lane = aicore_deferred_aiv_peer_lane_v1(sidecar_base, resolver);
@@ -1275,7 +1278,7 @@ inline __aicore__ bool aicore_drain_deferred_aiv_to_peer_v1(
                 if (!aicore_service_cluster_completion_slot_v1(
                         graph, sidecar_base, resolver, run_control, static_cast<uint32_t>(peer_lane), pending_slot,
                         completed_generation, wake_stats, ready_stats, completion_stats, nullptr, trace_enabled,
-                        &queue->entries[0].ready, &refilled, completion_timing
+                        &queue->entries[0].ready, &refilled, completion_timing, owner_state
                     ) ||
                     !refilled)
                     return false;

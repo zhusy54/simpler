@@ -480,47 +480,166 @@ TEST(AicoreBootstrapV1, PublishesExclusiveInboxAndAggregatesDirectory) {
 
     auto *controls =
         aicore_sidecar_at_v1<AicoreTaskControlV1>(storage.sidecar->base(), storage.layout.task_controls_offset);
-    EXPECT_EQ(controls[1].next_waiter, 0);
-    EXPECT_EQ(controls[0].next_waiter, AICORE_INBOX_EMPTY_V1);
-    EXPECT_EQ(aicore_ready_inbox_at_v1(storage.sidecar->base(), &storage.contexts[1], 0, 0)->head, 1);
+    EXPECT_EQ(controls[0].next_waiter, 1);
+    EXPECT_EQ(controls[1].next_waiter, AICORE_INBOX_EMPTY_V1);
+    EXPECT_EQ(aicore_ready_inbox_at_v1(storage.sidecar->base(), &storage.contexts[1], 0, 0)->head, 0);
     EXPECT_EQ(directory->core_types[0][0].bits, 1u);
     EXPECT_EQ(directory->core_types[1][0].bits, 0u);
     EXPECT_EQ(stats.enqueue_count, 2u);
     EXPECT_EQ(stats.batch_count, 1u);
 }
 
-TEST(AicoreReadyInboxV1, BatchPushAndPerTaskPopMaintainDirectory) {
+TEST(AicoreReadyInboxV1, BatchPushAndOwnerMaintenancePreserveFifoAndDirectory) {
     constexpr uint64_t kTasks = 4;
     FixtureStorage storage(kTasks, 1);
     GraphBuffer graph(kTasks);
     for (uint64_t task = 0; task < kTasks; ++task)
         graph.executable(task, 0);
     AicoreReadyBatchV1 batch{};
+    AicoreReadyOwnerStateV1 owner_state{};
     AicoreReadyStatsV1 stats{};
     for (uint64_t task = 0; task < kTasks; ++task)
         ASSERT_TRUE(aicore_ready_batch_append_v1(storage.sidecar->base(), &storage.contexts[0], task, &batch, &stats));
-    ASSERT_TRUE(aicore_ready_batch_push_v1(storage.sidecar->base(), &storage.contexts[0], 0, 0, &batch, &stats));
+    ASSERT_TRUE(
+        aicore_ready_batch_push_v1(storage.sidecar->base(), &storage.contexts[0], 0, 0, &batch, &stats, &owner_state)
+    );
 
     auto *directory =
         aicore_sidecar_at_v1<AicoreReadyDirectoryV1>(storage.sidecar->base(), storage.layout.ready_directory_offset);
     EXPECT_NE(directory->core_types[0][0].bits & 1, 0u);
-    std::vector<bool> seen(kTasks, false);
     for (uint64_t index = 0; index < kTasks; ++index) {
         int64_t task = AICORE_TASK_ID_INVALID_V1;
         ASSERT_TRUE(aicore_ready_pop_from_inbox_v1(
             graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 0, 0, &task, &stats
         ));
-        ASSERT_GE(task, 0);
-        EXPECT_FALSE(seen[static_cast<size_t>(task)]);
-        seen[static_cast<size_t>(task)] = true;
+        EXPECT_EQ(task, static_cast<int64_t>(index));
     }
     int64_t task = AICORE_TASK_ID_INVALID_V1;
     ASSERT_TRUE(aicore_ready_pop_from_inbox_v1(
         graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 0, 0, &task, &stats
     ));
     EXPECT_EQ(task, AICORE_TASK_ID_INVALID_V1);
+    EXPECT_NE(directory->core_types[0][0].bits & 1, 0u);
+    ASSERT_TRUE(aicore_ready_owner_maintain_type_v1(storage.sidecar->base(), &storage.contexts[0], 0, &owner_state));
     EXPECT_EQ(directory->core_types[0][0].bits & 1, 0u);
     EXPECT_EQ(stats.pop_count, kTasks);
+}
+
+TEST(AicoreReadyInboxV1, OwnerPromotesPendingBankAfterPublishedBankDrains) {
+    constexpr uint64_t kTasks = 4;
+    FixtureStorage storage(kTasks, 1);
+    GraphBuffer graph(kTasks);
+    for (uint64_t task = 0; task < kTasks; ++task)
+        graph.executable(task, 0);
+    AicoreReadyOwnerStateV1 owner_state{};
+    AicoreReadyStatsV1 stats{};
+    AicoreReadyBatchV1 published{};
+    AicoreReadyBatchV1 pending{};
+    for (int64_t task = 0; task < 2; ++task)
+        ASSERT_TRUE(
+            aicore_ready_batch_append_v1(storage.sidecar->base(), &storage.contexts[0], task, &published, &stats)
+        );
+    for (int64_t task = 2; task < 4; ++task)
+        ASSERT_TRUE(
+            aicore_ready_batch_append_v1(storage.sidecar->base(), &storage.contexts[0], task, &pending, &stats)
+        );
+    ASSERT_TRUE(aicore_ready_batch_push_v1(
+        storage.sidecar->base(), &storage.contexts[0], 0, 0, &published, &stats, &owner_state
+    ));
+    ASSERT_TRUE(
+        aicore_ready_batch_push_v1(storage.sidecar->base(), &storage.contexts[0], 0, 0, &pending, &stats, &owner_state)
+    );
+    EXPECT_EQ(owner_state.queues[0].pending.head, 2);
+    EXPECT_EQ(owner_state.queues[0].pending.tail, 3);
+
+    for (int64_t expected = 0; expected < 2; ++expected) {
+        int64_t task = AICORE_TASK_ID_INVALID_V1;
+        ASSERT_TRUE(aicore_ready_pop_from_inbox_v1(
+            graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 0, 0, &task, &stats
+        ));
+        EXPECT_EQ(task, expected);
+    }
+    int64_t task = AICORE_TASK_ID_INVALID_V1;
+    ASSERT_TRUE(aicore_ready_pop_from_inbox_v1(
+        graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 0, 0, &task, &stats
+    ));
+    EXPECT_EQ(task, AICORE_TASK_ID_INVALID_V1);
+    ASSERT_TRUE(aicore_ready_owner_maintain_type_v1(storage.sidecar->base(), &storage.contexts[0], 0, &owner_state));
+    for (int64_t expected = 2; expected < 4; ++expected) {
+        ASSERT_TRUE(aicore_ready_pop_from_inbox_v1(
+            graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 0, 0, &task, &stats
+        ));
+        EXPECT_EQ(task, expected);
+    }
+}
+
+TEST(AicoreReadyInboxV1, OlderPendingBankPrecedesBatchArrivingAfterDrain) {
+    constexpr uint64_t kTasks = 3;
+    FixtureStorage storage(kTasks, 1);
+    GraphBuffer graph(kTasks);
+    for (uint64_t task = 0; task < kTasks; ++task)
+        graph.executable(task, 0);
+    AicoreReadyOwnerStateV1 owner_state{};
+    AicoreReadyStatsV1 stats{};
+    for (int64_t task = 0; task < 2; ++task) {
+        AicoreReadyBatchV1 batch{};
+        ASSERT_TRUE(aicore_ready_batch_append_v1(storage.sidecar->base(), &storage.contexts[0], task, &batch, &stats));
+        ASSERT_TRUE(aicore_ready_batch_push_v1(
+            storage.sidecar->base(), &storage.contexts[0], 0, 0, &batch, &stats, &owner_state
+        ));
+    }
+    int64_t task = AICORE_TASK_ID_INVALID_V1;
+    ASSERT_TRUE(aicore_ready_pop_from_inbox_v1(
+        graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 0, 0, &task, &stats
+    ));
+    ASSERT_EQ(task, 0);
+
+    AicoreReadyBatchV1 arriving{};
+    ASSERT_TRUE(aicore_ready_batch_append_v1(storage.sidecar->base(), &storage.contexts[0], 2, &arriving, &stats));
+    ASSERT_TRUE(
+        aicore_ready_batch_push_v1(storage.sidecar->base(), &storage.contexts[0], 0, 0, &arriving, &stats, &owner_state)
+    );
+    EXPECT_EQ(owner_state.queues[0].pending.head, 2);
+    ASSERT_TRUE(aicore_ready_pop_from_inbox_v1(
+        graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 0, 0, &task, &stats
+    ));
+    EXPECT_EQ(task, 1);
+    ASSERT_TRUE(aicore_ready_owner_maintain_type_v1(storage.sidecar->base(), &storage.contexts[0], 0, &owner_state));
+    ASSERT_TRUE(aicore_ready_pop_from_inbox_v1(
+        graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 0, 0, &task, &stats
+    ));
+    EXPECT_EQ(task, 2);
+}
+
+TEST(AicoreReadyInboxV1, ThiefCannotObserveOrPromoteOwnerPendingBank) {
+    FixtureStorage storage(2, 2);
+    GraphBuffer graph(2);
+    graph.executable(0, 0);
+    graph.executable(1, 0);
+    AicoreReadyOwnerStateV1 owner_state{};
+    AicoreReadyStatsV1 stats{};
+    for (int64_t task = 0; task < 2; ++task) {
+        AicoreReadyBatchV1 batch{};
+        ASSERT_TRUE(aicore_ready_batch_append_v1(storage.sidecar->base(), &storage.contexts[1], task, &batch, &stats));
+        ASSERT_TRUE(aicore_ready_batch_push_v1(
+            storage.sidecar->base(), &storage.contexts[1], 0, 1, &batch, &stats, &owner_state
+        ));
+    }
+    int64_t task = AICORE_TASK_ID_INVALID_V1;
+    ASSERT_TRUE(aicore_ready_pop_from_inbox_v1(
+        graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 0, 1, &task, &stats
+    ));
+    ASSERT_EQ(task, 0);
+    ASSERT_TRUE(aicore_ready_pop_from_inbox_v1(
+        graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 0, 1, &task, &stats
+    ));
+    EXPECT_EQ(task, AICORE_TASK_ID_INVALID_V1);
+    EXPECT_EQ(owner_state.queues[0].pending.head, 1);
+    ASSERT_TRUE(aicore_ready_owner_maintain_type_v1(storage.sidecar->base(), &storage.contexts[1], 0, &owner_state));
+    ASSERT_TRUE(aicore_ready_pop_from_inbox_v1(
+        graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 0, 1, &task, &stats
+    ));
+    EXPECT_EQ(task, 1);
 }
 
 TEST(AicoreReadyInboxV1, StealsOnlyFromMarkedVictim) {
@@ -695,6 +814,49 @@ TEST(AicoreReadyWakeV1, WakeResolvePublishesConsumerToResolverLocalInbox) {
     EXPECT_EQ(task, 1);
     EXPECT_EQ(wake.wake_register_count, 1u);
     EXPECT_EQ(wake.wake_migrate_count, 1u);
+}
+
+TEST(AicoreReadyWakeV1, WakeResolveQueuesBehindOlderPublishedWork) {
+    FixtureStorage storage(3, 1);
+    GraphBuffer graph(3);
+    graph.executable(0, 0);
+    graph.executable(1, 0, {0});
+    graph.executable(2, 0);
+    storage.metadata[1].flags |= AICORE_TASK_HAS_FANIN_V1;
+    AicoreWakeStatsV1 wake{};
+    AicoreReadyStatsV1 ready{};
+    AicoreCompletionStatsV1 completion{};
+    AicoreReadyOwnerStateV1 owner_state{};
+    EXPECT_EQ(
+        aicore_route_task_v1(
+            graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 1, &wake
+        ),
+        AicoreRouteResultV1::WAITING
+    );
+    AicoreReadyBatchV1 older{};
+    ASSERT_TRUE(aicore_ready_batch_append_v1(storage.sidecar->base(), &storage.contexts[0], 2, &older, &ready));
+    ASSERT_TRUE(
+        aicore_ready_batch_push_v1(storage.sidecar->base(), &storage.contexts[0], 0, 0, &older, &ready, &owner_state)
+    );
+    auto *controls =
+        aicore_sidecar_at_v1<AicoreTaskControlV1>(storage.sidecar->base(), storage.layout.task_controls_offset);
+    controls[0].state = static_cast<int64_t>(AicoreTaskStateV1::DONE);
+    ASSERT_TRUE(aicore_resolve_completion_v1(
+        graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 0, &wake, &ready,
+        &completion, false, true, nullptr, &owner_state
+    ));
+    EXPECT_EQ(owner_state.queues[0].pending.head, 1);
+
+    int64_t task = AICORE_TASK_ID_INVALID_V1;
+    ASSERT_TRUE(aicore_ready_pop_from_inbox_v1(
+        graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 0, 0, &task, &ready
+    ));
+    ASSERT_EQ(task, 2);
+    ASSERT_TRUE(aicore_ready_owner_maintain_type_v1(storage.sidecar->base(), &storage.contexts[0], 0, &owner_state));
+    ASSERT_TRUE(aicore_ready_pop_from_inbox_v1(
+        graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 0, 0, &task, &ready
+    ));
+    EXPECT_EQ(task, 1);
 }
 
 TEST(AicoreReadyInboxV1, ReadyAndCompletionUseIndependentLinks) {

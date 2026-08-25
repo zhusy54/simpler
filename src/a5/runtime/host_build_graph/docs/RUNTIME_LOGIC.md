@@ -27,7 +27,7 @@ periodic task pattern with the resolver count. A bootstrap-only route registers
 each blocked consumer on its first executable producer with one wake-head
 exchange. Inline-completed producers are skipped from immutable metadata.
 
-Each resolver links dependency-free tasks into private typed Ready batches,
+Each resolver links dependency-free tasks into private typed FIFO Ready batches,
 writes back all waiter links, and executes one cache barrier before directly
 publishing its initially empty inbox heads. Resolver-local Ready-type flags are
 stored contiguously beside the Ready directory. The last resolver aggregates
@@ -38,18 +38,27 @@ close-race protocol.
 
 ## Ready inboxes and stealing
 
-Each resolver owns one AIC and one AIV Overflow Ready Inbox. Producers only
-push to their own inbox, normally as a batch. Consumers pop one task at a time
-using CAS on the inbox head:
+Each resolver owns one AIC and one AIV Ready inbox. Each typed inbox is an
+owner-banked FIFO: the shared out bank is visible to consumers through its
+head, while a Resolver-local pending bank tracks both endpoints. Producers
+only append batches to their own inbox. Consumers pop one task at a time using
+CAS on the shared head:
 
 1. Try the resolver-local typed inbox.
 2. If empty, inspect the typed Ready bitmask and steal from a marked victim.
 3. Advance a resolver-local round-robin cursor seeded from resolver ID.
 
-The Ready bitmask has one bit per resolver inbox and core type. Push sets the
-bit when it may make an inbox nonempty. Last-pop clears the bit, rechecks the
-head, and sets it again if a concurrent push won the race. Stale set bits are
-allowed; a nonempty inbox must not remain unmarked.
+The published out-bank links are immutable. When it drains, only its Resolver
+owner may publish the older pending bank; thieves never observe or promote
+pending work. This preserves FIFO order within each typed Resolver inbox
+without a shared tail or producer-side CAS. Local-first claiming and sharded
+stealing still mean this is not a global FIFO across Resolvers or core types.
+
+The Ready bitmask has one bit per resolver inbox and core type. The owner sets
+the bit when an empty inbox becomes nonempty and clears it only after both the
+shared out bank and local pending bank are empty. Last-pop does not modify the
+bit. Stale set bits are allowed until the owner next services the inbox; a
+published nonempty inbox must not remain unmarked.
 
 `AicoreTaskControlV1::next_waiter` links the dependency wake list while a task
 is blocked and its Ready inbox after routing. `inbox_next` is reserved for the
@@ -96,7 +105,7 @@ correlating Ready ownership with graph task IDs. The resolver:
 
 1. confirms the binding and releases the exact slot to private `FREE`;
 2. closes the producer wake list;
-3. reroutes waiters and batches newly ready tasks into its local typed inboxes;
+3. reroutes waiters and appends newly ready batches to its local typed FIFO inboxes;
 4. tries local pop, then stealing, to refill the released slot;
 5. advertises the slot if no task is available.
 
