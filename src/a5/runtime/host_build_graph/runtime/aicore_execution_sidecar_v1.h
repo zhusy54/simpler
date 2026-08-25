@@ -143,6 +143,17 @@ struct alignas(128) AicoreReadyInboxV1 {
     uint8_t atomic_line_padding[120];
 };
 
+struct alignas(64) AicoreReadyOwnerQueueV1 {
+    volatile int64_t pending_head{AICORE_INBOX_EMPTY_V1};
+    volatile int64_t pending_tail{AICORE_INBOX_EMPTY_V1};
+    volatile uint64_t advertised{0};
+    uint8_t owner_line_padding[40];
+};
+
+struct alignas(128) AicoreReadyOwnerStateV1 {
+    AicoreReadyOwnerQueueV1 queues[AICORE_CORE_TYPE_COUNT_V1];
+};
+
 enum class AicoreGangCohortStateV1 : uint64_t {
     FREE = 0,
     DRAINING = 1,
@@ -379,7 +390,8 @@ struct alignas(128) AicoreWorkerContextV1 {
     volatile uint64_t worker_index;
     volatile uint64_t completion_inboxes_offset;
     volatile uint64_t inbox_index;
-    uint64_t runtime_offset_padding[2];
+    volatile uint64_t ready_owner_states_offset;
+    uint64_t runtime_offset_padding;
 
     volatile uint64_t task_metadata_offset;
     volatile uint64_t ready_inboxes_offset;
@@ -530,6 +542,7 @@ struct AicoreExecutionSidecarLayoutV1 {
     uint64_t task_controls_offset;
     uint64_t completion_inboxes_offset;
     uint64_t ready_inboxes_offset;
+    uint64_t ready_owner_states_offset;
     uint64_t ready_directory_offset;
     uint64_t free_slot_directory_offset;
     uint64_t trace_cells_offset;
@@ -557,6 +570,8 @@ static_assert(
     "completion generations must fit one 64-bit device load"
 );
 static_assert(sizeof(AicoreReadyInboxV1) == 128, "ready inbox layout changed");
+static_assert(sizeof(AicoreReadyOwnerQueueV1) == 64, "ready owner queue must occupy one cache line");
+static_assert(sizeof(AicoreReadyOwnerStateV1) == 128, "ready owner state must occupy two cache lines");
 static_assert(sizeof(AicoreGangCoordinatorV1) == 256, "gang coordinator layout changed");
 static_assert(
     offsetof(AicoreGangCoordinatorV1, active_dispatch_cohort) == 64,
@@ -603,6 +618,9 @@ static_assert(
     std::is_standard_layout_v<AicoreCompletionInboxV1> && std::is_trivially_copyable_v<AicoreCompletionInboxV1>
 );
 static_assert(std::is_standard_layout_v<AicoreReadyInboxV1> && std::is_trivially_copyable_v<AicoreReadyInboxV1>);
+static_assert(
+    std::is_standard_layout_v<AicoreReadyOwnerStateV1> && std::is_trivially_copyable_v<AicoreReadyOwnerStateV1>
+);
 static_assert(
     std::is_standard_layout_v<AicoreGangCoordinatorV1> && std::is_trivially_copyable_v<AicoreGangCoordinatorV1>
 );
@@ -691,6 +709,7 @@ inline bool aicore_sidecar_plan_v1(
         !AICORE_RESERVE_ARRAY(
             AICORE_CORE_TYPE_COUNT_V1 * AICORE_WORKER_CAPACITY_V1, AicoreReadyInboxV1, ready_inboxes_offset
         ) ||
+        !AICORE_RESERVE_ARRAY(AICORE_CLUSTER_CAPACITY_V1, AicoreReadyOwnerStateV1, ready_owner_states_offset) ||
         !aicore_sidecar_reserve_v1(
             &cursor, sizeof(AicoreReadyDirectoryV1), alignof(AicoreReadyDirectoryV1), &next.ready_directory_offset
         ) ||
@@ -746,6 +765,14 @@ inline bool aicore_sidecar_init_v1(void *base, const AicoreExecutionSidecarLayou
     auto *ready = aicore_sidecar_at_v1<AicoreReadyInboxV1>(base, layout.ready_inboxes_offset);
     for (uint64_t i = 0; i < AICORE_CORE_TYPE_COUNT_V1 * AICORE_WORKER_CAPACITY_V1; ++i)
         ready[i].head = AICORE_INBOX_EMPTY_V1;
+    auto *ready_owners =
+        aicore_sidecar_at_v1<AicoreReadyOwnerStateV1>(base, layout.ready_owner_states_offset);
+    for (uint64_t owner = 0; owner < AICORE_CLUSTER_CAPACITY_V1; ++owner) {
+        for (uint32_t type = 0; type < AICORE_CORE_TYPE_COUNT_V1; ++type) {
+            ready_owners[owner].queues[type].pending_head = AICORE_INBOX_EMPTY_V1;
+            ready_owners[owner].queues[type].pending_tail = AICORE_INBOX_EMPTY_V1;
+        }
+    }
     auto *contexts = aicore_sidecar_at_v1<AicoreWorkerContextV1>(base, layout.worker_contexts_offset);
     for (uint64_t worker = 0; worker < AICORE_WORKER_CAPACITY_V1; ++worker) {
         contexts[worker].physical_core_id = -1;

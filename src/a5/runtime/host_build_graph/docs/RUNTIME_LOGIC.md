@@ -40,7 +40,9 @@ close-race protocol.
 
 Each resolver owns one AIC and one AIV Ready inbox. Each typed inbox is an
 owner-banked FIFO: the shared out bank is visible to consumers through its
-head, while a Resolver-local pending bank tracks both endpoints. Producers
+head, while a Resolver-owned GM sidecar bank tracks both pending endpoints.
+The pending metadata has a dedicated cache line per core type and is never
+read or written by thieves. Producers
 only append batches to their own inbox. Consumers pop one task at a time using
 CAS on the shared head:
 
@@ -51,12 +53,12 @@ CAS on the shared head:
 The published out-bank links are immutable. When it drains, only its Resolver
 owner may publish the older pending bank; thieves never observe or promote
 pending work. This preserves FIFO order within each typed Resolver inbox
-without a shared tail or producer-side CAS. Local-first claiming and sharded
+without a contended shared tail or producer-side CAS. Local-first claiming and sharded
 stealing still mean this is not a global FIFO across Resolvers or core types.
 
 The Ready bitmask has one bit per resolver inbox and core type. The owner sets
 the bit when an empty inbox becomes nonempty and clears it only after both the
-shared out bank and local pending bank are empty. Last-pop does not modify the
+shared out bank and owner-only pending bank are empty. Last-pop does not modify the
 bit. Stale set bits are allowed until the owner next services the inbox; a
 published nonempty inbox must not remain unmarked.
 

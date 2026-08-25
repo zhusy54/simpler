@@ -66,14 +66,20 @@ struct AicoreReadyBatchV1 {
     uint64_t count{0};
 };
 
-struct AicoreReadyOwnerQueueV1 {
-    AicoreReadyBatchV1 pending{};
-    bool advertised{false};
-};
+inline __host__ __aicore__ void aicore_ready_batch_reset_v1(AicoreReadyBatchV1 *batch) {
+    batch->head = AICORE_INBOX_EMPTY_V1;
+    batch->tail = AICORE_INBOX_EMPTY_V1;
+    batch->count = 0;
+}
 
-struct AicoreReadyOwnerStateV1 {
-    AicoreReadyOwnerQueueV1 queues[AICORE_CORE_TYPE_COUNT_V1]{};
-};
+inline __host__ __aicore__ void aicore_ready_owner_init_v1(__gm__ AicoreReadyOwnerStateV1 *owner_state) {
+    if (owner_state == nullptr) return;
+    for (uint32_t type = 0; type < AICORE_CORE_TYPE_COUNT_V1; ++type) {
+        aicore_gm_store_v0(owner_state->queues[type].pending_head, AICORE_INBOX_EMPTY_V1);
+        aicore_gm_store_v0(owner_state->queues[type].pending_tail, AICORE_INBOX_EMPTY_V1);
+        aicore_gm_store_v0(owner_state->queues[type].advertised, UINT64_C(0));
+    }
+}
 
 struct AicoreReadyClaimV1 {
     int64_t task_id{AICORE_TASK_ID_INVALID_V1};
@@ -172,6 +178,14 @@ inline __host__ __aicore__ __gm__ AicoreReadyInboxV1 *aicore_ready_inbox_at_v1(
     uint64_t linear = static_cast<uint64_t>(core_type_index) * AICORE_WORKER_CAPACITY_V1 + inbox_index;
     return aicore_sidecar_at_v1<AicoreReadyInboxV1>(
         sidecar_base, context->ready_inboxes_offset + linear * sizeof(AicoreReadyInboxV1)
+    );
+}
+
+inline __host__ __aicore__ __gm__ AicoreReadyOwnerStateV1 *
+aicore_ready_owner_state_at_v1(__gm__ void *sidecar_base, __gm__ const AicoreWorkerContextV1 *context) {
+    return aicore_sidecar_at_v1<AicoreReadyOwnerStateV1>(
+        sidecar_base,
+        context->ready_owner_states_offset + context->inbox_index * sizeof(AicoreReadyOwnerStateV1)
     );
 }
 
@@ -514,69 +528,79 @@ inline __aicore__ void aicore_ready_directory_clear_v1(
     aicore_gm_fetch_and_v0(directory->core_types[core_type_index][shard].bits, ~bit);
 }
 
-inline __aicore__ bool aicore_ready_batch_concat_v1(
-    __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *context, AicoreReadyBatchV1 *destination,
-    AicoreReadyBatchV1 *source
+inline __aicore__ void aicore_ready_owner_pending_reset_v1(__gm__ AicoreReadyOwnerQueueV1 *owner_queue) {
+    aicore_gm_store_v0(owner_queue->pending_head, AICORE_INBOX_EMPTY_V1);
+    aicore_gm_store_v0(owner_queue->pending_tail, AICORE_INBOX_EMPTY_V1);
+}
+
+inline __aicore__ bool aicore_ready_owner_pending_append_v1(
+    __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *context,
+    __gm__ AicoreReadyOwnerQueueV1 *owner_queue, AicoreReadyBatchV1 *source
 ) {
     // Only the owner mutates pending links; links reachable from a shared inbox head stay immutable.
-    if (destination == nullptr || source == nullptr || source->head == AICORE_INBOX_EMPTY_V1) return true;
+    if (owner_queue == nullptr || source == nullptr || source->head == AICORE_INBOX_EMPTY_V1) return true;
     if (source->tail < 0) return false;
-    if (destination->head == AICORE_INBOX_EMPTY_V1) {
-        *destination = *source;
-        *source = {};
+    const int64_t pending_head = aicore_gm_query_v0(owner_queue->pending_head);
+    if (pending_head == AICORE_INBOX_EMPTY_V1) {
+        aicore_gm_store_v0(owner_queue->pending_head, source->head);
+        aicore_gm_store_v0(owner_queue->pending_tail, source->tail);
+        aicore_ready_batch_reset_v1(source);
         return true;
     }
-    if (destination->tail < 0) return false;
-    __gm__ AicoreTaskControlV1 *tail = aicore_task_control_at_v1(sidecar_base, context, destination->tail);
+    if (pending_head < AICORE_INBOX_EMPTY_V1) return false;
+    const int64_t pending_tail = aicore_gm_query_v0(owner_queue->pending_tail);
+    if (pending_tail < 0) return false;
+    __gm__ AicoreTaskControlV1 *tail = aicore_task_control_at_v1(sidecar_base, context, pending_tail);
     aicore_observe_cache_line_v0(&tail->next_waiter);
     tail->next_waiter = source->head;
     aicore_publish_cache_line_v0(&tail->next_waiter);
-    destination->tail = source->tail;
-    destination->count += source->count;
-    *source = {};
+    aicore_gm_store_v0(owner_queue->pending_tail, source->tail);
+    aicore_ready_batch_reset_v1(source);
     return true;
 }
 
 inline __aicore__ bool aicore_ready_owner_maintain_type_v1(
     __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *context, uint32_t core_type_index,
-    AicoreReadyOwnerStateV1 *owner_state
+    __gm__ AicoreReadyOwnerStateV1 *owner_state
 ) {
     if (owner_state == nullptr || core_type_index >= AICORE_CORE_TYPE_COUNT_V1 ||
         context->inbox_index >= AICORE_WORKER_CAPACITY_V1)
         return false;
-    AicoreReadyOwnerQueueV1 &owner_queue = owner_state->queues[core_type_index];
+    __gm__ AicoreReadyOwnerQueueV1 *owner_queue = &owner_state->queues[core_type_index];
     __gm__ AicoreReadyInboxV1 *inbox =
         aicore_ready_inbox_at_v1(sidecar_base, context, core_type_index, context->inbox_index);
     __gm__ AicoreReadyDirectoryV1 *directory = aicore_ready_directory_at_v1(sidecar_base, context);
     const int64_t head = aicore_gm_query_v0(inbox->head);
     if (head < AICORE_INBOX_EMPTY_V1) return false;
     if (head != AICORE_INBOX_EMPTY_V1) {
-        if (!owner_queue.advertised) {
+        if (aicore_gm_query_v0(owner_queue->advertised) == 0) {
             aicore_ready_directory_set_v1(directory, core_type_index, context->inbox_index);
-            owner_queue.advertised = true;
+            aicore_gm_store_v0(owner_queue->advertised, UINT64_C(1));
         }
         return true;
     }
-    if (owner_queue.pending.head != AICORE_INBOX_EMPTY_V1) {
-        if (owner_queue.pending.tail < 0) return false;
+    const int64_t pending_head = aicore_gm_query_v0(owner_queue->pending_head);
+    if (pending_head != AICORE_INBOX_EMPTY_V1) {
+        if (pending_head < AICORE_INBOX_EMPTY_V1 || aicore_gm_query_v0(owner_queue->pending_tail) < 0) return false;
         aicore_cache_barrier_v0();
-        aicore_gm_store_v0(inbox->head, owner_queue.pending.head);
-        owner_queue.pending = {};
-        if (!owner_queue.advertised) {
+        aicore_gm_store_v0(inbox->head, pending_head);
+        aicore_ready_owner_pending_reset_v1(owner_queue);
+        if (aicore_gm_query_v0(owner_queue->advertised) == 0) {
             aicore_ready_directory_set_v1(directory, core_type_index, context->inbox_index);
-            owner_queue.advertised = true;
+            aicore_gm_store_v0(owner_queue->advertised, UINT64_C(1));
         }
         return true;
     }
-    if (owner_queue.advertised) {
+    if (aicore_gm_query_v0(owner_queue->advertised) != 0) {
         aicore_ready_directory_clear_v1(directory, core_type_index, context->inbox_index);
-        owner_queue.advertised = false;
+        aicore_gm_store_v0(owner_queue->advertised, UINT64_C(0));
     }
     return true;
 }
 
 inline __aicore__ bool aicore_ready_owner_maintain_v1(
-    __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *context, AicoreReadyOwnerStateV1 *owner_state
+    __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *context,
+    __gm__ AicoreReadyOwnerStateV1 *owner_state
 ) {
     for (uint32_t type = 0; type < AICORE_CORE_TYPE_COUNT_V1; ++type) {
         if (!aicore_ready_owner_maintain_type_v1(sidecar_base, context, type, owner_state)) return false;
@@ -586,7 +610,8 @@ inline __aicore__ bool aicore_ready_owner_maintain_v1(
 
 inline __aicore__ bool aicore_ready_batch_push_v1(
     __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *context, uint32_t core_type_index, uint64_t inbox_index,
-    AicoreReadyBatchV1 *batch, AicoreReadyStatsV1 *stats, AicoreReadyOwnerStateV1 *owner_state = nullptr
+    AicoreReadyBatchV1 *batch, AicoreReadyStatsV1 *stats,
+    __gm__ AicoreReadyOwnerStateV1 *owner_state = nullptr
 ) {
     if (batch == nullptr || batch->head == AICORE_INBOX_EMPTY_V1) return true;
     if (core_type_index >= AICORE_CORE_TYPE_COUNT_V1 || inbox_index >= AICORE_WORKER_CAPACITY_V1 || batch->tail < 0)
@@ -601,45 +626,47 @@ inline __aicore__ bool aicore_ready_batch_push_v1(
         );
     } else {
         if (inbox_index != context->inbox_index) return false;
-        AicoreReadyOwnerQueueV1 &owner_queue = owner_state->queues[core_type_index];
+        __gm__ AicoreReadyOwnerQueueV1 *owner_queue = &owner_state->queues[core_type_index];
         const int64_t head = aicore_gm_query_v0(inbox->head);
         if (head < AICORE_INBOX_EMPTY_V1) return false;
-        if (head == AICORE_INBOX_EMPTY_V1 && owner_queue.pending.head != AICORE_INBOX_EMPTY_V1) {
-            if (owner_queue.pending.tail < 0) return false;
+        const int64_t pending_head = aicore_gm_query_v0(owner_queue->pending_head);
+        if (head == AICORE_INBOX_EMPTY_V1 && pending_head != AICORE_INBOX_EMPTY_V1) {
+            if (pending_head < AICORE_INBOX_EMPTY_V1 || aicore_gm_query_v0(owner_queue->pending_tail) < 0)
+                return false;
             aicore_cache_barrier_v0();
-            aicore_gm_store_v0(inbox->head, owner_queue.pending.head);
-            owner_queue.pending = {};
-            if (!owner_queue.advertised) {
+            aicore_gm_store_v0(inbox->head, pending_head);
+            aicore_ready_owner_pending_reset_v1(owner_queue);
+            if (aicore_gm_query_v0(owner_queue->advertised) == 0) {
                 aicore_ready_directory_set_v1(
                     aicore_ready_directory_at_v1(sidecar_base, context), core_type_index, inbox_index
                 );
-                owner_queue.advertised = true;
+                aicore_gm_store_v0(owner_queue->advertised, UINT64_C(1));
             }
         }
         const int64_t published_head = aicore_gm_query_v0(inbox->head);
         if (published_head == AICORE_INBOX_EMPTY_V1) {
             aicore_cache_barrier_v0();
             aicore_gm_store_v0(inbox->head, batch->head);
-            if (!owner_queue.advertised) {
+            if (aicore_gm_query_v0(owner_queue->advertised) == 0) {
                 aicore_ready_directory_set_v1(
                     aicore_ready_directory_at_v1(sidecar_base, context), core_type_index, inbox_index
                 );
-                owner_queue.advertised = true;
+                aicore_gm_store_v0(owner_queue->advertised, UINT64_C(1));
             }
-            *batch = {};
+            aicore_ready_batch_reset_v1(batch);
         } else {
             if (published_head < AICORE_INBOX_EMPTY_V1) return false;
-            if (!owner_queue.advertised) {
+            if (aicore_gm_query_v0(owner_queue->advertised) == 0) {
                 aicore_ready_directory_set_v1(
                     aicore_ready_directory_at_v1(sidecar_base, context), core_type_index, inbox_index
                 );
-                owner_queue.advertised = true;
+                aicore_gm_store_v0(owner_queue->advertised, UINT64_C(1));
             }
-            if (!aicore_ready_batch_concat_v1(sidecar_base, context, &owner_queue.pending, batch)) return false;
+            if (!aicore_ready_owner_pending_append_v1(sidecar_base, context, owner_queue, batch)) return false;
         }
     }
     if (stats != nullptr) ++stats->batch_count;
-    if (owner_state == nullptr) *batch = {};
+    if (owner_state == nullptr) aicore_ready_batch_reset_v1(batch);
     return true;
 }
 
@@ -750,7 +777,7 @@ inline __aicore__ bool aicore_claim_ready_for_slot_v1(
     const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *context,
     __gm__ AicoreRunControlV1 *run_control, uint64_t resolver_count, uint32_t core_type_index, uint64_t *victim_cursor,
     AicoreReadyStatsV1 *stats, AicoreReadyClaimV1 *claim, bool trace_enabled = false,
-    AicoreReadyOwnerStateV1 *owner_state = nullptr
+    __gm__ AicoreReadyOwnerStateV1 *owner_state = nullptr
 ) {
     if (victim_cursor == nullptr || claim == nullptr || resolver_count == 0) return false;
     *claim = {};
@@ -1150,7 +1177,7 @@ inline __aicore__ bool aicore_resolve_completion_v1(
     __gm__ AicoreRunControlV1 *run_control, int64_t task_id, AicoreWakeStatsV1 *wake_stats,
     AicoreReadyStatsV1 *ready_stats, AicoreCompletionStatsV1 *completion_stats, bool trace_enabled = false,
     bool validate_done_state = true, uint64_t *ready_publish_cycles = nullptr,
-    AicoreReadyOwnerStateV1 *owner_state = nullptr
+    __gm__ AicoreReadyOwnerStateV1 *owner_state = nullptr
 ) {
     __gm__ AicoreTaskControlV1 *control = aicore_task_control_at_v1(sidecar_base, context, task_id);
     if (validate_done_state && aicore_gm_query_v0(control->state) != static_cast<int64_t>(AicoreTaskStateV1::DONE)) {
@@ -1240,7 +1267,7 @@ inline __aicore__ bool aicore_refill_private_slot_v1(
     const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver,
     __gm__ AicoreRunControlV1 *run_control, uint64_t resolver_count, const AicoreFreeSlotClaimV1 &slot_claim,
     uint64_t *ready_victim_cursors, AicoreReadyStatsV1 *ready_stats, bool trace_enabled,
-    AicoreRefillTimingV1 *timing = nullptr, AicoreReadyOwnerStateV1 *owner_state = nullptr
+    AicoreRefillTimingV1 *timing = nullptr, __gm__ AicoreReadyOwnerStateV1 *owner_state = nullptr
 ) {
     __gm__ AicoreWorkerContextV1 *target = aicore_worker_context_at_v1(sidecar_base, resolver, slot_claim.worker_id);
     aicore_observe_cache_line_v0(target);
@@ -1276,7 +1303,7 @@ inline __aicore__ bool aicore_service_completion_inboxes_v1(
     __gm__ AicoreRunControlV1 *run_control, uint64_t resolver_count, uint64_t *completion_victim_cursor,
     uint64_t *ready_victim_cursors, AicoreWakeStatsV1 *wake_stats, AicoreReadyStatsV1 *ready_stats,
     AicoreCompletionStatsV1 *completion_stats, bool *made_progress, bool trace_enabled = false,
-    AicoreReadyOwnerStateV1 *owner_state = nullptr
+    __gm__ AicoreReadyOwnerStateV1 *owner_state = nullptr
 ) {
     if (made_progress != nullptr) *made_progress = false;
     if (context->core_type != static_cast<int32_t>(AicoreRootCoreTypeV0::AIV)) return true;
@@ -1344,7 +1371,7 @@ inline __aicore__ bool aicore_dispatch_one_overflow_v1(
     __gm__ AicoreRunControlV1 *run_control, uint64_t resolver_count, uint32_t core_type_index,
     uint64_t *ready_victim_cursor, uint64_t *free_slot_cursor, AicoreReadyStatsV1 *ready_stats,
     AicoreFreeSlotStatsV1 *free_stats, bool *made_progress, bool trace_enabled = false,
-    AicoreReadyOwnerStateV1 *owner_state = nullptr
+    __gm__ AicoreReadyOwnerStateV1 *owner_state = nullptr
 ) {
     if (made_progress != nullptr) *made_progress = false;
     if (!aicore_ready_directory_nonempty_v1(sidecar_base, resolver, resolver_count, core_type_index)) return true;

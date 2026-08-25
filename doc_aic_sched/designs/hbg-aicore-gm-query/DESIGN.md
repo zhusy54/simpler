@@ -272,14 +272,15 @@ Task state 的 query 决定是否继续路由；wake-list head 的 query 只提�
 
 | 调用位置 | 查询字段 | 作用 | 后续所有权动作 |
 | -------- | -------- | ---- | -------------- |
-| `aicore_ready_owner_maintain_type_v1` | `inbox.head` | owner 判断是否提升本地 pending bank 或清 directory bit | 普通 store 发布 pending head；两 bank 为空时清 bit |
-| `aicore_ready_batch_push_v1` | `inbox.head` | owner 判断 batch 直接发布还是追加到本地 pending bank | 空 out 以普通 store 发布，否则只更新 owner-local FIFO |
+| `aicore_ready_owner_maintain_type_v1` | `inbox.head`、owner-only GM pending metadata | owner 判断是否提升 pending bank 或清 directory bit | 普通 store 发布 pending head；两 bank 为空时清 bit |
+| `aicore_ready_batch_push_v1` | `inbox.head`、owner-only GM pending metadata | owner 判断 batch 直接发布还是追加到 pending bank | 空 out 以普通 store 发布，否则只更新 owner 独占 FIFO；不新增 RMW |
 | `aicore_ready_pop_from_inbox_v1` | `inbox.head` | 发现可弹出的 ready task | CAS/exchange 更新 head |
 | `aicore_ready_pop_from_inbox_v1` link wait | `inbox.head` | 等待 next link 发布时判断 head 是否已变化 | 变化后重新开始领取 |
 | `aicore_load_ready_directory_shard_v1` | shard bitmap | 发现本 shard 中非空 inbox | 进入具体 inbox claim |
 
 directory bit 是提示信息，不是 Ready task 的所有权。consumer 不再清 bit；Resolver owner
-在 published out 与本地 pending 同时为空时清除它。真正的 task 领取仍发生在 inbox head
+在 published out 与 owner-only GM pending 同时为空时清除它。pending metadata 按
+Resolver/type 独占缓存行布局，thief 不访问，因此不增加跨核竞争。真正的 task 领取仍发生在 inbox head
 的 CAS 更新处。
 
 ### 5.3 Free-slot directory 查询

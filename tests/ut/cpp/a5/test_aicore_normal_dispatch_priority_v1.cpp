@@ -60,6 +60,7 @@ TEST(AicoreNormalDispatchPriorityV1, EmptyReadyDirectorySkipsAllSlotClaims) {
         contexts[worker].worker_contexts_offset = layout.worker_contexts_offset;
         contexts[worker].dispatch_slots_offset = layout.dispatch_slots_offset;
         contexts[worker].ready_inboxes_offset = layout.ready_inboxes_offset;
+        contexts[worker].ready_owner_states_offset = layout.ready_owner_states_offset;
         contexts[worker].ready_directory_offset = layout.ready_directory_offset;
         contexts[worker].gang_coordinator_offset = layout.gang_coordinator_offset;
         contexts[worker].runtime_worker_count = 3;

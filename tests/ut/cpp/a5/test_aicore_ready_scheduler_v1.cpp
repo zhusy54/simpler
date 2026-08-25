@@ -103,6 +103,7 @@ struct FixtureStorage {
             context.task_metadata_offset = layout.task_metadata_offset;
             context.completion_inboxes_offset = layout.completion_inboxes_offset;
             context.ready_inboxes_offset = layout.ready_inboxes_offset;
+            context.ready_owner_states_offset = layout.ready_owner_states_offset;
             context.ready_directory_offset = layout.ready_directory_offset;
             context.free_slot_directory_offset = layout.free_slot_directory_offset;
             context.trace_cells_offset = layout.trace_cells_offset;
@@ -199,6 +200,7 @@ TEST(AicoreReadySidecarV1, PlansAndInitializesReadyState) {
     EXPECT_EQ(layout.total_size % AICORE_SIDECAR_ALIGNMENT_V1, 0u);
     EXPECT_EQ(layout.task_metadata_offset % alignof(AicoreTaskMetadataV1), 0u);
     EXPECT_EQ(layout.ready_inboxes_offset % alignof(AicoreReadyInboxV1), 0u);
+    EXPECT_EQ(layout.ready_owner_states_offset % alignof(AicoreReadyOwnerStateV1), 0u);
     EXPECT_EQ(layout.ready_directory_offset % alignof(AicoreReadyDirectoryV1), 0u);
     EXPECT_EQ(layout.free_slot_directory_offset % alignof(AicoreFreeSlotDirectoryV1), 0u);
 
@@ -212,6 +214,14 @@ TEST(AicoreReadySidecarV1, PlansAndInitializesReadyState) {
     auto *ready = aicore_sidecar_at_v1<AicoreReadyInboxV1>(storage.base(), layout.ready_inboxes_offset);
     for (uint64_t inbox = 0; inbox < AICORE_CORE_TYPE_COUNT_V1 * AICORE_WORKER_CAPACITY_V1; ++inbox)
         EXPECT_EQ(ready[inbox].head, AICORE_INBOX_EMPTY_V1);
+    auto *ready_owners =
+        aicore_sidecar_at_v1<AicoreReadyOwnerStateV1>(storage.base(), layout.ready_owner_states_offset);
+    for (uint64_t owner = 0; owner < AICORE_CLUSTER_CAPACITY_V1; ++owner) {
+        for (uint32_t type = 0; type < AICORE_CORE_TYPE_COUNT_V1; ++type) {
+            EXPECT_EQ(ready_owners[owner].queues[type].pending_head, AICORE_INBOX_EMPTY_V1);
+            EXPECT_EQ(ready_owners[owner].queues[type].pending_tail, AICORE_INBOX_EMPTY_V1);
+        }
+    }
 
     auto *directory = aicore_sidecar_at_v1<AicoreReadyDirectoryV1>(storage.base(), layout.ready_directory_offset);
     auto shard0 = reinterpret_cast<uintptr_t>(&directory->core_types[0][0]);
@@ -525,6 +535,19 @@ TEST(AicoreReadyInboxV1, BatchPushAndOwnerMaintenancePreserveFifoAndDirectory) {
     EXPECT_EQ(stats.pop_count, kTasks);
 }
 
+TEST(AicoreReadyInboxV1, OwnerStateInitializationRestoresEmptySentinels) {
+    AicoreReadyOwnerStateV1 owner_state;
+    __builtin_memset(&owner_state, 0, sizeof(owner_state));
+
+    aicore_ready_owner_init_v1(&owner_state);
+
+    for (uint32_t type = 0; type < AICORE_CORE_TYPE_COUNT_V1; ++type) {
+        EXPECT_EQ(owner_state.queues[type].pending_head, AICORE_INBOX_EMPTY_V1);
+        EXPECT_EQ(owner_state.queues[type].pending_tail, AICORE_INBOX_EMPTY_V1);
+        EXPECT_EQ(owner_state.queues[type].advertised, 0u);
+    }
+}
+
 TEST(AicoreReadyInboxV1, OwnerPromotesPendingBankAfterPublishedBankDrains) {
     constexpr uint64_t kTasks = 4;
     FixtureStorage storage(kTasks, 1);
@@ -549,8 +572,8 @@ TEST(AicoreReadyInboxV1, OwnerPromotesPendingBankAfterPublishedBankDrains) {
     ASSERT_TRUE(
         aicore_ready_batch_push_v1(storage.sidecar->base(), &storage.contexts[0], 0, 0, &pending, &stats, &owner_state)
     );
-    EXPECT_EQ(owner_state.queues[0].pending.head, 2);
-    EXPECT_EQ(owner_state.queues[0].pending.tail, 3);
+    EXPECT_EQ(owner_state.queues[0].pending_head, 2);
+    EXPECT_EQ(owner_state.queues[0].pending_tail, 3);
 
     for (int64_t expected = 0; expected < 2; ++expected) {
         int64_t task = AICORE_TASK_ID_INVALID_V1;
@@ -599,7 +622,7 @@ TEST(AicoreReadyInboxV1, OlderPendingBankPrecedesBatchArrivingAfterDrain) {
     ASSERT_TRUE(
         aicore_ready_batch_push_v1(storage.sidecar->base(), &storage.contexts[0], 0, 0, &arriving, &stats, &owner_state)
     );
-    EXPECT_EQ(owner_state.queues[0].pending.head, 2);
+    EXPECT_EQ(owner_state.queues[0].pending_head, 2);
     ASSERT_TRUE(aicore_ready_pop_from_inbox_v1(
         graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 0, 0, &task, &stats
     ));
@@ -634,7 +657,7 @@ TEST(AicoreReadyInboxV1, ThiefCannotObserveOrPromoteOwnerPendingBank) {
         graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 0, 1, &task, &stats
     ));
     EXPECT_EQ(task, AICORE_TASK_ID_INVALID_V1);
-    EXPECT_EQ(owner_state.queues[0].pending.head, 1);
+    EXPECT_EQ(owner_state.queues[0].pending_head, 1);
     ASSERT_TRUE(aicore_ready_owner_maintain_type_v1(storage.sidecar->base(), &storage.contexts[1], 0, &owner_state));
     ASSERT_TRUE(aicore_ready_pop_from_inbox_v1(
         graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 0, 1, &task, &stats
@@ -845,7 +868,7 @@ TEST(AicoreReadyWakeV1, WakeResolveQueuesBehindOlderPublishedWork) {
         graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 0, &wake, &ready,
         &completion, false, true, nullptr, &owner_state
     ));
-    EXPECT_EQ(owner_state.queues[0].pending.head, 1);
+    EXPECT_EQ(owner_state.queues[0].pending_head, 1);
 
     int64_t task = AICORE_TASK_ID_INVALID_V1;
     ASSERT_TRUE(aicore_ready_pop_from_inbox_v1(

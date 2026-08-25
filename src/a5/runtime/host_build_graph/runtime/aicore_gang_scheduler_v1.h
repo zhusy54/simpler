@@ -619,7 +619,7 @@ inline __aicore__ bool aicore_gang_service_owner_v1(
     const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver,
     __gm__ AicoreRunControlV1 *run_control, uint32_t cohort_index, __gm__ AicoreGangCohortV1 *cohort,
     AicoreWakeStatsV1 *wake_stats, AicoreReadyStatsV1 *ready_stats, AicoreCompletionStatsV1 *completion_stats,
-    AicoreReadyOwnerStateV1 *owner_state = nullptr
+    __gm__ AicoreReadyOwnerStateV1 *owner_state = nullptr
 ) {
     if (resolver->resolver_index != 0 || cohort->participant_count == 0) return false;
     const uint64_t generation = cohort->generation;
@@ -714,7 +714,7 @@ inline __aicore__ bool aicore_gang_service_owner_v1(
 inline __aicore__ bool aicore_service_gang_scheduler_v1(
     const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver,
     __gm__ AicoreRunControlV1 *run_control, AicoreWakeStatsV1 *wake_stats, AicoreReadyStatsV1 *ready_stats,
-    AicoreCompletionStatsV1 *completion_stats, AicoreReadyOwnerStateV1 *owner_state = nullptr
+    AicoreCompletionStatsV1 *completion_stats, __gm__ AicoreReadyOwnerStateV1 *owner_state = nullptr
 ) {
     if (resolver->is_resolver == 0) return false;
     __gm__ AicoreGangCoordinatorV1 *coordinator = aicore_gang_coordinator_at_v1(sidecar_base, resolver);
@@ -803,7 +803,7 @@ inline __aicore__ bool aicore_service_cluster_completion_slot_v1(
     AicoreWakeStatsV1 *wake_stats, AicoreReadyStatsV1 *ready_stats, AicoreCompletionStatsV1 *completion_stats,
     uint64_t *ready_victim_cursors, bool trace_enabled, const AicoreReadyClaimV1 *replacement_ready,
     bool *direct_refilled, AicoreCompletionServiceTimingV1 *timing = nullptr,
-    AicoreReadyOwnerStateV1 *owner_state = nullptr
+    __gm__ AicoreReadyOwnerStateV1 *owner_state = nullptr
 ) {
     if (direct_refilled != nullptr) *direct_refilled = false;
     if (cluster_lane >= 3 || pending_slot >= AICORE_PENDING_SLOT_COUNT_V1 || completed_generation == 0) return false;
@@ -933,7 +933,7 @@ inline __aicore__ bool aicore_service_cluster_completions_v1(
     __gm__ AicoreRunControlV1 *run_control, AicoreWakeStatsV1 *wake_stats, AicoreReadyStatsV1 *ready_stats,
     AicoreCompletionStatsV1 *completion_stats, uint64_t *ready_victim_cursors = nullptr, bool trace_enabled = false,
     uint64_t *direct_refilled_slot_mask = nullptr, AicoreCompletionServiceTimingV1 *timing = nullptr,
-    AicoreReadyOwnerStateV1 *owner_state = nullptr
+    __gm__ AicoreReadyOwnerStateV1 *owner_state = nullptr
 ) {
     if (resolver->is_resolver == 0) return false;
     if (direct_refilled_slot_mask != nullptr) *direct_refilled_slot_mask = 0;
@@ -997,7 +997,7 @@ inline __aicore__ bool aicore_fill_cluster_normal_slots_v1(
     const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver,
     __gm__ AicoreRunControlV1 *run_control, uint64_t *ready_victim_cursors, AicoreReadyStatsV1 *ready_stats,
     bool trace_enabled, uint64_t skip_slot_mask = 0, AicoreNormalDispatchTimingV1 *timing = nullptr,
-    AicoreDeferredAivQueueV1 *deferred_aiv = nullptr, AicoreReadyOwnerStateV1 *owner_state = nullptr
+    AicoreDeferredAivQueueV1 *deferred_aiv = nullptr, __gm__ AicoreReadyOwnerStateV1 *owner_state = nullptr
 ) {
     if (resolver->is_resolver == 0) return false;
     const uint32_t aic_core_type = static_cast<uint32_t>(AicoreRootCoreTypeV0::AIC);
@@ -1228,7 +1228,8 @@ inline __aicore__ bool aicore_drain_deferred_aiv_to_peer_v1(
     __gm__ AicoreRunControlV1 *run_control, AicoreDeferredAivQueueV1 *queue, AicoreWakeStatsV1 *wake_stats,
     AicoreReadyStatsV1 *ready_stats, AicoreCompletionStatsV1 *completion_stats, bool trace_enabled,
     AicoreCompletionServiceTimingV1 *completion_timing = nullptr,
-    AicoreNormalDispatchTimingV1 *dispatch_timing = nullptr, AicoreReadyOwnerStateV1 *owner_state = nullptr
+    AicoreNormalDispatchTimingV1 *dispatch_timing = nullptr,
+    __gm__ AicoreReadyOwnerStateV1 *owner_state = nullptr
 ) {
     if (queue == nullptr || queue->count == 0) return true;
     const int32_t peer_lane = aicore_deferred_aiv_peer_lane_v1(sidecar_base, resolver);

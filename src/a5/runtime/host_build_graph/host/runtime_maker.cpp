@@ -1181,6 +1181,7 @@ bool create_aicore_sidecar_v1(
         context.completion_inboxes_offset = layout.completion_inboxes_offset;
         context.task_metadata_offset = layout.task_metadata_offset;
         context.ready_inboxes_offset = layout.ready_inboxes_offset;
+        context.ready_owner_states_offset = layout.ready_owner_states_offset;
         context.ready_directory_offset = layout.ready_directory_offset;
         context.free_slot_directory_offset = layout.free_slot_directory_offset;
         context.worker_contexts_offset = layout.worker_contexts_offset;

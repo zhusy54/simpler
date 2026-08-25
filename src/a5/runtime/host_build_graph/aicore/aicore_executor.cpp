@@ -253,9 +253,9 @@ __aicore__ __attribute__((always_inline)) void commit_task_trace(
 __aicore__ bool bootstrap_ready_graph(
     const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *resolver,
     __gm__ AicoreRunControlV1 *run_control, uint64_t resolver_count, AicoreWorkerStatsV1 *stats, bool trace_enabled,
-    AicoreDeferredAivQueueV1 *deferred_aiv, AicoreReadyOwnerStateV1 *ready_owner
+    AicoreDeferredAivQueueV1 *deferred_aiv
 ) {
-    if (resolver_count == 0 || resolver->inbox_index >= resolver_count || ready_owner == nullptr) return false;
+    if (resolver_count == 0 || resolver->inbox_index >= resolver_count) return false;
     if (trace_enabled) stats->bootstrap_start_cycles = aicore_scheduler_cycles_v1();
     AicoreReadyBatchV1 batches[AICORE_CORE_TYPE_COUNT_V1]{};
     uint64_t tasks_per_resolver = graph.task_count / resolver_count;
@@ -298,7 +298,6 @@ __aicore__ bool bootstrap_ready_graph(
                 sidecar_base, resolver, type, resolver->inbox_index, &batches[type], &stats->ready, &ready_types
             ))
             return false;
-        ready_owner->queues[type].advertised = (ready_types & (UINT64_C(1) << type)) != 0;
     }
     __gm__ AicoreReadyDirectoryV1 *ready_directory = aicore_ready_directory_at_v1(sidecar_base, resolver);
     aicore_gm_store_v0(ready_directory->bootstrap_ready_types[resolver->inbox_index], ready_types);
@@ -345,11 +344,11 @@ __aicore__ bool bootstrap_ready_graph(
         (resolver->inbox_index + 1) % resolver_count,
     };
     (void)aicore_service_gang_scheduler_v1(
-        graph, sidecar_base, resolver, run_control, &stats->wake, &stats->ready, &stats->completion, ready_owner
+        graph, sidecar_base, resolver, run_control, &stats->wake, &stats->ready, &stats->completion
     );
     (void)aicore_fill_cluster_normal_slots_v1(
         graph, sidecar_base, resolver, run_control, ready_victim_cursors, &stats->ready, trace_enabled, 0, nullptr,
-        deferred_aiv, ready_owner
+        deferred_aiv
     );
 
     // This completion publication is observed by AICPU before it emits the
@@ -364,12 +363,25 @@ __aicore__ bool run_ready_dispatch_loop(
     const AicoreReadonlyGraphV0 &graph, __gm__ void *sidecar_base, __gm__ AicoreWorkerContextV1 *context,
     __gm__ AicoreRunControlV1 *run_control, AicoreTaskProfilingStateV1 *task_profiling, AicoreWorkerStatsV1 *stats,
     bool trace_enabled, uint64_t aicore_entry_cycles, uint64_t handshake_publish_cycles,
-    uint64_t register_release_cycles, uint64_t descriptor_cache_observed_cycles, AicoreDeferredAivQueueV1 *deferred_aiv,
-    AicoreReadyOwnerStateV1 *ready_owner
+    uint64_t register_release_cycles, uint64_t descriptor_cache_observed_cycles, AicoreDeferredAivQueueV1 *deferred_aiv
 ) {
     uint64_t resolver_count = aicore_gm_query_v0(run_control->resolver_count);
     bool resolver_worker = context->is_resolver != 0;
     if (resolver_count == 0) return false;
+    __gm__ AicoreReadyOwnerStateV1 *ready_owner = nullptr;
+    if (resolver_worker) {
+        ready_owner = aicore_ready_owner_state_at_v1(sidecar_base, context);
+        aicore_ready_owner_init_v1(ready_owner);
+        __gm__ AicoreReadyDirectoryV1 *ready_directory = aicore_ready_directory_at_v1(sidecar_base, context);
+        const uint64_t bootstrap_ready_types =
+            aicore_gm_query_v0(ready_directory->bootstrap_ready_types[context->inbox_index]);
+        for (uint32_t type = 0; type < AICORE_CORE_TYPE_COUNT_V1; ++type) {
+            aicore_gm_store_v0(
+                ready_owner->queues[type].advertised,
+                (bootstrap_ready_types & (UINT64_C(1) << type)) != 0 ? UINT64_C(1) : UINT64_C(0)
+            );
+        }
+    }
     uint64_t ready_victim_cursors[AICORE_CORE_TYPE_COUNT_V1]{
         resolver_worker ? (context->inbox_index + 1) % resolver_count : 0,
         resolver_worker ? (context->inbox_index + 1) % resolver_count : 0,
@@ -673,7 +685,6 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     };
     AicoreWorkerStatsV1 stats{};
     AicoreDeferredAivQueueV1 deferred_aiv{};
-    AicoreReadyOwnerStateV1 ready_owner{};
     uint64_t descriptor_cache_observed_cycles = 0;
     if (context->active != 0) {
         aicore_observe_data_cache_v0(reinterpret_cast<__gm__ void *>(graph.descriptors_address));
@@ -681,7 +692,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         if (context->is_resolver != 0 &&
             !bootstrap_ready_graph(
                 graph, sidecar_base, context, run_control, aicore_gm_query_v0(run_control->resolver_count), &stats,
-                trace_enabled, &deferred_aiv, &ready_owner
+                trace_enabled, &deferred_aiv
             )) {
             aicore_record_scheduler_error_v1(
                 run_control, AICORE_TASK_ID_INVALID_V1, AicoreRootStatusV0::INVALID_ARGUMENTS, &graph, context,
@@ -704,8 +715,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         if (context->active != 0) {
             (void)run_ready_dispatch_loop(
                 graph, sidecar_base, context, run_control, &task_profiling, &stats, trace_enabled, aicore_entry_cycles,
-                handshake_publish_cycles, register_release_cycles, descriptor_cache_observed_cycles, &deferred_aiv,
-                &ready_owner
+                handshake_publish_cycles, register_release_cycles, descriptor_cache_observed_cycles, &deferred_aiv
             );
         }
     }
