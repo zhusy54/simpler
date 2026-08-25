@@ -279,7 +279,8 @@ Task state 的 query 决定是否继续路由；wake-list head 的 query 只提�
 | `aicore_load_ready_directory_shard_v1` | shard bitmap | 发现本 shard 中非空 inbox | 进入具体 inbox claim |
 
 directory bit 是提示信息，不是 Ready task 的所有权。consumer 不再清 bit；Resolver owner
-在 published out 与 owner-only GM pending 同时为空时清除它。pending metadata 按
+在 published out 与 owner-only GM pending 同时为空时清除它。pending head/tail 打包在
+同一个 64-bit device word 中，owner 每次只观察一个一致快照；该 metadata 按
 Resolver/type 独占缓存行布局，thief 不访问，因此不增加跨核竞争。真正的 task 领取仍发生在 inbox head
 的 CAS 更新处。
 

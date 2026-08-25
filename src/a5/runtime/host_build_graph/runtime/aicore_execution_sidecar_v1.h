@@ -46,6 +46,7 @@ inline constexpr int64_t AICORE_WAKE_LIST_OPEN_V1 = -1;
 inline constexpr int64_t AICORE_WAKE_LIST_CLOSED_V1 = -2;
 inline constexpr int64_t AICORE_INBOX_EMPTY_V1 = -1;
 inline constexpr int64_t AICORE_INBOX_LINK_UNPUBLISHED_V1 = -2;
+inline constexpr uint64_t AICORE_READY_PENDING_EMPTY_V1 = UINT64_MAX;
 
 enum class AicoreTaskStateV1 : int64_t {
     BLOCKED = 0,
@@ -144,10 +145,11 @@ struct alignas(128) AicoreReadyInboxV1 {
 };
 
 struct alignas(64) AicoreReadyOwnerQueueV1 {
-    volatile int64_t pending_head{AICORE_INBOX_EMPTY_V1};
-    volatile int64_t pending_tail{AICORE_INBOX_EMPTY_V1};
+    // Head and tail are one owner-only device word so an ld_dev cannot
+    // observe endpoints from different updates.
+    volatile uint64_t pending_endpoints{AICORE_READY_PENDING_EMPTY_V1};
     volatile uint64_t advertised{0};
-    uint8_t owner_line_padding[40];
+    uint8_t owner_line_padding[48];
 };
 
 struct alignas(128) AicoreReadyOwnerStateV1 {
@@ -768,10 +770,8 @@ inline bool aicore_sidecar_init_v1(void *base, const AicoreExecutionSidecarLayou
     auto *ready_owners =
         aicore_sidecar_at_v1<AicoreReadyOwnerStateV1>(base, layout.ready_owner_states_offset);
     for (uint64_t owner = 0; owner < AICORE_CLUSTER_CAPACITY_V1; ++owner) {
-        for (uint32_t type = 0; type < AICORE_CORE_TYPE_COUNT_V1; ++type) {
-            ready_owners[owner].queues[type].pending_head = AICORE_INBOX_EMPTY_V1;
-            ready_owners[owner].queues[type].pending_tail = AICORE_INBOX_EMPTY_V1;
-        }
+        for (uint32_t type = 0; type < AICORE_CORE_TYPE_COUNT_V1; ++type)
+            ready_owners[owner].queues[type].pending_endpoints = AICORE_READY_PENDING_EMPTY_V1;
     }
     auto *contexts = aicore_sidecar_at_v1<AicoreWorkerContextV1>(base, layout.worker_contexts_offset);
     for (uint64_t worker = 0; worker < AICORE_WORKER_CAPACITY_V1; ++worker) {

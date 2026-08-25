@@ -40,7 +40,9 @@ close-race protocol.
 
 Each resolver owns one AIC and one AIV Ready inbox. Each typed inbox is an
 owner-banked FIFO: the shared out bank is visible to consumers through its
-head, while a Resolver-owned GM sidecar bank tracks both pending endpoints.
+head, while a Resolver-owned GM sidecar bank tracks both pending endpoints in
+one packed 64-bit word. The single-word snapshot prevents the owner from
+observing a head and tail from different GM updates.
 The pending metadata has a dedicated cache line per core type and is never
 read or written by thieves. Producers
 only append batches to their own inbox. Consumers pop one task at a time using

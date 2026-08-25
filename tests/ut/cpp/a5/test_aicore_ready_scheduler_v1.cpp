@@ -218,8 +218,7 @@ TEST(AicoreReadySidecarV1, PlansAndInitializesReadyState) {
         aicore_sidecar_at_v1<AicoreReadyOwnerStateV1>(storage.base(), layout.ready_owner_states_offset);
     for (uint64_t owner = 0; owner < AICORE_CLUSTER_CAPACITY_V1; ++owner) {
         for (uint32_t type = 0; type < AICORE_CORE_TYPE_COUNT_V1; ++type) {
-            EXPECT_EQ(ready_owners[owner].queues[type].pending_head, AICORE_INBOX_EMPTY_V1);
-            EXPECT_EQ(ready_owners[owner].queues[type].pending_tail, AICORE_INBOX_EMPTY_V1);
+            EXPECT_EQ(ready_owners[owner].queues[type].pending_endpoints, AICORE_READY_PENDING_EMPTY_V1);
         }
     }
 
@@ -542,10 +541,16 @@ TEST(AicoreReadyInboxV1, OwnerStateInitializationRestoresEmptySentinels) {
     aicore_ready_owner_init_v1(&owner_state);
 
     for (uint32_t type = 0; type < AICORE_CORE_TYPE_COUNT_V1; ++type) {
-        EXPECT_EQ(owner_state.queues[type].pending_head, AICORE_INBOX_EMPTY_V1);
-        EXPECT_EQ(owner_state.queues[type].pending_tail, AICORE_INBOX_EMPTY_V1);
+        EXPECT_EQ(owner_state.queues[type].pending_endpoints, AICORE_READY_PENDING_EMPTY_V1);
         EXPECT_EQ(owner_state.queues[type].advertised, 0u);
     }
+}
+
+TEST(AicoreReadyInboxV1, PackedOwnerEndpointsRoundTripAsOneWord) {
+    EXPECT_EQ(aicore_ready_pending_pack_v1(AICORE_INBOX_EMPTY_V1, AICORE_INBOX_EMPTY_V1), UINT64_MAX);
+    const uint64_t endpoints = aicore_ready_pending_pack_v1(INT32_MAX - 1, INT32_MAX);
+    EXPECT_EQ(aicore_ready_pending_head_v1(endpoints), INT32_MAX - 1);
+    EXPECT_EQ(aicore_ready_pending_tail_v1(endpoints), INT32_MAX);
 }
 
 TEST(AicoreReadyInboxV1, OwnerPromotesPendingBankAfterPublishedBankDrains) {
@@ -572,8 +577,9 @@ TEST(AicoreReadyInboxV1, OwnerPromotesPendingBankAfterPublishedBankDrains) {
     ASSERT_TRUE(
         aicore_ready_batch_push_v1(storage.sidecar->base(), &storage.contexts[0], 0, 0, &pending, &stats, &owner_state)
     );
-    EXPECT_EQ(owner_state.queues[0].pending_head, 2);
-    EXPECT_EQ(owner_state.queues[0].pending_tail, 3);
+    const uint64_t endpoints = owner_state.queues[0].pending_endpoints;
+    EXPECT_EQ(aicore_ready_pending_head_v1(endpoints), 2);
+    EXPECT_EQ(aicore_ready_pending_tail_v1(endpoints), 3);
 
     for (int64_t expected = 0; expected < 2; ++expected) {
         int64_t task = AICORE_TASK_ID_INVALID_V1;
@@ -622,7 +628,7 @@ TEST(AicoreReadyInboxV1, OlderPendingBankPrecedesBatchArrivingAfterDrain) {
     ASSERT_TRUE(
         aicore_ready_batch_push_v1(storage.sidecar->base(), &storage.contexts[0], 0, 0, &arriving, &stats, &owner_state)
     );
-    EXPECT_EQ(owner_state.queues[0].pending_head, 2);
+    EXPECT_EQ(aicore_ready_pending_head_v1(owner_state.queues[0].pending_endpoints), 2);
     ASSERT_TRUE(aicore_ready_pop_from_inbox_v1(
         graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 0, 0, &task, &stats
     ));
@@ -657,7 +663,7 @@ TEST(AicoreReadyInboxV1, ThiefCannotObserveOrPromoteOwnerPendingBank) {
         graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 0, 1, &task, &stats
     ));
     EXPECT_EQ(task, AICORE_TASK_ID_INVALID_V1);
-    EXPECT_EQ(owner_state.queues[0].pending_head, 1);
+    EXPECT_EQ(aicore_ready_pending_head_v1(owner_state.queues[0].pending_endpoints), 1);
     ASSERT_TRUE(aicore_ready_owner_maintain_type_v1(storage.sidecar->base(), &storage.contexts[1], 0, &owner_state));
     ASSERT_TRUE(aicore_ready_pop_from_inbox_v1(
         graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 0, 1, &task, &stats
@@ -868,7 +874,7 @@ TEST(AicoreReadyWakeV1, WakeResolveQueuesBehindOlderPublishedWork) {
         graph.graph(), storage.sidecar->base(), &storage.contexts[0], storage.run_control, 0, &wake, &ready,
         &completion, false, true, nullptr, &owner_state
     ));
-    EXPECT_EQ(owner_state.queues[0].pending_head, 1);
+    EXPECT_EQ(aicore_ready_pending_head_v1(owner_state.queues[0].pending_endpoints), 1);
 
     int64_t task = AICORE_TASK_ID_INVALID_V1;
     ASSERT_TRUE(aicore_ready_pop_from_inbox_v1(
