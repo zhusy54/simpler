@@ -1,7 +1,7 @@
 # Scalar Data Access During Host Graph Construction
 
-`host_build_graph` runs the orchestration function synchronously on the host,
-before any AICPU scheduler or AICore kernel starts. `get_tensor_data` and
+A5 `host_build_graph` runs the orchestration function synchronously on the
+host, before AICPU lifecycle initialization or AICore execution starts. `get_tensor_data` and
 `set_tensor_data` therefore access the host view used to stage the graph's
 external tensors; they do not interleave host code with device execution.
 
@@ -38,8 +38,8 @@ The execution order is:
 
 1. The host loads and calls the orchestration shared object.
 2. Orchestration builds the entire task graph and returns.
-3. The host copies the graph image to device memory.
-4. AICPU schedulers boot and dispatch the graph.
+3. The host relocates and copies the graph image to device memory.
+4. AICPU initializes the workers, then AICore executes and resolves the graph.
 
 A producer submitted in step 1 cannot become `COMPLETED` until step 4. Waiting
 for that producer from the orchestration call cannot make progress. The runtime

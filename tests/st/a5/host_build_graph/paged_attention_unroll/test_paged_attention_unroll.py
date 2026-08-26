@@ -7,7 +7,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Paged attention unroll benchmark for the host-build-graph runtime."""
+"""Paged attention unroll for A5 host_build_graph."""
 
 import torch
 from simpler.task_interface import ArgDirection as D
@@ -18,42 +18,42 @@ from simpler_setup.goldens.paged_attention import generate_inputs as _pa_generat
 
 
 @scene_test(level=2, runtime="host_build_graph")
-class TestPagedAttentionUnrollHostBuildGraph(SceneTestCase):
+class TestPagedAttentionUnrollHostBuildGraphA5(SceneTestCase):
     RTOL = 1e-3
     ATOL = 1e-3
 
     CALLABLE = {
         "orchestration": {
             "source": "kernels/orchestration/paged_attention_orch.cpp",
-            "function_name": "aicpu_orchestration_entry",
+            "function_name": "build_paged_attention_unroll_graph",
             "signature": [D.IN, D.IN, D.IN, D.IN, D.IN, D.OUT],
         },
         "incores": [
             {
                 "func_id": 0,
                 "name": "QK",
-                "source": "kernels/aic/aic_qk_matmul.cpp",
+                "source": "../../tensormap_and_ringbuffer/paged_attention_unroll/kernels/aic/aic_qk_matmul.cpp",
                 "core_type": "aic",
                 "signature": [D.IN, D.IN, D.IN, D.OUT],
             },
             {
                 "func_id": 1,
                 "name": "SF",
-                "source": "kernels/aiv/aiv_softmax_prepare.cpp",
+                "source": "../../tensormap_and_ringbuffer/paged_attention_unroll/kernels/aiv/aiv_softmax_prepare.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.OUT, D.OUT, D.OUT],
             },
             {
                 "func_id": 2,
                 "name": "PV",
-                "source": "kernels/aic/aic_pv_matmul.cpp",
+                "source": "../../tensormap_and_ringbuffer/paged_attention_unroll/kernels/aic/aic_pv_matmul.cpp",
                 "core_type": "aic",
                 "signature": [D.IN, D.IN, D.IN, D.OUT],
             },
             {
                 "func_id": 3,
                 "name": "UP",
-                "source": "kernels/aiv/aiv_online_update.cpp",
+                "source": "../../tensormap_and_ringbuffer/paged_attention_unroll/kernels/aiv/aiv_online_update.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.IN, D.IN, D.INOUT, D.INOUT, D.INOUT, D.INOUT],
             },
@@ -61,6 +61,21 @@ class TestPagedAttentionUnrollHostBuildGraph(SceneTestCase):
     }
 
     CASES = [
+        {
+            "name": "SmallCaseMixedGroups",
+            "platforms": ["a5sim", "a5"],
+            "params": {
+                "batch": 2,
+                "num_heads": 16,
+                "kv_head_num": 1,
+                "head_dim": 128,
+                "block_size": 128,
+                "context_len": 8193,
+                "context_lens_list": [8193, 257],
+                "max_model_len": 8448,
+                "dtype": "bfloat16",
+            },
+        },
         {
             "name": "Case1",
             "platforms": ["a5"],
@@ -93,7 +108,6 @@ class TestPagedAttentionUnrollHostBuildGraph(SceneTestCase):
     ]
 
     def generate_args(self, params):
-        params = {**params, "variant": "paged_attention_unroll"}
         result = _pa_generate_inputs(params)
         specs = []
         for name, value in result:

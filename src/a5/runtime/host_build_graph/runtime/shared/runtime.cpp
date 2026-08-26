@@ -30,19 +30,19 @@ Runtime::Runtime() {
     memset(workers, 0, sizeof(workers));
     worker_count = 0;
     aicpu_thread_num = 1;
-    ready_queue_shards = RUNTIME_DEFAULT_READY_QUEUE_SHARDS;
     memset(aicpu_allowed_cpus, 0, sizeof(aicpu_allowed_cpus));
     aicpu_allowed_cpu_count = 0;
     aicpu_launch_count = 0;
     host_total_tasks = 0;
     sm_image_bytes = 0;
+    scheduler_state_base = nullptr;
+    scheduler_state_allocation = nullptr;
+    scheduler_state_allocation_size = 0;
+    scheduler_layout = {};
 
     // Initialize shared-memory / orchestration argument plumbing
     gm_sm_ptr_ = nullptr;
-    slot_states_ptr_ = nullptr;
     orch_args_storage_.clear();
-    prebuilt_arena_base_ = nullptr;
-    prebuilt_runtime_offset_ = 0;
 
     active_callable_id_ = -1;
     dev_orch_so_addr_ = 0;
@@ -60,10 +60,8 @@ Runtime::Runtime() {
 // Shared-memory / orchestration argument plumbing
 // =============================================================================
 
-void *Runtime::get_gm_sm_ptr() const { return gm_sm_ptr_; }
 const simpler::hbg::EntryArgsStorage &Runtime::get_orch_args() const { return orch_args_storage_; }
 void Runtime::set_gm_sm_ptr(void *p) { gm_sm_ptr_ = p; }
-void Runtime::set_slot_states_ptr(void *p) { slot_states_ptr_ = p; }
 // The one place a boundary ChipTensor becomes this runtime's Tensor. Called from
 // the host, before any orchestration runs, so nothing inside the runtime — on the
 // host or on the AICPU — ever holds the boundary form.
@@ -76,13 +74,6 @@ void Runtime::set_orch_args(const ChipStorageTaskArgs &args) {
         orch_args_storage_.add_scalar(args.scalar(i));
     }
 }
-
-void Runtime::set_prebuilt_arena(void *arena_base, size_t runtime_off) {
-    prebuilt_arena_base_ = arena_base;
-    prebuilt_runtime_offset_ = runtime_off;
-}
-void *Runtime::get_prebuilt_arena_base() const { return prebuilt_arena_base_; }
-size_t Runtime::get_prebuilt_runtime_offset() const { return prebuilt_runtime_offset_; }
 
 // Orchestration metadata written by the platform host (DeviceRunner) at
 // callable registration. host_build_graph runs the orchestrator on the host so

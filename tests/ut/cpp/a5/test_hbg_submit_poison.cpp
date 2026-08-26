@@ -46,11 +46,8 @@ void *const POISON_PTR = reinterpret_cast<void *>(static_cast<uintptr_t>(0xAAAAA
 class HbgSubmitPoisonTest : public ::testing::Test {
 protected:
     DeviceArena sm_arena;
-    DeviceArena runtime_arena;
     SharedMemoryHandle *sm_handle = nullptr;
     OrchestratorState orch{};
-    SchedulerState sched{};
-    SchedulerLayout sched_layout{};
     std::vector<char> gm_heap;
 
     void SetUp() override {
@@ -58,20 +55,10 @@ protected:
         ASSERT_NE(sm_handle, nullptr);
         gm_heap.resize(4096);
 
-        sched_layout = SchedulerState::reserve_layout(runtime_arena);
-        ASSERT_NE(runtime_arena.commit(), nullptr);
-
-        ASSERT_TRUE(sched.init_data_from_layout(sched_layout, runtime_arena, sm_handle->sm_base));
-        sched.wire_arena_pointers(sched_layout, runtime_arena);
-        // Same order the AICPU boots in: the slot arrays are not part of the
-        // uploaded image, so nothing can push until they carry their ramp.
-        sched.seed_queue_slots();
-        ASSERT_TRUE(orch.init(sm_handle->sm_base, gm_heap.data(), 4096, CHIP_DEFAULT_GRAPH_TASKS, &sched));
+        ASSERT_TRUE(orch.init(sm_handle->sm_base, gm_heap.data(), 4096, CHIP_DEFAULT_GRAPH_TASKS));
     }
 
     void TearDown() override {
-        sched.destroy();
-        runtime_arena.release();
         sm_arena.release();
     }
 

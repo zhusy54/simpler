@@ -20,10 +20,8 @@
  * - Device orchestration state (gm_sm_ptr_, orch_args_)
  * - Function address mapping (func_id_to_addr_)
  *
- * Task dispatch uses a per-core DispatchPayload written by the scheduler.
- * At dispatch time, build_payload() copies tensor pointers and scalars from
- * the task payload into the per-core args[], populates SPMD context, then
- * signals AICore via DATA_MAIN_BASE.
+ * AICore workers materialize a DispatchPayload from the uploaded graph,
+ * execute it, and publish its per-task completion flag.
  */
 
 #pragma once
@@ -39,6 +37,7 @@
 #include "common/chip_swimlane_profiling.h"
 #include "common/platform_config.h"
 #include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
+#include "scheduler/scheduler_types.h"
 #include "dispatch_payload.h"
 #include "task_args.h"
 #include "tensor.h"  // EntryArgsStorage
@@ -53,9 +52,6 @@
 #define RUNTIME_MAX_ORCH_SO_SIZE (4 * 1024 * 1024)  // 4MB max for orchestration SO
 #define RUNTIME_MAX_ORCH_SYMBOL_NAME 64
 
-// Default number of ready-queue shards.
-constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 1;
-
 // =============================================================================
 // Data Structures
 // =============================================================================
@@ -67,13 +63,10 @@ constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 
  * AICPU and AICore during task execution.
  *
  * Protocol State Machine:
- * 1. AICore publishes physical_core_id, core_type, and aicore_done on launch
- * 2. AICPU publishes the task pointer and opens the register window with DATA_MAIN_BASE=IDLE
- * 3. AICore observes window-open, reports initial idle state, and reads the task pointer
- * 4. Task Dispatch: AICPU writes DATA_MAIN_BASE after updating the per-core payload
- * 5. Task Execution: AICore reads the cached DispatchPayload and executes
- * 6. Task Completion: AICore writes FIN to COND; AICPU observes completion
- * 7. Shutdown: AICPU writes the exit signal to DATA_MAIN_BASE; AICore exits
+ * 1. Initialization: AICPU sets aicpu_ready=1
+ * 2. Acknowledgment: AICore sets aicore_done=core_id+1
+ * 3. Execution: AICore resolves dependencies and executes graph tasks
+ * 4. Shutdown: AICPU waits for all workers, then closes register windows
  *
  * Each AICore instance has its own handshake buffer to enable concurrent
  * task execution across multiple cores.
@@ -145,15 +138,14 @@ public:
     Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
     int worker_count;                       // Number of active workers
 
-    // Execution parameters for AICPU scheduling.
+    // Execution parameters for AICPU lifecycle threads and AICore workers.
     //
     // aicpu_thread_num is the total AICPU thread count launched on this run.
     // host_build_graph builds the task graph on the host, so there is no
-    // on-device orchestrator: every thread is a scheduler that dispatches tasks
-    // to AICore. The highest-index thread additionally performs the one-time
-    // host-orch boot (attach SM, latch task count) before it starts dispatching.
+    // on-device orchestrator. The highest-index thread supervises the AICore
+    // bootstrap publication and waits for graph completion; other threads
+    // wait until teardown.
     int aicpu_thread_num;
-    int ready_queue_shards;  // Number of ready queue shards (1..MAX_AICPU_THREADS, default MAX-1)
 
     // Filter-style affinity gate input (a2a3 onboard). Host fills these
     // before launch from AICPU OCCUPY, and the device gate keeps threads whose
@@ -168,32 +160,25 @@ public:
     // NOTE: Made public for direct access from aicore code
     uint64_t func_id_to_addr_[RUNTIME_MAX_FUNC_ID];
 
-    // Total tasks the host orchestrator submitted, handed to the scheduler by
-    // SchedulerContext::on_orchestration_done. host_build_graph builds the whole
-    // graph on the host, so this scalar is the count's only carrier: the shared
-    // memory header holds no task counter for the boot thread to read.
+    // Total tasks submitted by the host orchestrator and consumed by the
+    // scheduler state.
     int32_t host_total_tasks;
 
-    // Size of the shipped shared-memory image, argument pools included. Set by the
-    // host before the image is copied; the AICPU cannot recompute it because the pool
-    // extents are the bind's cursors, which only the host saw. It bounds the region at
-    // attach and checks the int32 delta reach — it places no segment, since a payload
-    // names its argument regions by delta.
+    // Size of the compact shared-memory image, including argument pools.
     uint64_t sm_image_bytes;
+
+    // Per-run mutable AICore state. Device code uses the aligned base; Host
+    // cleanup retains the original allocation returned by device_malloc.
+    void *scheduler_state_base;
+    void *scheduler_state_allocation;
+    uint64_t scheduler_state_allocation_size;
+    SchedulerLayout scheduler_layout;
 
 private:
     // Kernel binary tracking for cleanup
 
-    void *gm_sm_ptr_;        // GM pointer to shared memory (device)
-    void *slot_states_ptr_;  // Pointer to ChipTaskSlotState array (scheduler-private, for profiling)
+    void *gm_sm_ptr_;                                   // GM pointer to shared memory (device)
     simpler::hbg::EntryArgsStorage orch_args_storage_;  // Entry args, adopted on the host
-
-    // Prebuilt-arena fast path (trb only). Set by the host before rtMemcpy'ing
-    // Runtime to device; AICPU reads them in the boot path to skip
-    // runtime_create_from_sm and reuse the pooled, prebuilt arena buffer
-    // (already populated by runtime_init_data_from_layout + wire on host).
-    void *prebuilt_arena_base_;
-    size_t prebuilt_runtime_offset_;
 
     // Orchestration metadata set by the platform host (DeviceRunner) when
     // registering a callable. host_build_graph runs the orchestrator on the
@@ -242,21 +227,10 @@ public:
     // Shared-memory / orchestration argument plumbing
     // =========================================================================
 
-    void *get_gm_sm_ptr() const;
+    void *get_gm_sm_ptr() const { return gm_sm_ptr_; }
     const simpler::hbg::EntryArgsStorage &get_orch_args() const;
     void set_gm_sm_ptr(void *p);
-    void set_slot_states_ptr(void *p);
     void set_orch_args(const ChipStorageTaskArgs &args);
-
-    // Prebuilt-arena fast path (trb only). Set by host's
-    // bind_callable_to_runtime_impl; consumed by AICPU at boot to attach a
-    // DeviceArena to `prebuilt_arena_base_` and pick up the RuntimeContext at
-    // `prebuilt_arena_base_ + prebuilt_runtime_offset_`. Both stay zero on
-    // first construction (Runtime() ctor zeros them) so a non-prebuilt boot
-    // path can still detect "no prebuilt image set" via nullptr.
-    void set_prebuilt_arena(void *arena_base, size_t runtime_off);
-    void *get_prebuilt_arena_base() const;
-    size_t get_prebuilt_runtime_offset() const;
 
     // Orchestration metadata written by the platform host (DeviceRunner) at
     // callable registration. Shared ABI with tensormap_and_ringbuffer; the

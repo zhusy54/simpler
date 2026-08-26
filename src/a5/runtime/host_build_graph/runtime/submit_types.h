@@ -43,14 +43,14 @@ inline constexpr uint8_t SUBTASK_MASK_AIC = (1u << 0);   // 0x1
 inline constexpr uint8_t SUBTASK_MASK_AIV0 = (1u << 1);  // 0x2
 inline constexpr uint8_t SUBTASK_MASK_AIV1 = (1u << 2);  // 0x4
 
-// Dispatch-predicate comparison operator. The scheduler evaluates the predicate
+// Dispatch-predicate comparison operator. The AICore scheduler evaluates it
 // at the dispatch point — the task is ready (fanin satisfied), so the predicate
 // address' producer has completed and the value read is current, without the
 // wait_for_tensor_ready() stall that get_tensor_data() pays in orchestration.
 // PASS => dispatch normally; FAIL => retire inline via the dep-only path.
 enum class PredicateOp : uint8_t { NONE = 0, EQ, NE, GT, LT, GE, LE };
 
-// Resolved dispatch predicate stored on a task's payload (AICPU-side only): the
+// Resolved dispatch predicate stored on a task's payload: the
 // absolute GM address of the predicate element + the comparison. op == NONE
 // means "no predicate — always dispatch". Populated at submit from an
 // CoreTaskPredicate; evaluated by the scheduler at the dispatch point via pass().
@@ -93,17 +93,10 @@ struct DispatchPredicate {
 };
 
 /**
- * Resource shape — classifies a MixedKernels into one of 3 scheduling buckets.
+ * Resource shape used for submit-time topology validation.
  *
- * Multi-subtask tasks (2+ active slots) are all scheduled as MIX. Dispatch
- * chooses one cluster, then uses active_mask to decide which cores in that
- * cluster must be placed together: all used cores idle -> running placement;
- * all used cores already running with free pending slots -> pending placement;
- * mixed used-core state is rejected and retried later.
- *
- * DUMMY is a synthetic shape for dep-only tasks (no AICore dispatch). Tasks
- * with an empty core_mask route to a dedicated DUMMY ready queue and are
- * completed inline by the scheduler dispatch loop, bypassing core allocation.
+ * Multi-subtask tasks are MIX and require one cluster. DUMMY identifies tasks
+ * with no AICore subtask.
  */
 enum class ResourceShape : uint8_t {
     AIC = 0,    // Single AIC
@@ -111,11 +104,6 @@ enum class ResourceShape : uint8_t {
     MIX = 2,    // Full cluster (dispatch uses active_mask)
     DUMMY = 3,  // Dependency-only (no AICore dispatch)
 };
-
-// Number of *dispatchable* resource shapes (AIC, AIV, MIX). DUMMY does not
-// allocate a per-shape ready_queue entry / local buffer — it lives in a
-// dedicated queue inside SchedulerState.
-inline constexpr int32_t NUM_RESOURCE_SHAPES = 3;
 
 /**
  * Bitmask of active subtask slots (AIC/AIV0/AIV1), sizeof == 1.
@@ -171,8 +159,7 @@ static_assert(sizeof(ActiveMask) == 1, "ActiveMask must be exactly 1 byte");
  *
  * Single home for the independent per-task flags: an early-dispatch hint, the
  * two dispatch-time predicates (sync_start / has_predicate), and the selective
- * timing tag. Consolidating them here keeps active_mask a pure subtask-slot mask
- * and lands the timing tag on the scheduler's hot slot_state cache line.
+ * timing tag. Consolidating them here keeps active_mask a pure subtask-slot mask.
  *
  *   bit 0     allow_early_resolve
  *   bit 1     sync_start

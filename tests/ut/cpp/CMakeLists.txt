@@ -874,15 +874,6 @@ target_sources(test_hbg_scheduler_drain PRIVATE
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/chip_swimlane_collector_aicpu.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/device_phase_aicpu.cpp
 )
-add_a5_hbg_runtime_test(test_a5_hbg_scheduler_drain common/test_hbg_scheduler_drain.cpp)
-target_sources(test_a5_hbg_scheduler_drain PRIVATE
-    common/test_hbg_scheduler_drain_a5_stubs.cpp
-    ${A5_HBG_RUNTIME_DIR}/scheduler/scheduler_completion.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/shared/aicpu/pmu_collector_aicpu.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/chip_swimlane_collector_aicpu.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/device_phase_aicpu.cpp
-)
 target_sources(test_hbg_ready_queue_seed PRIVATE
     ${HBG_RUNTIME_DIR}/orchestrator_core/orchestrator.cpp
     ${HBG_RUNTIME_DIR}/shared/shared_memory.cpp
@@ -902,6 +893,8 @@ target_sources(test_hbg_submit_poison PRIVATE
     ${HBG_RUNTIME_DIR}/shared/runtime.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
 )
+add_a5_hbg_runtime_test(test_a5_hbg_scheduler a5/test_hbg_scheduler.cpp)
+add_a5_hbg_runtime_test(test_a5_hbg_scheduler_dispatch a5/test_hbg_scheduler_dispatch.cpp)
 add_a2a3_hbg_runtime_test(test_hbg_graph_submit_failure common/test_hbg_graph_submit_failure.cpp)
 target_sources(test_hbg_graph_submit_failure PRIVATE
     ${HBG_RUNTIME_DIR}/orchestrator_core/orchestrator.cpp
@@ -960,20 +953,8 @@ target_sources(test_a5_hbg_slot_claim PRIVATE
     ${A5_HBG_RUNTIME_DIR}/shared/runtime.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
 )
-add_a5_hbg_runtime_test(test_a5_hbg_core_tracker common/test_hbg_core_tracker.cpp)
-add_a5_hbg_runtime_test(test_a5_hbg_ready_queue_seed common/test_hbg_ready_queue_seed.cpp)
-add_a5_hbg_runtime_test(test_a5_hbg_mailbox_init common/test_hbg_mailbox_init.cpp)
 add_a5_hbg_runtime_test(test_a5_hbg_self_relative_ptr common/test_hbg_self_relative_ptr.cpp)
 add_a5_hbg_runtime_test(test_a5_hbg_sm_compaction common/test_hbg_sm_compaction.cpp)
-target_sources(test_a5_hbg_ready_queue_seed PRIVATE
-    ${A5_HBG_RUNTIME_DIR}/orchestrator_core/orchestrator.cpp
-    ${A5_HBG_RUNTIME_DIR}/shared/shared_memory.cpp
-    ${A5_HBG_RUNTIME_DIR}/shared/tensormap.cpp
-    ${A5_HBG_RUNTIME_DIR}/shared/runtime_init.cpp
-    ${A5_HBG_RUNTIME_DIR}/shared/runtime.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
-)
-add_a5_hbg_runtime_test(test_a5_hbg_aicore_completion_mailbox a5/test_aicore_completion_mailbox.cpp)
 set(HBG_A5_RUNTIME_DIR ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/host_build_graph/runtime)
 # The submit-poison test drives the real orchestrator submit path, so it links the
 # orchestrator + shared runtime out-of-line members (mirrors a2a3's test_hbg_submit_poison).
@@ -990,25 +971,14 @@ add_a2a3_hbg_runtime_test(test_graph_cache common/test_hbg_graph_cache.cpp)
 target_sources(test_graph_cache PRIVATE
     ${CMAKE_SOURCE_DIR}/../../../src/common/host_build_graph/graph_execution.cpp
 )
-add_a5_hbg_runtime_test(test_a5_graph_cache common/test_hbg_graph_cache.cpp)
-target_sources(test_a5_graph_cache PRIVATE
-    ${CMAKE_SOURCE_DIR}/../../../src/common/host_build_graph/graph_execution.cpp
-)
-# Incremental-activation tests init a real SchedulerState (ready queues), so
-# they link the scheduler + shared runtime out-of-line members.
+# The a2a3 incremental-activation test initializes its device scheduler and
+# therefore links the shared runtime out-of-line members.
 add_a2a3_hbg_runtime_test(test_graph_activation a2a3/test_graph_activation.cpp)
 target_sources(test_graph_activation PRIVATE
     ${HBG_RUNTIME_DIR}/shared/shared_memory.cpp
     ${HBG_RUNTIME_DIR}/shared/tensormap.cpp
     ${HBG_RUNTIME_DIR}/shared/runtime_init.cpp
     ${HBG_RUNTIME_DIR}/shared/runtime.cpp
-)
-add_a5_hbg_runtime_test(test_a5_graph_activation a5/test_graph_activation.cpp)
-target_sources(test_a5_graph_activation PRIVATE
-    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/host_build_graph/runtime/shared/shared_memory.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/host_build_graph/runtime/shared/tensormap.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/host_build_graph/runtime/shared/runtime_init.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/host_build_graph/runtime/shared/runtime.cpp
 )
 # ChipTensorMap's out-of-line members (reserve_layout / init / valid_count) live
 # in this .cpp; no other add_a2a3_hbg_runtime_test target needs them.

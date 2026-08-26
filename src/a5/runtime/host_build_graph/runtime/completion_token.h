@@ -19,9 +19,7 @@
 // CompletionToken is the runtime-internal POD that backend submit handlers
 // produce and the generic register_completion_condition() consumes. It is the
 // ABI contract for "this is one completion to wait on" — independent of which
-// backend (SDMA, RoCE, notification counter, ...) generated it. Each backend's
-// (poll, retire) pair is registered in async_wait.h's ops table, keyed by
-// completion_type.
+// backend (SDMA, RoCE, notification counter, ...) generated it.
 struct CompletionToken {
     uint64_t addr;
     uint32_t expected_value;
@@ -29,15 +27,4 @@ struct CompletionToken {
     int32_t completion_type;
     // Backend-specific 64-bit metadata (for example, an SDMA post ID).
     uint64_t backend_cookie;
-};
-
-enum class CompletionPollState : uint8_t {
-    PENDING = 0,
-    READY = 1,
-    FAILED = 2,
-};
-
-struct CompletionPollResult {
-    CompletionPollState state{CompletionPollState::PENDING};
-    int32_t error_code{SIMPLER_ERROR_NONE};
 };

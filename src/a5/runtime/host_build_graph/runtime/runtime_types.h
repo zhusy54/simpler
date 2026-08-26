@@ -43,27 +43,11 @@
 // against tensormap_and_ringbuffer's copy inside the shared host-dispatcher TU.
 // runtime_types.h never references DispatchPayload itself; consumers that
 // need it include it via runtime.h directly.
-#include "aicore_completion_mailbox.h"
 #include "common/args_dump_task_metadata.h"
 #include "host_build_graph/self_relative_ptr.h"
 #include "submit_types.h"
 #include "task_id.h"
 #include "types.h"
-
-// Spin-wait hint for AICPU threads.  On real hardware the AICPU has dedicated
-// ARM A55 cores — no OS yield is needed, so the hint is a no-op.  In simulation
-// all threads share host CPU cores, so we yield to prevent starvation.
-// This header is also compiled into the Host .so (for struct definitions only),
-// where the hint is never called — the fallback no-op keeps Host builds clean.
-#if __has_include("spin_hint.h")
-#include "spin_hint.h"
-#else
-#define SPIN_WAIT_HINT() ((void)0)
-#endif
-
-#if SIMPLER_ORCH_PROFILING || SIMPLER_SCHED_PROFILING
-#include "aicpu/device_time.h"
-#endif
 
 // =============================================================================
 // Configuration Constants
@@ -128,24 +112,11 @@ inline constexpr uint64_t HEAP_VIRTUAL_CAPACITY = GRAPH_RECORD_VIRTUAL_BASE - HE
 // Scope management
 #define CHIP_MAX_SCOPE_DEPTH 64  // Maximum nesting depth
 
-// Per-shape ready-queue capacity (power of two). This is a ring buffer that
-// bounds peak CONCURRENT occupancy (enqueue_pos - dequeue_pos), not total task
-// count: slots recycle, so capacity need only exceed the most tasks ever
-// simultaneously ready in any one queue. Overflow on the ready/sync/dummy queues
-// latches SIMPLER_ERROR_READY_QUEUE_OVERFLOW (safe-fail), so it must exceed the
-// worst-case ready burst with margin.
-#define CHIP_READY_QUEUE_SIZE 8192
-
-// Cross-thread early-dispatch work queue (power of two)
-#define CHIP_EARLY_DISPATCH_QUEUE_SIZE 64
-
 // Fanin storage
 #define CHIP_FANIN_INLINE_CAP 64
 
-// Polling-scheduler fanin cap. The polling model stores producer dependencies as
-// flat position-independent local-id integers in the fanin pool (no dep-pool
-// spill), so a task's fanin degree is hard-capped here. Must cover the worst-case
-// fanin of any workload (paged_attention is the densest).
+// The AICore scheduler reads producer ids directly from the compact fanin pool.
+// A task's fanin degree is hard-capped here and must cover the densest workload.
 #define CHIP_MAX_FANIN 128
 
 // Alignment of every per-task region inside an argument pool. Each region starts
@@ -179,17 +150,11 @@ constexpr uint64_t TENSOR_DATA_TIMEOUT_MS = 15000;  // 15 s
  * State transitions:
  *   PENDING -> COMPLETED
  *
- * The slot stays in PENDING from submit through "ready in queue" and "running
- * on a worker"; readiness and running-vs-idle are derived from fanin_refcount
- * and per-core running_slot_state respectively, not from task_state itself.
+ * Executable tasks remain PENDING in the host graph image. Hidden allocation
+ * tasks transition to COMPLETED during orchestration and are represented as
+ * already resolved when the scheduler state is built.
  *
- * Conditions:
- *   PENDING->COMPLETED:   all subtasks finish (set by scheduler) or task is a
- *                         hidden alloc completed inline by the orchestrator
- *
- * COMPLETED is terminal: no slot is recycled before the run ends, so nothing
- * advances a task past it. Consumer retirement is observed through the per-ring
- * completed_watermark instead.
+ * COMPLETED is terminal because host_build_graph does not recycle graph slots.
  */
 typedef enum {
     CHIP_TASK_PENDING = 0,    // Submitted; awaiting fanin, queued, or dispatched
@@ -255,8 +220,8 @@ struct TaskDescriptor {
     void *packed_buffer_end;   // End of packed buffer (for heap reclamation)
 };
 
-// A 4-byte alignment pad follows kernel_id[3]; the scheduler and shared-memory
-// ABI depend on the descriptor size and packed_buffer_base offset staying fixed.
+// A 4-byte alignment pad follows kernel_id[3]; the AICore graph ABI depends on
+// the descriptor size and packed_buffer_base offset staying fixed.
 static_assert(sizeof(TaskDescriptor) == 40, "TaskDescriptor size is part of the shared-memory ABI");
 static_assert(offsetof(TaskDescriptor, packed_buffer_base) == 24, "packed_buffer_base offset must be unchanged");
 
@@ -271,37 +236,6 @@ static_assert(offsetof(TaskDescriptor, packed_buffer_base) == 24, "packed_buffer
  * by bulk tensor and scalar data. Small fanins stay fully inline; larger
  * fanins spill into a per-ring ring buffer slice.
  */
-// Early-dispatch claim states for TaskPayload::early_dispatch_state.
-enum EarlyDispatchState : uint8_t {
-    EARLY_DISPATCH_NONE = 0,       // not pre-staged
-    EARLY_DISPATCH_STAGING = 1,    // Hook 1 claimed it; staging in progress
-    EARLY_DISPATCH_STAGED = 2,     // reserved
-    EARLY_DISPATCH_DISPATCHED = 3  // producers released; staged blocks may still be gated
-};
-
-enum EarlyDispatchLaunchState : uint8_t {
-    EARLY_DISPATCH_LAUNCH_NONE = 0,
-    EARLY_DISPATCH_LAUNCH_RINGING = 1,
-    EARLY_DISPATCH_LAUNCH_COMPLETE = 2,
-};
-
-enum EarlySyncDrainState : uint8_t {
-    EARLY_SYNC_DRAIN_NONE = 0,
-    EARLY_SYNC_DRAIN_OWNER = 1 << 0,
-    EARLY_SYNC_DRAIN_ARMED = 1 << 1,
-    EARLY_SYNC_DRAIN_READY = 1 << 2,
-    EARLY_SYNC_DRAIN_COMPLETE = 1 << 3,
-};
-
-// A pre-staged consumer occupies one core per gated subtask block. WHICH cores
-// it occupies is recorded as a bitmask (staged_core_mask, 1 bit per global
-// core_id); the completion-path release iterates the set bits and rings each
-// core's doorbell from the scheduler's per-core doorbell table. Bounded by the
-// chip's core count (RUNTIME_MAX_WORKER = 72; no two-level pre-dispatch means
-// gated cores in flight <= core count), NOT by block_num — so a wide SPMD
-// consumer can pre-stage all its idle cores. 2 words = 128 bits >= 72.
-inline constexpr int EARLY_DISPATCH_CORE_MASK_WORDS = 2;
-
 struct TaskPayload {
     // === Cache line 0 (64B) — the dispatch path's own line ===
     // sizeof is independent of CHIP_MAX_FANIN / MAX_TENSOR_ARGS / MAX_SCALAR_ARGS:
@@ -326,59 +260,8 @@ struct TaskPayload {
     simpler::hbg::SelfRelativePtr<uint64_t> scalars;
     simpler::hbg::SelfRelativePtr<int32_t> fanin;
 
-    // === Cache line 1 — early-dispatch metadata (AICPU-side only) ===
-    // Ordered by descending alignment (8B mask, 4B fanin, then 2B/1B counters and
-    // flags) so the block packs with no internal padding. On its own line rather
-    // than line 0: these atomics are written during staging while line 0's counts
-    // and region deltas are read by build_payload at dispatch, so sharing a line
-    // would false-share.
-    //
-    // Bitmask of global core_ids this consumer is pre-staged (gated) on. Concurrent
-    // stagers publish bits with atomic fetch_or. A regular consumer destructively
-    // splits them between release and late-stager owners; a sync_start cohort keeps
-    // the completed mask stable for its single launch owner, whether staging is local
-    // or uses the global drain fallback.
-    alignas(64) std::atomic<uint64_t> staged_core_mask[EARLY_DISPATCH_CORE_MASK_WORDS]{};
-    // Early-dispatch CANDIDATE detection (event-driven, dual of fanin_refcount):
-    // seeded at wiring with producers already complete, then a flagged producer
-    // bumps each consumer after all of its logical blocks are published.
-    // dispatch_fanin == fanin_actual_count  <=>  every producer is
-    // flagged-and-fully-published or was
-    // pre-completed  =>  this task is an early-dispatch candidate (push early_dispatch_queues[shape]).
-    std::atomic<int32_t> dispatch_fanin{0};  // CONSUMER side: fully-published + pre-completed producers
-    // Number of logical blocks whose payloads and MMIO tokens are published.
-    // Claimed-but-unpublished blocks do not make a producer launch-visible. Its
-    // seq_cst updates pair with early_dispatch_state to avoid losing the final
-    // publish vs. release wakeup for a pre-staged producer.
-    std::atomic<int16_t> published_block_count{0};
-    // Lock-free claim state shared by the stagers (Hook 1, possibly several AICPU
-    // threads concurrently) and the completion-path release: 0=NONE, 1=STAGING,
-    // 3=DISPATCHED (2=STAGED is unused now). STAGING is the STABLE gated state —
-    // many threads stage blocks concurrently while it holds, each claiming a block
-    // via the atomic next_block_idx and OR-ing its cores into staged_core_mask.
-    // Release does STAGING->DISPATCHED. For a regular consumer it claims the current
-    // mask and a late stager rings only its remaining bits. A sync_start consumer
-    // preserves the mask for rendezvous counting and its single launch pass.
-    std::atomic<uint8_t> early_dispatch_state{0};
-    std::atomic<uint8_t> dispatch_propagated{0};  // PRODUCER side: once-guard for fanout propagation
-    // The launch owner publishes COMPLETE only after all owned doorbells are
-    // visible, keeping fanout private until every gated block has launched.
-    std::atomic<uint8_t> early_dispatch_launch_state{EARLY_DISPATCH_LAUNCH_NONE};
-    // sync_start early-dispatch rendezvous: count of this task's gated CORES currently
-    // occupying a RUNNING slot (staged directly to an idle core, or promoted from a
-    // gated pending slot). Counted per-core (not per-block) so it is shape-agnostic: a
-    // MIX block spans a cluster whose cores promote independently. A sync_start task's
-    // doorbells are rung only once this reaches popcount(staged_core_mask) AND the
-    // producer released, so all cores launch atomically. Unused (0) for non-sync_start.
-    std::atomic<int16_t> running_slot_count{0};
-    // Ownership handshake between the early sync queue and final ready routing.
-    // A successful OWNER persists through ARMED and COMPLETE until payload
-    // reinitialization. READY records that producer release observed OWNER;
-    // only cancellation clears OWNER during the current task lifetime.
-    std::atomic<uint8_t> early_sync_drain_state{EARLY_SYNC_DRAIN_NONE};
-    // === Cache line 2 — dispatch predicate + dump metadata (AICPU-only) ===
-    // AICore never reads either — args are materialized from line 0's counts and
-    // region deltas. Resolved at submit; evaluated by the scheduler at dispatch.
+    // === Cache line 1 — dispatch predicate + dump metadata ===
+    // The AICore scheduler evaluates the predicate immediately before dispatch.
     alignas(64) DispatchPredicate predicate;
     ArgsDumpTaskMetadata dump_metadata;
 
@@ -426,7 +309,6 @@ struct TaskPayload {
         }
         __builtin_prefetch(this, 1, 3);
         __builtin_prefetch(reinterpret_cast<const char *>(this) + 64, 1, 3);
-        __builtin_prefetch(reinterpret_cast<const char *>(this) + 128, 1, 3);
     }
 
     /**
@@ -483,51 +365,23 @@ struct TaskPayload {
         dump_metadata.dump_arg_flags = args.dump_arg_index_ambiguous_mask();
         memcpy(dump_metadata.scalar_dtypes, args.scalar_dtypes(), args.scalar_count() * sizeof(uint8_t));
 #endif
-
-        // Early-dispatch metadata — the single init point for these
-        // fields. reset_for_reuse MUST NOT touch the payload (it runs at slot
-        // init and would pull this cold cache line across structures);
-        // prepare_task only allocates/binds. prefetch() warms this
-        // line (cache line 1) so these writes land in warm cache.
-        //
-        // early_dispatch_state / staged_core_mask / dispatch_fanin are all CONSUMER-side: a
-        // task whose own allow_early_resolve is false still has them touched when
-        // one of ITS producers is flagged (propagate_dispatch_fanin bumps
-        // dispatch_fanin and may CAS early_dispatch_state on any consumer, independent of the
-        // consumer's own hint). So they MUST be zeroed here unconditionally.
-        // Publication, propagation, and launch fields share this same
-        // per-submit lifetime and are reset here too.
-        early_dispatch_state.store(EARLY_DISPATCH_NONE, std::memory_order_relaxed);
-        for (int w = 0; w < EARLY_DISPATCH_CORE_MASK_WORDS; w++)
-            staged_core_mask[w].store(0, std::memory_order_relaxed);
-        dispatch_fanin.store(0, std::memory_order_relaxed);
-        dispatch_propagated.store(0, std::memory_order_relaxed);
-        published_block_count.store(0, std::memory_order_relaxed);
-        early_dispatch_launch_state.store(EARLY_DISPATCH_LAUNCH_NONE, std::memory_order_relaxed);
-        running_slot_count.store(0, std::memory_order_relaxed);
-        early_sync_drain_state.store(EARLY_SYNC_DRAIN_NONE, std::memory_order_relaxed);
     }
 };
 
 // TaskPayload layout verification (offsetof requires complete type). The counts
-// and region deltas share the first cache line, the early-dispatch atomics own the
-// second, and the AICPU-only predicate + dump metadata own the third.
+// and region deltas share the first cache line; the predicate and dump metadata
+// own the second.
 static_assert(offsetof(TaskPayload, tensors) == 12, "region deltas must follow the three counts");
 static_assert(
     offsetof(TaskPayload, fanin) + sizeof(simpler::hbg::SelfRelativePtr<int32_t>) <= 64,
     "counts + region deltas must fit the first cache line"
 );
+static_assert(offsetof(TaskPayload, predicate) == 64, "dispatch predicate owns cache line 1");
 static_assert(
-    offsetof(TaskPayload, staged_core_mask) == 64,
-    "the early-dispatch atomics own cache line 1: they are written during staging while "
-    "line 0's counts and deltas are read at dispatch, so sharing a line would false-share"
-);
-static_assert(offsetof(TaskPayload, predicate) == 128, "dispatch predicate owns cache line 2");
-static_assert(
-    offsetof(TaskPayload, dump_metadata) + sizeof(ArgsDumpTaskMetadata) <= 192,
+    offsetof(TaskPayload, dump_metadata) + sizeof(ArgsDumpTaskMetadata) <= 128,
     "dump metadata must fit the predicate's cache line"
 );
-static_assert(sizeof(TaskPayload) == 192, "TaskPayload is three cache lines and independent of every argument cap");
+static_assert(sizeof(TaskPayload) == 128, "TaskPayload is two cache lines and independent of every argument cap");
 // compact_live_image restacks the payload segment with one memcpy and the device
 // copy moves the whole image, so the payload has to be a POD wire struct. Deleting
 // SelfRelativePtr's copy operations does not cost it that — a deleted special member
@@ -539,18 +393,10 @@ static_assert(
 static_assert(sizeof(simpler::hbg::Tensor) == 128, "simpler::hbg::Tensor must be 2 cache lines");
 
 /**
- * Per-task slot scheduling state (scheduler-private, NOT in shared memory)
+ * Per-task host orchestration state
  *
- * 64 bytes = one cache line. Under the polling completion model a task's
- * readiness is derived from its producers' completion_flags (in the ring
- * header); producer completion is published by setting this task's own
- * completion_flag + draining its wake list. There is no fanout adjacency,
- * refcount, or per-task lock here.
- *
- * task_state is retained (a COMPLETED store on completion) because the HOST
- * still polls it: the completion-wait in runtime_core.cpp, the allocator
- * deadlock detector, and the cold-path stall dump. completion_flags is the
- * device-side readiness truth; task_state is the host-visible mirror.
+ * 64 bytes = one cache line. The host uses this metadata while constructing
+ * the compact scheduler state and servicing orchestration-time waits.
  */
 struct alignas(64) ChipTaskSlotState {
     // Highest local task id among this slot's consumers. Reclaim gate: the slot
@@ -560,9 +406,8 @@ struct alignas(64) ChipTaskSlotState {
     // bumped via max() at submit for each consumer.
     int32_t last_consumer_local_id;
 
-    // Host-visible completion mirror. PENDING at submit; COMPLETED at
-    // on_mixed_task_complete. Read by the host completion-wait / deadlock
-    // detector / cold-path dump; the device readiness path uses completion_flags.
+    // Host graph classification state. Executable tasks remain PENDING; inline
+    // allocation tasks become COMPLETED before the scheduler state is built.
     std::atomic<ChipTaskState> task_state;
 
     // --- Per-slot constant, re-bound by orch::prepare_task each submit ---
@@ -571,73 +416,29 @@ struct alignas(64) ChipTaskSlotState {
     simpler::hbg::SelfRelativePtr<TaskPayload> payload;
     simpler::hbg::SelfRelativePtr<TaskDescriptor> task;
 
-    // --- Wake list: last-fanin notification (intrusive, lock-free) ---
-    // A pending consumer whose fanin scan finds an unmet producer registers on
-    // that producer's wake list (CAS push through next_in_wake_list). On
-    // completion the producer atomic-exchanges wake_list_head to
-    // WAKE_LIST_SENTINEL and routes every waiter. Reset to nullptr at init.
-    std::atomic<ChipTaskSlotState *> wake_list_head{nullptr};
-    ChipTaskSlotState *next_in_wake_list{nullptr};
-
     // --- Set per-submit (depend on task inputs) ---
     ActiveMask active_mask;  // Bitmask of active subtask slots (set once)
     // Single per-task attributes byte (early-dispatch hint, sync_start,
-    // has_predicate, selective timing tag). Lives on slot_state (not payload) so
-    // fanin walks and the completion path read them off the already-hot producer
-    // slot_state cache line. Plain-write (set once at submit, before the slot is
-    // scheduler-visible).
+    // has_predicate, selective timing tag). Plain-write once at submit, before
+    // the scheduler state builder reads it.
     TaskAttrs task_attrs{};
-    // Set by any subtask FIN that pushed a deferred-completion CONDITION to the
-    // runtime mailbox; read by the last subtask FIN to decide inline vs
-    // MPSC-deferred completion. The release write is sequenced before
-    // on_subtask_complete's acq_rel fetch_add and the acquire read after.
-    std::atomic<bool> any_subtask_deferred{false};
     TaskKind task_kind{TaskKind::KERNEL};
 
-    std::atomic<int16_t> completed_subtasks{0};  // Each core completion increments by 1
-    int16_t total_required_subtasks{0};          // = logical_block_num * popcount(active_mask)
-    int16_t logical_block_num{1};                // Total logical blocks (set by orchestrator)
-    // Next block to dispatch. Normal dispatch and late early-dispatch stagers
-    // can run concurrently after a partial staged release. All paths claim
-    // ranges through claim_block_range().
-    std::atomic<int16_t> next_block_idx{0};
+    int16_t total_required_subtasks{0};  // = logical_block_num * popcount(active_mask)
+    int16_t logical_block_num{1};        // Total logical blocks (set by orchestrator)
 
     // Graph scheduling metadata occupies the slot's tail padding. Ordinary
     // Ordinary tasks keep the index invalid and the context null.
     int32_t graph_node_index{-1};
     void *graph_context{nullptr};
 
-    int32_t claim_block_range(int32_t block_limit, int32_t max_count, int32_t &start) {
-        int16_t current = next_block_idx.load(std::memory_order_relaxed);
-        while (current < block_limit && max_count > 0) {
-            int32_t count = block_limit - current;
-            if (count > max_count) count = max_count;
-            int16_t desired = static_cast<int16_t>(current + count);
-            if (next_block_idx.compare_exchange_weak(
-                    current, desired, std::memory_order_seq_cst, std::memory_order_relaxed
-                )) {
-                start = current;
-                return count;
-            }
-        }
-        start = current;
-        return 0;
-    }
-
     void bind_buffers(TaskPayload *p, TaskDescriptor *t) {
         payload.set(p);
         task.set(t);
     }
 
-    // Host-visible completion mirror. The device readiness truth
-    // (completion_flags[slot]) is published by the scheduler's
-    // on_mixed_task_complete; this store makes the same fact visible to the
-    // host completion-wait / deadlock detector.
+    // Host-visible completion mirror for orchestration-time waits.
     void mark_completed() { task_state.store(CHIP_TASK_COMPLETED, std::memory_order_release); }
-
-    void mark_any_subtask_deferred() { any_subtask_deferred.store(true, std::memory_order_release); }
-
-    bool has_any_subtask_deferred() const { return any_subtask_deferred.load(std::memory_order_acquire); }
 
     /**
      * Reset dynamic scheduling fields to their pristine values. Called once per
@@ -645,27 +446,15 @@ struct alignas(64) ChipTaskSlotState {
      * node's storage is materialized — whole-graph-resident hbg has no
      * execution-time slot recycle. Skips payload/task (bound once) and
      * task_state (the orchestrator sets PENDING when it populates the slot).
-     * wake_list_head starts nullptr (open for registration), NOT SENTINEL.
      */
     void reset_for_reuse() {
-        wake_list_head.store(nullptr, std::memory_order_relaxed);
-        next_in_wake_list = nullptr;
-        any_subtask_deferred.store(false, std::memory_order_relaxed);
-        completed_subtasks.store(0, std::memory_order_relaxed);
-        next_block_idx.store(0, std::memory_order_relaxed);
         graph_node_index = -1;
         graph_context = nullptr;
         task_kind = TaskKind::KERNEL;
         // Note: active_mask and task_attrs are per-submit-constant fields
         // rewritten in prepare_task on every reuse, so they are not reset here.
         // last_consumer_local_id is seeded in prepare_task once the id is known.
-        // Payload early-dispatch/fanin fields are (re)initialized in
-        // TaskPayload::init on every submit, before the slot is visible.
     }
 };
 
 static_assert(sizeof(ChipTaskSlotState) == 64);
-
-// Sentinel marking a wake list as "owner already completed; no more
-// registrations accepted". Distinct from any real slot_state pointer.
-inline ChipTaskSlotState *const WAKE_LIST_SENTINEL = reinterpret_cast<ChipTaskSlotState *>(static_cast<uintptr_t>(0x1));

@@ -62,26 +62,22 @@ static_assert(
 // Byte offsets into TaskPayload used by AICore to materialize args[] on the
 // not_ready (early-dispatch) path. The AICore .o does not include
 // runtime_types.h, so it reads tensor_count / scalar_count / tensors[] /
-// scalars[] through these constants. The AICPU side (scheduler_dispatch.cpp)
-// static_asserts them against offsetof where the full struct is visible, so any
+// scalars[] through these constants. The graph-view header static_asserts them
+// against offsetof where the full struct is visible, so any
 // TaskPayload layout drift fails the build rather than corrupting args[].
 constexpr uint32_t TASKPAYLOAD_TENSOR_COUNT_OFFSET = 0;
 constexpr uint32_t TASKPAYLOAD_SCALAR_COUNT_OFFSET = 4;
-// Offsets of the fields that NAME the argument regions, not of the regions themselves:
-// a region's address is (src + <field offset>) + <the int32 delta stored there>.
+// Offsets of the self-relative fields that name the external argument pools.
 constexpr uint32_t TASKPAYLOAD_TENSORS_DELTA_OFFSET = 12;
 constexpr uint32_t TASKPAYLOAD_SCALARS_DELTA_OFFSET = 16;
-// Cache line 9 (byte 576) holds the AICPU-only DispatchPredicate. Scalars follow it,
-// then tensors — the tensor array is last because it is the only region whose used
-// extent varies per task, so a task's read set is a contiguous prefix.
-constexpr uint32_t TASKPAYLOAD_TENSOR_STRIDE = 128;  // sizeof(simpler::hbg::Tensor)
+constexpr uint32_t TASKPAYLOAD_FANIN_DELTA_OFFSET = 20;
+constexpr uint32_t TASKPAYLOAD_TENSOR_STRIDE = 128;  // sizeof(ChipTensor)
 
 /**
  * Per-core dispatch payload: function address + args[] + SPMD context.
  *
- * AICPU maintains a static array s_payload_per_core[RUNTIME_MAX_WORKER].
- * AICore caches a pointer to its per-core slot at startup (via Handshake.task)
- * and reads from it on each dispatch.
+ * Each AICore worker owns one payload slot in the scheduler state and
+ * materializes it immediately before kernel execution.
  *
  * The struct is cache-line aligned to prevent false sharing across
  * concurrently dispatched cores.
@@ -89,16 +85,16 @@ constexpr uint32_t TASKPAYLOAD_TENSOR_STRIDE = 128;  // sizeof(simpler::hbg::Ten
 struct alignas(64) DispatchPayload {
     // === Cache line 0 (64B): control block, the only line written per dispatch ===
     // function_bin_addr, local_context.{block_idx,block_num,async_ctx.task_token}
-    // and src_payload are the per-dispatch writes; async_ctx's slab pointers +
-    // capacity are cold (prefilled once at init) but ride this hot line for free.
+    // and src_payload are the per-dispatch writes. The AICore scheduler has no
+    // deferred-completion slab, so task_token is written as invalid and backend
+    // adapters use their synchronous fallback.
     // Sized to exactly 64B so both dispatch paths write one control line: the
     // ready path (src_payload = 0) then also fills args[0..num_args); the gated
     // path (src_payload = &TaskPayload) leaves args[] to the idle AICore.
     uint64_t function_bin_addr; /**< Kernel entry address in GM (set by Scheduler). */
 
-    /** Per-dispatch context: block_idx/block_num (hot) + async_ctx (task_token hot,
-     *  slab pointers + capacity prefilled once at init). args[SPMD_LOCAL_CONTEXT_INDEX]
-     *  points here. */
+    /** Per-dispatch context: block_idx/block_num plus a disabled async_ctx.
+     *  args[SPMD_LOCAL_CONTEXT_INDEX] points here. */
     LocalContext local_context;
 
     /** Early-dispatch gate AND source pointer, folded into one field. 0 = ready:

@@ -30,9 +30,11 @@ The shared graph image separates stable task identity from scheduling state:
   addresses.
 - `TaskPayload` contains the argument counts, predicate, and a delta naming
   each of its tensor, scalar and position-independent fanin-id regions. The
-  arguments live in the pool segments, not in the payload.
-- `ChipTaskSlotState` contains the active mask, task attributes, logical block
-  count, subtask counters, completion state, and descriptor/payload bindings.
+  arguments live in the pool segments, not in the fixed two-cache-line payload.
+- `ChipTaskSlotState` contains host-side classification metadata: the active
+  mask, task attributes, logical block count, required-subtask total,
+  orchestration-time task state, and descriptor/payload bindings. Device
+  scheduling counters live in the scheduler state.
 
 This image is built on the host and copied to the device verbatim. It contains
 no fanout adjacency or dependency-pool pointers, and its descriptor/payload
@@ -64,9 +66,9 @@ block_num >= 1
 block_num * popcount(active_mask) <= INT16_MAX
 ```
 
-The product is the number stored in the 16-bit completion counter. Invalid
-values latch `SIMPLER_ERROR_INVALID_ARGS`; they are not capped at the device's
-physical cluster count.
+The product is stored as the scheduler state's 16-bit required-subtask total. Invalid
+values latch `SIMPLER_ERROR_INVALID_ARGS`; non-sync work is not capped at the
+device's physical cluster count.
 
 `require_sync_start` adds a separate residency constraint because every block
 must launch as one cohort:
@@ -74,38 +76,54 @@ must launch as one cohort:
 - AIV-only: `block_num <= rt_available_aiv_count()`
 - AIC or MIX: `block_num <= rt_available_cluster_count()`
 
-## Dependency and Readiness Flow
+## Dependency and Readiness Flow on the A5 HBG AICore Scheduler
 
 1. Host orchestration allocates a task slot and builds its payload.
-2. TensorMap and explicit dependencies append producer local IDs to the payload's
-   fanin region.
-3. Submit publishes only the finished graph data; it does not push ready tasks.
-4. After H2D, device boot scans every submitted task exactly once.
-5. A task with every fanin complete is routed to its ready queue; otherwise it
-   registers on its latest-submitted unmet producer's wake list, minimising
-   transfers between wake lists and their CAS contention.
-6. Producer completion reclassifies wake-list consumers until they become ready.
-
-Completion flags are monotonic, so a task never needs periodic fanin polling.
+2. TensorMap and explicit dependencies append producer local IDs to
+   `fanin_local_ids[]`.
+3. Submit publishes the finished graph and task-indexed execution metadata.
+4. AIV resolvers statically partition a full bootstrap scan, register blocked
+   tasks on producer wake lists, and push dependency-free tasks to local typed
+   Ready inboxes.
+5. Resolvers pop locally first, then steal unbound tasks from another resolver's
+   typed Ready inbox. A compact bitmask identifies inboxes worth probing.
+6. Each AIC/AIV executor owns two dispatch slots. Resolvers refill a private
+   free slot after completion or claim an advertised free slot by typed bitmask.
+7. Kernel completion publishes the slot generation to a Completion inbox. An
+   AIV resolver marks an ordinary task `DONE`, or advances a Gang participant;
+   once the whole task completes it closes the wake list, routes newly ready
+   consumers, and refills the released capacity.
 
 ## Dispatch and Completion
 
-- AIC and AIV tasks claim as many free cores as the current scheduler owns and
-  requeue remaining logical blocks for later waves.
-- MIX placement selects whole clusters whose used lanes can all accept the
-  task. High cluster offsets are represented by the runtime's 128-bit bitset.
-- `require_sync_start` uses local staging when possible and a generation-tagged
-  global drain when the cohort spans scheduler ownership domains.
-- Each completed lane increments `completed_subtasks`; the mixed task completes
-  exactly once when it reaches `block_num * popcount(active_mask)`.
+- A single-lane, single-block task uses the ordinary typed Ready inbox and is
+  late-bound to one advertised executor slot.
+- MIX or multi-block work uses the Gang scheduler. Resolver 0 admits a cohort
+  and partitions its blocks across participating Resolver clusters; later
+  blocks fill slots released by earlier completions.
+- MIX placement publishes all active lanes of one physical cluster together.
+  If any required lane is unavailable, that cluster publishes none of the
+  task.
+- `require_sync_start` drains the required lanes, stages every dispatch as
+  `GATED`, and releases the cohort only after a generation-tagged Resolver tree
+  reports all participants ready.
+- Each completed Gang lane increments its participant's
+  `local_completed_subtasks`. Resolver 0 resolves the graph task exactly once
+  after the completion tree covers every participant and the total reaches
+  `block_num * popcount(active_mask)`.
 
 ## Executor Model
 
 The host loads and executes the orchestration shared object synchronously. The
-device has no orchestration thread: every launched AICPU thread participates in
-scheduling its assigned cores after the boot thread attaches the prebuilt graph.
-Cluster ownership is assigned during the AICore handshake and remains stable for
-the run.
+device has no orchestration thread. One AICPU supervisor publishes the active
+worker prefixes and waits for full bootstrap plus resolved-task completion;
+other AICPU threads wait for teardown. Persistent AICore workers own dependency
+resolution, Ready scheduling, kernel execution, and completion publication.
+
+The ordinary Ready path handles one AIC or AIV lane with one logical block; a
+dispatch predicate is supported only on this shape. The Gang path handles MIX,
+single-lane SPMD, and sync-start cohorts. Dependency-only and host-completed
+tasks are resolved without launching a user kernel.
 
 ## Capacity
 
@@ -124,6 +142,7 @@ pytest examples tests/st --platform a2a3sim --runtime host_build_graph
 pytest examples tests/st --platform a5sim --runtime host_build_graph
 ```
 
-The `host_build_graph_wide_dispatch` scene specifically covers wide AIV work,
-sync-start MIX placement, normal MIX placement, and bit offsets above 63 with
-`aicpu_thread_num=2`.
+The A5 `mix_spmd_sync_start` scene covers normal MIX, single-lane SPMD, and
+sync-start cohort execution. `graph_execution_mix_spmd` covers the same shape
+metadata through Graph Execution, while `predicated_dispatch` covers the
+ordinary single-lane predicate path.

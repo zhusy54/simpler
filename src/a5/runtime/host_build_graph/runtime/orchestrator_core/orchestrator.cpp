@@ -94,17 +94,6 @@ __attribute__((weak, visibility("hidden"))) void dep_gen_host_graph_add_tensorma
     uint64_t, int32_t, const simpler::hbg::Tensor &, const ChipTensorMapEntry &, OverlapStatus
 ) {}
 
-// AICore register accessor (aicpu/platform_regs.h). The host orchestrator's
-// route_ready_once path transitively ODR-uses the early-dispatch doorbell inline
-// (scheduler.h ring_one_doorbell), but no core is gated during host
-// graph-build, so the doorbell never fires and this weak host fallback only
-// satisfies the linker. The AICPU build links the strong definition from
-// platform/.../platform_regs.cpp; hidden so the HOST .so does not shadow it.
-__attribute__((weak, visibility("hidden"))) volatile uint32_t *get_reg_ptr(uint64_t, RegId) {
-    static volatile uint32_t sink = 0;
-    return &sink;
-}
-
 // =============================================================================
 // Orchestrator Profiling (compile-time toggle)
 // =============================================================================
@@ -1203,8 +1192,8 @@ static bool append_fanin_or_fail(OrchestratorState *orch, TaskId producer_task_i
     );
     // Skip a stale/reused producer slot: the cached owner id no longer resolves
     // to this producer (defensive — whole-graph-resident hbg does not reuse slots
-    // at build time). A COMPLETED producer IS a real fanin edge under polling (its
-    // completion_flags byte is set), so it is not skipped.
+    // at build time). A COMPLETED inline producer remains a real fanin edge; the
+    // scheduler state builder marks it resolved before AICore execution starts.
     if (prod_state->task == nullptr ||
         simpler::hbg::task_local_id(prod_state->task->task_id) != simpler::hbg::task_local_id(producer_task_id)) {
         return true;
@@ -1330,9 +1319,6 @@ static bool prepare_task(
     // early-dispatch fields) is initialized in TaskPayload::init, the
     // single payload-init point, which runs before Orch-side wiring publish.
 
-    // Fields already zeroed by the reset_for_reuse() above:
-    //   wake_list_head=nullptr, next_in_wake_list=nullptr,
-    //   any_subtask_deferred=false, completed_subtasks=0, next_block_idx=0
     // task_state is set to PENDING here as the orchestrator populates the slot
     // (host_build_graph does not recycle slots at runtime, so there is no
     // post-CONSUMED reset path).
@@ -1477,7 +1463,6 @@ static TaskOutputTensors submit_task_common(
     if (!prepare_task(orch, args, layout.total_output_size, active_mask, task_attrs, &prepared)) {
         return result;
     }
-    SchedulerState *sched = orch->scheduler;
     TaskId task_id = prepared.task_id;
     TaskDescriptor &task = *prepared.task;
     TaskPayload &payload = *prepared.payload;
@@ -1588,7 +1573,7 @@ static TaskOutputTensors submit_task_common(
     payload.init(args, result, prepared.alloc_result, layout);
 
     // Dispatch predicate: resolve the (tensor, indices) to an absolute GM address
-    // now so the scheduler can read it at the dispatch point with a single load,
+    // now so the AICore scheduler can read it at dispatch with a single load,
     // no Arg/simpler::hbg::Tensor access. Both branches write predicate.op explicitly because
     // payload slots are ring-reused; op == NONE means "always dispatch".
     {
@@ -1608,25 +1593,18 @@ static TaskOutputTensors submit_task_common(
     CYCLE_COUNT_LAP(g_orch_args_cycle);
 
     // === STEP 6: publish the inline fanin count (device boot classifies) ===
-    // Polling + host-orch: append_fanin_or_fail already wrote each producer's
+    // append_fanin_or_fail already wrote each producer's
     // local id into the payload's fanin region and bumped its last_consumer_local_id.
     // All that remains is to record how many. There is NO fanout adjacency, NO
     // dep_pool, and NO ready routing here — the initial device boot scan classifies
-    // each task once. A -1 result from classify_fanin_state routes the task through
-    // push_ready_routed; otherwise the returned index selects the producer passed
-    // to register_wake. Wake retargeting in register_wake may reclassify a task
-    // when the selected producer is already complete.
-    // The initial scan happens before the scheduler dispatch loop starts. Fanin is
-    // a flat array of position-independent integers, so it crosses to the device
-    // unchanged.
+    // each task once. Fanin is a flat array of position-independent integers, so
+    // it crosses to the device unchanged.
     payload.fanin_count = fanin_builder.count;
     // The region's length is settled, so the cursor closes it at the real count. The
     // equality holds only while nothing between the bind and here bound another fanin
     // region, which is what makes the deferred advance safe.
     debug_assert(orch->fanin_pool_cursor == static_cast<int32_t>(payload.fanin_data() - orch->fanin_pool));
     orch->fanin_pool_cursor += CHIP_ALIGN_UP(fanin_builder.count, ARG_POOL_ALIGN / (int32_t)sizeof(int32_t));
-
-    (void)sched;
 
     CYCLE_COUNT_LAP(g_orch_fanin_cycle);
     ORCH_PHASE_END(HostPhaseKind::OrchSubmitTask, task_id.raw);
@@ -1753,15 +1731,6 @@ void graph_reset_outer_payload(TaskPayload &payload) {
     payload.scalar_count = 0;
     payload.fanin_count = 0;
     payload.predicate = DispatchPredicate{};
-    payload.early_dispatch_state.store(EARLY_DISPATCH_NONE, std::memory_order_relaxed);
-    for (auto &word : payload.staged_core_mask)
-        word.store(0, std::memory_order_relaxed);
-    payload.dispatch_fanin.store(0, std::memory_order_relaxed);
-    payload.dispatch_propagated.store(0, std::memory_order_relaxed);
-    payload.published_block_count.store(0, std::memory_order_relaxed);
-    payload.early_dispatch_launch_state.store(EARLY_DISPATCH_LAUNCH_NONE, std::memory_order_relaxed);
-    payload.running_slot_count.store(0, std::memory_order_relaxed);
-    payload.early_sync_drain_state.store(EARLY_SYNC_DRAIN_NONE, std::memory_order_relaxed);
 }
 
 bool graph_submit_outer(
@@ -1815,11 +1784,8 @@ bool graph_submit_outer(
     TaskPayload &payload = tasks.task_payloads[allocation.task_id];
     ChipTaskSlotState &slot = tasks.get_slot_state_by_task_id(allocation.task_id);
 
-    // Init-on-write, as in prepare_task: this slot's dynamic scheduling fields and
-    // completion flag are established here, at the claim, because nothing else
-    // writes them. A stale wake_list_head of WAKE_LIST_SENTINEL would close the
-    // list against every consumer, and a stale completion flag would report the
-    // Graph done before it ran.
+    // Init-on-write, as in prepare_task: this slot's host metadata and completion
+    // flag are established here at the claim because nothing else writes them.
     slot.reset_for_reuse();
     tasks.completion_flags[allocation.task_id].store(0, std::memory_order_relaxed);
 
@@ -2553,7 +2519,6 @@ TaskOutputTensors OrchestratorState::submit_task(const MixedKernels &mixed_kerne
         orch_mark_fatal(orch, SIMPLER_ERROR_INVALID_ARGS);
         return TaskOutputTensors{};
     }
-    always_assert(orch->scheduler != nullptr);
     // === Validate submit inputs ===
     ActiveMask active_mask = mixed_kernels.to_active_mask();
     if (!static_cast<bool>(active_mask)) {
@@ -2641,8 +2606,6 @@ TaskOutputTensors OrchestratorState::submit_dummy_task(const CoreTaskArgs &args)
         orch_mark_fatal(orch, SIMPLER_ERROR_INVALID_ARGS);
         return TaskOutputTensors{};
     }
-    always_assert(orch->scheduler != nullptr);
-
     // Dummy tasks never dispatch to an AICore, so sync_start / has_predicate do
     // not apply; only the early-dispatch hint and timing tag carry over.
     TaskAttrs task_attrs;
@@ -2751,27 +2714,15 @@ TaskOutputTensors OrchestratorState::alloc_tensors(const CoreTaskArgs &args) {
         // mirror, both set below — but worker dispatch fields are never
         // observed for hidden alloc tasks.
         //
-        // Flag the creator so it does NOT suppress its consumers' early-dispatch.
-        // Under the direct-only model an unflagged producer disqualifies its
-        // consumer, and a pre-completed producer only seeds dispatch_fanin when
-        // flagged. A buffer allocation is pure memory whose output is ready at
-        // creation — it should always be transparent, never a barrier. Unlike a
-        // codegen task there is no Arg-driven hint to honor here, so mark it
-        // unconditionally.
+        // A buffer allocation is pure memory whose output is ready at creation,
+        // so the scheduler state classifies it as an inline-completed producer.
         prepared.slot_state->task_attrs.set_early_resolve(true);
         prepared.slot_state->mark_completed();  // host-visible task_state mirror
-        // Polling: pre-set the device-visible completion_flags byte in the H2D
-        // image. Consumers poll completion_flags (not task_state), so a hidden-alloc
-        // producer completed here on the host must publish its flag too — otherwise
-        // every consumer register_wakes on a producer that never runs on device and
-        // the run hangs. (The device watermark walk transparently steps past this
-        // pre-set flag when a later on-device task completes.)
+        // Keep the compact SM completion mirror consistent with task_state.
         SharedMemoryTaskHeader &done_tasks = orch->sm_header->tasks;
         int32_t done_local = static_cast<int32_t>(simpler::hbg::task_local_id(prepared.task_id));
         done_tasks.set_completion_flag(done_local);
     }
-    orch->inline_completed_tasks++;
-
     CYCLE_COUNT_LAP(g_orch_fanin_cycle);
     ORCH_PHASE_END(HostPhaseKind::OrchAllocTensors, prepared.task_id.raw);
 

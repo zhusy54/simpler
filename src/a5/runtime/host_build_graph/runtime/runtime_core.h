@@ -43,9 +43,7 @@
 #include "shared_memory.h"
 #include "task_allocator.h"
 #include "tensormap.h"
-#include "scheduler/scheduler.h"
 #include "orchestrator.h"
-#include "aicore_completion_mailbox.h"
 
 // =============================================================================
 // Runtime Context
@@ -113,60 +111,9 @@ struct RuntimeOps {
 };
 
 /**
- * Layout descriptor for the prebuilt runtime arena. Holds all sub-region
- * offsets (scheduler / sm_handle wrapper / runtime header / AICore mailbox)
- * plus the layout-defining capacities. Produced once on the host by
- * runtime_reserve_layout(); consumed by runtime_init_data_from_layout and
- * runtime_wire_arena_pointers.
- */
-struct RuntimeArenaLayout {
-    size_t off_sm_handle{0};
-    SchedulerLayout sched;
-    size_t off_scheduler{0};
-    size_t off_runtime{0};
-    size_t off_mailbox{0};
-    // Every region in this arena is device-resident. The arena is reserved in two
-    // zones, in this order, and the offsets above land in exactly one of them:
-    //
-    //   device-only  sm_handle, the AICore mailbox, the scheduler state and its
-    //                queue slot arrays. Reachable storage whose content is a
-    //                function of the layout, not of the run, so the device writes
-    //                it at boot instead of receiving an initialization pattern
-    //                over PCIe.
-    //   copied       [off_copied_begin, off_copied_end). Every byte carries this
-    //                run's own content, so bind ships the whole zone as one
-    //                contiguous range.
-    //
-    // Past off_copied_end the device carries one further tail the host arena does
-    // not: the shared-memory image, whose size is the submitted task count and
-    // therefore not known when this layout is built. bind grows the device region
-    // to cover it once orchestration ends.
-    //
-    // The copied zone is padded to a CHIP_ALIGN_SIZE boundary, so that tail begins
-    // exactly at off_copied_end: the copied zone and the shared-memory image are
-    // adjacent on the device and travel as one copy.
-    //
-    // The orchestrator is NOT here. It runs on the host, owns its own scratch, and
-    // no device code reads any of it — see OrchestratorState.
-    size_t off_copied_begin{0};
-    size_t off_copied_end{0};
-
-    // The task-table slot count this image was built for, resolved per bind from
-    // runtime_env.ring_task_window. The device needs it to bound the pitch it
-    // attaches with.
-    uint64_t task_capacity{0};
-
-    // Total arena byte size post-commit. Used by host to size the prebuilt
-    // image buffer and as the rtMemcpy length, and requested of the device as
-    // the region length before its shared-memory tail.
-    size_t arena_size{0};
-};
-
-/**
  * Runtime context
  *
- * Contains all state for orchestration and scheduling.
- * In simulated mode, runs in single process with shared address space.
+ * Contains the host orchestration state exposed through RuntimeOps.
  */
 struct RuntimeContext {
     // Ops table (first field — used by orchestration .so via function pointers)
@@ -174,26 +121,15 @@ struct RuntimeContext {
     ScopeMode pending_scope_mode;
 
     // Components
-    SharedMemoryHandle *sm_handle;
     // Host-only, and by pointer so that this header stays trivially copyable:
-    // the orchestrator runs on the host and owns non-trivial scratch. Null on the
-    // device — bind drops it before the copied zone is uploaded, so no device code
-    // may dereference it.
+    // the orchestrator runs on the host and owns non-trivial scratch.
     OrchestratorState *orchestrator;
-    // Device-only zone: the scheduler state holds no per-run content, so it is
-    // addressed through the arena rather than carried inside this header.
-    SchedulerState *scheduler;
-    AICoreCompletionMailbox *aicore_mailbox;
 
     // Mode
     RuntimeMode mode;
 
     // Statistics
     int64_t total_cycles;
-    // Hidden alloc tasks the host orchestrator completed inline, published here by
-    // rt_orchestration_done. The device-side executor folds this into its
-    // completed_tasks_ progress counter so shutdown/profiling totals stay closed.
-    int64_t inline_completed_tasks;
     // Graph definitions are process-local host cache entries. The callable
     // identity prevents two orchestration DSOs from sharing the same key.
     uint64_t active_callable_hash;
@@ -204,25 +140,13 @@ struct RuntimeContext {
     // dereferencing one. Lives past the first two fields, so the orchestration
     // .so's partial RuntimeContext definition neither sees nor needs it.
     HostTensorAccessor *tensor_access;
-
-    // Prebuilt-arena fast path metadata. Carries every offset
-    // wire_arena_pointers needs at AICPU boot so the AICPU can reconstruct
-    // all arena-internal pointer fields without re-running init_data. The
-    // device base of the runtime arena travels separately on the host-side
-    // Runtime (Runtime::prebuilt_arena_base_), since the AICPU needs it
-    // *before* dereferencing this image. Populated on host by
-    // runtime_init_data_from_layout + runtime_wire_arena_pointers; read by
-    // aicpu_executor.cpp.
-    RuntimeArenaLayout prebuilt_layout;
 };
 
-// bind copies this header to the device as one contiguous range, so every byte
-// of it has to survive a memcpy with no fix-up. That rules out an owning or
-// otherwise non-trivial member — the orchestrator's scratch is reached through
-// a pointer for exactly this reason.
+// The orchestration DSO consumes the common prefix through its partial
+// RuntimeContext definition, so this runtime-owned form must retain C layout.
 static_assert(
     std::is_trivially_copyable_v<RuntimeContext> && std::is_standard_layout_v<RuntimeContext>,
-    "RuntimeContext is copied to the device verbatim"
+    "RuntimeContext must retain a stable orchestration ABI prefix"
 );
 
 // =============================================================================
@@ -230,58 +154,9 @@ static_assert(
 // =============================================================================
 
 /**
- * Phase 1 — declare every sub-region (sm_handle wrapper, scheduler / mailbox /
- * RuntimeContext header) on the supplied arena. Pure arithmetic; does not touch
- * device memory and may run on host. Returns the layout descriptor; caller
- * commits/attaches the arena before Phase 2/3.
- */
-RuntimeArenaLayout runtime_reserve_layout(DeviceArena &arena, uint64_t task_capacity);
-
-/**
- * Phase 2 — write the data half of the runtime arena: standalone fields,
- * memset'd arena regions, sub-structure initializers, and SM-side device
- * pointers. The arena must already be committed (or attached); writes go
- * into arena.base() + sub-region offsets.
- *
- * `sm_dev_base` is a device address; we only store it (never dereference).
- * Safe to run on a host arena that owns a host mirror of the runtime image —
- * the resulting buffer is rtMemcpy-ready.
- *
- * Returns the RuntimeContext* that sits at layout.off_runtime within the arena.
- * Caller must follow up with runtime_wire_arena_pointers; rt->ops and the
- * AICore-side count fields are left untouched and must be filled by the
- * AICPU at boot. Initializes the scheduler only: the orchestrator is a
- * host-owned object the host-orch path (run_host_orchestration) stands up and
- * points rt->orchestrator at, and it is never uploaded to the device.
- */
-RuntimeContext *runtime_init_data_from_layout(
-    DeviceArena &arena, const RuntimeArenaLayout &layout, RuntimeMode mode, void *sm_dev_base, uint64_t sm_size
-);
-
-/**
- * Phase 3 — wire the arena-internal pointer fields that exist on both sides
- * (rt->sm_handle, rt->aicore_mailbox, rt->scheduler and
- * scheduler.{ready_queues, ready_sync_queues, early_dispatch_queues}) so each
- * holds arena.base() + offset. Idempotent — runs on both host (writing
- * host-mirror addresses) and AICPU (writing device addresses) sides.
- */
-void runtime_wire_arena_pointers(DeviceArena &arena, const RuntimeArenaLayout &layout, RuntimeContext *rt);
-
-/**
- * AICPU-only Phase 4 — install the ops table, the one field the host could not
- * know at prebuilt-image build time (s_runtime_ops is a device-side file-local
- * global, so the host cannot resolve its device address). Call once per boot
- * after runtime_wire_arena_pointers.
+ * Install the runtime-owned operations table before invoking orchestration.
  */
 void runtime_bind_ops(RuntimeContext *rt);
-
-/**
- * Destroy runtime. With the prebuilt-arena fast path the arena buffer is
- * pooled across runs by DeviceRunner, so we never call arena.release()
- * here — the destructor only forgets sub-structure pointers (idempotent
- * cleanup).
- */
-void runtime_destroy(RuntimeContext *rt, DeviceArena &arena);
 
 /**
  * Set execution mode

@@ -20,23 +20,55 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "graph_execution.h"
 #include "graph_host_state.h"
+#include "hbg_orchestrator_fixture_runtime.h"
 #include "orchestrator.h"
 #include "shared_memory.h"
 #include "utils/device_arena.h"
 #include "host_build_graph/task_id_encoding.h"
 
+template <typename Slot, typename = void>
+struct HasLegacySchedulerSlotState : std::false_type {};
+
+template <typename Slot>
+struct HasLegacySchedulerSlotState<
+    Slot,
+    std::void_t<decltype(std::declval<Slot &>().wake_list_head)>> : std::true_type {};
+
+template <typename Slot>
+void poison_legacy_scheduler_slot_state(Slot &state, Slot *next) {
+    if constexpr (HasLegacySchedulerSlotState<Slot>::value) {
+        state.wake_list_head.store(reinterpret_cast<Slot *>(1), std::memory_order_relaxed);
+        state.next_in_wake_list = next;
+        state.any_subtask_deferred.store(true, std::memory_order_relaxed);
+        state.completed_subtasks.store(7, std::memory_order_relaxed);
+        state.next_block_idx.store(3, std::memory_order_relaxed);
+    }
+}
+
+template <typename Slot>
+void expect_legacy_scheduler_slot_state_pristine(const Slot &state) {
+    if constexpr (HasLegacySchedulerSlotState<Slot>::value) {
+        EXPECT_EQ(state.wake_list_head.load(std::memory_order_relaxed), nullptr)
+            << "a stale closed wake list prevents consumers from registering on this producer";
+        EXPECT_EQ(state.next_in_wake_list, nullptr);
+        EXPECT_FALSE(state.has_any_subtask_deferred());
+        EXPECT_EQ(state.completed_subtasks.load(std::memory_order_relaxed), 0);
+        EXPECT_EQ(state.next_block_idx.load(std::memory_order_relaxed), 0);
+    }
+}
+
 class HbgSlotClaimTest : public ::testing::Test {
 protected:
     DeviceArena sm_arena;
-    DeviceArena runtime_arena;
     SharedMemoryHandle *sm_handle = nullptr;
     OrchestratorState orch{};
-    SchedulerState sched{};
-    SchedulerLayout sched_layout{};
+    HbgOrchestratorFixtureRuntime<OrchestratorState> fixture_runtime;
     GraphHostStatePtr graph_state;
     std::vector<char> gm_heap;
     // Stands in for a bind's retained staging: the Definition objects are built
@@ -51,12 +83,9 @@ protected:
         ASSERT_NE(sm_handle, nullptr);
         gm_heap.resize(HEAP_BYTES);
 
-        sched_layout = SchedulerState::reserve_layout(runtime_arena);
-        ASSERT_NE(runtime_arena.commit(), nullptr);
-
-        ASSERT_TRUE(sched.init_data_from_layout(sched_layout, runtime_arena, sm_handle->sm_base));
-        sched.wire_arena_pointers(sched_layout, runtime_arena);
-        ASSERT_TRUE(orch.init(sm_handle->sm_base, gm_heap.data(), HEAP_BYTES, CHIP_DEFAULT_GRAPH_TASKS, &sched));
+        ASSERT_TRUE(fixture_runtime.init(
+            orch, sm_handle->sm_base, gm_heap.data(), HEAP_BYTES, CHIP_DEFAULT_GRAPH_TASKS
+        ));
 
         definition_staging.assign(STAGING_BYTES, std::byte{0});
         GraphDefinitionArena arena{};
@@ -72,8 +101,7 @@ protected:
     void TearDown() override {
         orch.graph_host_state = nullptr;
         graph_state.reset();
-        sched.destroy();
-        runtime_arena.release();
+        fixture_runtime.destroy();
         sm_arena.release();
     }
 
@@ -83,23 +111,19 @@ protected:
     // completed task really leaves behind.
     void poison_slot(int32_t slot) {
         ChipTaskSlotState &state = sm_handle->header->tasks.get_slot_state_by_task_id(slot);
-        state.wake_list_head.store(WAKE_LIST_SENTINEL, std::memory_order_relaxed);
-        state.next_in_wake_list = &sm_handle->header->tasks.get_slot_state_by_task_id(slot + 1);
-        state.any_subtask_deferred.store(true, std::memory_order_relaxed);
-        state.completed_subtasks.store(7, std::memory_order_relaxed);
-        state.next_block_idx.store(3, std::memory_order_relaxed);
         state.graph_node_index = 11;
+        state.graph_context = &sm_handle->header->tasks.get_slot_state_by_task_id(slot + 1);
+        poison_legacy_scheduler_slot_state(
+            state, &sm_handle->header->tasks.get_slot_state_by_task_id(slot + 1)
+        );
         sm_handle->header->tasks.completion_flags[slot].store(1, std::memory_order_relaxed);
     }
 
     void expect_slot_pristine(int32_t slot) {
         ChipTaskSlotState &state = sm_handle->header->tasks.get_slot_state_by_task_id(slot);
-        EXPECT_EQ(state.wake_list_head.load(std::memory_order_relaxed), nullptr)
-            << "a stale SENTINEL closes the wake list, so no consumer can register on this producer";
-        EXPECT_EQ(state.next_in_wake_list, nullptr);
-        EXPECT_FALSE(state.has_any_subtask_deferred());
-        EXPECT_EQ(state.completed_subtasks.load(std::memory_order_relaxed), 0);
-        EXPECT_EQ(state.next_block_idx.load(std::memory_order_relaxed), 0);
+        EXPECT_EQ(state.graph_node_index, -1);
+        EXPECT_EQ(state.graph_context, nullptr);
+        expect_legacy_scheduler_slot_state_pristine(state);
         EXPECT_EQ(sm_handle->header->tasks.completion_flags[slot].load(std::memory_order_relaxed), 0)
             << "a stale completion flag reports this task done before it has run";
     }

@@ -34,7 +34,6 @@
 #include "graph_cache.h"
 #include "runtime_types.h"
 #include "submit_types.h"
-#include "scheduler/scheduler.h"
 #include "shared_memory.h"
 #include "tensormap.h"
 #include "types.h"
@@ -77,11 +76,6 @@ struct OrchestratorState {
     int32_t scope_stack_top{-1};  // Current top of stack (-1 = no scope open)
     int32_t manual_begin_depth{CHIP_MAX_SCOPE_DEPTH};
 
-    // === SCHEDULER REFERENCE ===
-    // Note: In simulated mode, orchestrator and scheduler share address space
-    // In real mode, they communicate via shared memory only
-    SchedulerState *scheduler;  // For simulated mode only
-
     // Total core counts set once at executor init; used for submit-time deadlock detection.
     int32_t total_cluster_count{0};  // AIC cores = MIX clusters
     int32_t total_aiv_count{0};      // AIV cores (= 2 × clusters on standard hardware)
@@ -90,13 +84,6 @@ struct OrchestratorState {
     // Fatal error flag (single-thread access by orchestrator, no atomic needed)
     // Cross-thread notification uses shared memory orch_error_code (atomic)
     bool fatal;
-
-    // Hidden alloc tasks complete synchronously inside the orchestrator and
-    // therefore bypass the executor's normal worker-completion counter path.
-    // rt_orchestration_done publishes this into RuntimeContext, which is the copy
-    // the device-side executor adds into its completed_tasks_ progress counter
-    // so shutdown/profiling totals remain closed.
-    int64_t inline_completed_tasks{0};
 
     // Host-only, like everything else here.
     GraphHostState *graph_host_state{nullptr};
@@ -131,17 +118,15 @@ struct OrchestratorState {
     // === Cold-path API (defined in orchestrator.cpp) ===
 
     // Allocate the scratch arrays (fanin epoch table, scope arrays, tensor map)
-    // and bind this orchestrator to one shared-memory mirror, GM heap and
-    // scheduler. sm_base is the base of the mirror this orchestrator writes; it
+    // and bind this orchestrator to one shared-memory mirror and GM heap.
+    // sm_base is the base of the mirror this orchestrator writes; it
     // is dereferenced, so a host-orch pass passes its host mirror rather than a
     // device address. `max_tasks` is the slot count that mirror is dimensioned
     // for — the bind's resolved ring_task_window — and the cap alloc() enforces.
     //
     // Returns false when an allocation fails; the caller then has no hazard map
     // and must not orchestrate.
-    bool init(void *sm_base, void *gm_heap, uint64_t heap_size, uint64_t max_tasks, SchedulerState *scheduler);
-
-    void set_scheduler(SchedulerState *scheduler);
+    bool init(void *sm_base, void *gm_heap, uint64_t heap_size, uint64_t max_tasks);
     void report_fatal(int32_t error_code, const char *func, const char *fmt, ...);
     void begin_scope(ScopeMode mode = ScopeMode::AUTO);
     void end_scope();

@@ -95,8 +95,15 @@ static TaskOutputTensors submit_dummy_task_impl(RuntimeContext *rt, const CoreTa
 }
 
 static GraphScopeResult graph_begin_impl(RuntimeContext *rt, uint64_t graph_key, const GraphTaskArgs &args) {
-    if (rt == nullptr) return GraphScopeResult{};
-    return rt->orchestrator->graph_begin(graph_key, args, rt->active_callable_hash);
+    // The A5 AICore scheduler does not yet materialize outer GRAPH control
+    // tasks. Returning the default execute_block result selects the public
+    // API's ordinary-path fallback, which submits the graph body as regular
+    // tasks and preserves execution semantics without handing an unsupported
+    // empty-active-mask task to the scheduler state builder.
+    (void)rt;
+    (void)graph_key;
+    (void)args;
+    return GraphScopeResult{};
 }
 
 static bool graph_prepare_impl(RuntimeContext *rt, void *recording_handle, const GraphTaskArgs &args) {
@@ -138,13 +145,11 @@ void rt_orchestration_done(RuntimeContext *rt) {
     // outer shells even when no later non-Graph task forced an earlier commit.
     rt->orchestrator->graph_commit();
     rt->orchestrator->mark_done();
-    // The orchestrator itself never crosses to the device, so the count of tasks
-    // it completed inline is published into the header that does.
-    rt->inline_completed_tasks = rt->orchestrator->inline_completed_tasks;
 }
 
 static bool is_fatal_impl(RuntimeContext *rt) { return rt->orchestrator->fatal; }
 
+// NOLINTNEXTLINE(modernize-avoid-variadic-functions)
 void rt_report_fatal(RuntimeContext *rt, int32_t error_code, const char *func, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
@@ -230,7 +235,7 @@ static bool wait_for_tensor_ready(
                     orch.report_fatal(
                         SIMPLER_ERROR_TENSOR_WAIT_TIMEOUT, caller,
                         "Timeout (%llu cycles): producer (local=%d) not completed",
-                        (unsigned long long)TENSOR_DATA_TIMEOUT_CYCLES, local_id
+                        static_cast<unsigned long long>(TENSOR_DATA_TIMEOUT_CYCLES), local_id
                     );
                     failed = true;
                     return;
@@ -261,7 +266,7 @@ static bool wait_for_tensor_ready(
                     orch.report_fatal(
                         SIMPLER_ERROR_TENSOR_WAIT_TIMEOUT, caller,
                         "Timeout (%llu cycles): consumers of producer (local=%d) not done",
-                        (unsigned long long)TENSOR_DATA_TIMEOUT_CYCLES, local_id
+                        static_cast<unsigned long long>(TENSOR_DATA_TIMEOUT_CYCLES), local_id
                     );
                     failed = true;
                     return;
@@ -340,7 +345,7 @@ get_tensor_data(RuntimeContext *rt, const simpler::hbg::Tensor &tensor, uint32_t
             SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
             "no host view for device address %#llx (%llu bytes): during host orchestration only tensors the "
             "runtime staged are readable, not runtime-created or child-memory buffers",
-            (unsigned long long)elem_addr, (unsigned long long)elem_size
+            static_cast<unsigned long long>(elem_addr), static_cast<unsigned long long>(elem_size)
         );
         return 0;
     }
@@ -371,7 +376,7 @@ void set_tensor_data(
             SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
             "no writable host view for device address %#llx (%llu bytes): during host orchestration only tensors "
             "the runtime staged are writable, not runtime-created or child-memory buffers",
-            (unsigned long long)elem_addr, (unsigned long long)elem_size
+            static_cast<unsigned long long>(elem_addr), static_cast<unsigned long long>(elem_size)
         );
     }
 }
