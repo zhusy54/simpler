@@ -9,16 +9,22 @@ host register: materialize + dlopen orchestration SO
         ↓
 host run/bind: stage external tensors, execute orchestration to completion
         ↓
-host: copy the prebuilt graph image to device memory
+host: copy the graph image and publish resident scheduler state
         ↓
-device: attach the image, classify tasks, dispatch with AICPU schedulers
+device: AICPU opens the launch gate; resident AICore workers schedule and execute
         ↓
 host: collect outputs and destroy/reset per-run state
 ```
 
-The device has no orchestration thread. Every launched AICPU thread participates
-in scheduling its assigned AICore workers; the highest-index thread first
-attaches the prebuilt runtime and publishes the boot barrier.
+The device has no orchestration thread. For ordinary DAG runs, AICPU owns worker
+discovery, context publication, launch gating, terminal wait, and teardown. AIV
+scheduler workers classify fanins, route Ready tasks, dispatch work, and consume
+completion generations; every active AIC/AIV worker executes its own resident
+loop.
+
+Runs containing `TaskKind::GRAPH` use the isolated AICPU compatibility executor.
+The Host selects this path before allocating resident scheduler state; ordinary
+runs cannot fall back after launch.
 
 This ordering is the defining constraint of the runtime. The host constructs the
 whole graph before any device task can complete.
@@ -58,11 +64,15 @@ never reaches shared memory; the bind maps it onto the status the caller sees.
 
 ### 2.3 Device Execution and Teardown
 
-The boot thread attaches the already-populated arena without resetting it. All
-threads classify/dispatch their core partitions and then shut those cores down.
-The last arriving thread destroys the attached runtime before publishing cleanup
-eligibility. Exactly one returning AICPU thread claims that eligibility and
-resets executor/scheduler state for the next run.
+For a resident run, AICPU discovers the physical worker topology, publishes one
+`SchedulerWorkerContext` per active lane, waits for scheduler bootstrap, and
+opens the single execution gate. AICPU waits for the Host-planned executable
+task count or the first scheduler error, then closes every resident AICore loop.
+
+The Graph compatibility path retains the prebuilt arena lifecycle: its boot
+thread attaches the arena, AICPU scheduler threads execute replay nodes, and the
+last thread destroys the attached runtime before cleanup eligibility is
+published.
 
 Publishing cleanup only after destruction prevents `deinit()` from racing the
 runtime arena or this run's host accessor.
@@ -87,7 +97,11 @@ target together and leaves them all correct.
 
 ### 3.1 What Ships: the Arena's Two Zones
 
-Three rules decide every byte of the runtime arena:
+The prebuilt runtime arena described below belongs to the Graph compatibility
+path. Ordinary DAG runs additionally allocate compact resident scheduler state
+from Host-planned metadata; that state is not embedded in the graph image.
+
+Three rules decide every byte of the compatibility runtime arena:
 
 1. **Whoever generates a value writes it.** Content the host generates is written
    on the host and copied down. Content that is a function of the *layout* rather
@@ -223,8 +237,9 @@ therefore also its slot index: ids run `0..capacity-1`, never wrap, and every
 segment is indexed by the id directly — there is no slot mask, so the capacity need
 not be a power of two.
 
-Completion is published per task, in `task_states[local_id]`, and reclaims
-neither task slots nor heap.
+The Graph compatibility executor publishes completion in
+`task_states[local_id]`; the resident scheduler publishes terminal completion
+in `SchedulerTaskControl::state`. Neither path reclaims task slots or heap.
 
 There is no post-run sweep that makes graph space reusable. Runtime destruction
 releases the complete arena, and the next run starts from a newly initialized
@@ -287,57 +302,60 @@ TensorMap maps tensor regions to producer task IDs. For every task:
 3. OUTPUT/INOUT regions register the new task as producer.
 4. Each producer tracks its highest consumer local ID for completion metadata.
 
-There is no fanout adjacency or dependency pool. A per-slot progress state is
-the readiness truth on device.
+There is no static fanout adjacency or dependency pool. The resident scheduler's
+per-task `SchedulerTaskControl::state` is the readiness truth on device.
 
 ## 6. Boot Classification and Wake Lists
 
-Submit does not push tasks into ready queues. After the graph arrives on device,
-boot classification scans every submitted task exactly once:
+Submit does not publish tasks as Ready. After the graph arrives on device,
+resident AIV schedulers collectively scan every submitted task exactly once:
 
-- a task whose fanins are all complete is routed to its shape queue;
-- otherwise it registers on its latest-submitted unmet producer's intrusive
-  wake list -- the producer likeliest to complete last, which minimises how
-  often a waiter is transferred between wake lists and the CAS contention
-  those transfers cause; and
-- producer completion reclassifies every detached waiter.
+- a single-lane task whose fanins are all complete is routed to its
+  scheduler-owner Ready inbox;
+- a Gang task whose fanins are all complete publishes its priority bit for
+  cohort admission;
+- otherwise it registers on the first executable producer in stored fanin
+  order; and
+- producer completion resumes the consumer from its saved `next_fanin_index`,
+  skips producers already in `DONE`, and registers on the next unfinished
+  producer or routes the task Ready.
 
-Completion flags are monotonic, so this consumer-pull scheme cannot miss a
-producer transition and does not require periodic dependency polling.
+`DONE` is terminal and each producer closes its wake list before detaching the
+waiters. A racing registration therefore observes either the open list or its
+closed sentinel, so the consumer-pull scheme cannot miss a completion and does
+not require periodic dependency polling.
 
-The dispatchable shapes are `AIC`, `AIV`, and `MIX`; dependency-only `DUMMY`
-tasks use a dedicated queue and complete without AICore dispatch.
+The dispatchable shapes are `AIC`, `AIV`, and `MIX`; `DUMMY` tasks do not enter
+Gang scheduling.
 
-Early dispatch is detected by the publish list, the wake list's dual keyed on
-publication instead of completion. The host qualifies candidates at submit
-(at least one producer, every producer flagged and none of them a Graph shell —
-a shell has no publication event — no dispatch predicate, dispatchable
-shape) and sorts
-a candidate's fanin row by ascending local id; a candidate hangs on its
-latest-submitted unpublished producer, the producer's publish event seals the
-chain (sentinel
-exchange) and hands the detached waiters to idle threads, and an all-published
-rescan verdict queues the candidate for pre-staging. Release rings the staged
-doorbells at the ready funnel (`push_ready_routed`), the moment readiness is
-decided. Completion readiness itself remains the boot classifier + wake lists.
+The separately selected Graph compatibility executor retains its AICPU early-
+dispatch publish lists and gated doorbells. Those lists are not part of the
+resident scheduler's dependency or Gang contract.
 
 ## 7. Dispatch and Completion
 
-- AIC/AIV dispatch claims ranges of logical block indices from
-  `next_block_idx` and requeues unfinished wide tasks.
-- MIX dispatch selects cluster offsets whose used lanes share one valid
-  placement. The tracker uses a 128-bit bitset because the flattened offset is
-  `cluster * 3`, reaching above bit 63 on supported devices.
-- Sync-start cohorts stage locally when possible; wider ownership spans use a
-  generation-tagged global drain before launch.
-- Every lane completion increments `completed_subtasks`. The task completes once
-  that count equals `block_num * popcount(active_mask)`.
-- Completion sets the task's flag and reclassifies its wake-list consumers.
+Single-lane tasks use two generation-tagged dispatch slots per worker. Their
+completion path marks the task DONE, resolves its wake list, and may refill the
+same slot directly.
 
-The drain's `pending_task` stays valid for the complete attempt: all participant
-threads load it before the coordinator can pass the stage-done barrier and clear
-it. A recovery return for a null pointer would describe an unreachable state and
-could strand the drain protocol, so the active path relies on that invariant.
+MIX, SPMD, and sync-start tasks use the Gang scheduler:
+
+1. Scheduler 0 admits Ready cohorts in sync-start, MIX, then single-lane SPMD
+   order.
+2. MIX reserves the same free pending slot on every active lane of one physical
+   cluster before any lane becomes READY.
+3. Sync-start first drains the lanes it needs, stages every participant slot as
+   GATED, and releases the cohort only after the generation-tagged stage tree
+   converges.
+4. Non-sync SPMD dispatches in waves when its logical block count exceeds the
+   available pending slots.
+5. Each Scheduler aggregates its participant completions. Scheduler 0 resolves
+   the graph task once the completion tree converges, then retires the generation
+   before the cohort slot can be reused.
+
+The active cohort and pending Gang priority bits suppress normal dispatch during
+admission, drain, staging, and release. Generation-tagged command and completion
+tokens prevent a previous cohort from satisfying a reused slot.
 
 ## 8. Scalar Access During Construction
 
@@ -362,8 +380,10 @@ runs on the host. Important validation paths include:
 - sync-start residency violations (`-7`); and
 - scheduler timeout (`-100`).
 
-Device logs contain scheduler records only. Host graph-construction diagnostics
-remain host-side. See [device_log_profiling.md](device_log_profiling.md).
+Device logs contain AICPU lifecycle, error, and Graph compatibility records.
+Resident scheduler timing is exported through chip-swimlane runtime extensions;
+Host graph-construction diagnostics remain host-side. See
+[device_log_profiling.md](device_log_profiling.md).
 
 ## 10. Verification
 

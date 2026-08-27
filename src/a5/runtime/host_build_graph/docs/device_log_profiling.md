@@ -6,8 +6,9 @@
 device launch. The device boots scheduler-only, so its device log contains no
 orchestrator-thread block and no device-side `dlopen` timing.
 
-Host graph-construction timing belongs in host-side diagnostics. This guide is
-only for the AICPU scheduler portion of a run.
+Host graph-construction timing belongs in host-side diagnostics. In ordinary DAG
+runs, AICPU owns lifecycle management while resident AIV workers own scheduling.
+Graph replay retains the AICPU compatibility scheduler.
 
 ## Finding the Log
 
@@ -17,17 +18,37 @@ On hardware, AICPU `LOG_INFO` records are written by CANN's dlog subsystem:
 $HOME/ascend/log/debug/device-<device_id>/device-<pid>_<timestamp>.log
 ```
 
-Find the newest file and filter the current scheduler records:
+Find the newest file and filter lifecycle, timeout, and compatibility scheduler
+records:
 
 ```bash
 ls -t "$HOME/ascend/log/debug/device-<device_id>"/device-*.log | head -1
-grep -E "sched_start=|Scheduler summary|Scheduler Phase Breakdown" <logfile>
+grep -E "A5 HBG AICore scheduler|sched_start=|Scheduler Phase Breakdown" <logfile>
 ```
 
-## Scheduler Summary
+## Resident Scheduler Capture
 
-With `SIMPLER_DFX` enabled, each scheduler thread emits timing bounds and a
-summary when its dispatch loop completes:
+Resident scheduler timing is exported through the chip-swimlane runtime
+extensions rather than per-task AICPU log lines. Enable chip swimlane through the
+scene-test CLI and inspect `chip_swimlane_records.json`:
+
+```bash
+pytest <scene> --platform a5sim --enable-chip-swimlane 3
+```
+
+The scheduler streams identify `producer: "aicore"`. Level 3 includes bootstrap,
+fanin, Ready claim, normal dispatch/completion, resolve, and idle records. The
+resident tail trace also accounts time spent in Gang service.
+
+Gang task-level records are intentionally omitted until representative-block and
+multi-lane aggregation semantics are complete. A run containing MIX, SPMD, or
+sync-start work still produces a valid artifact; analysis must tolerate missing
+Gang task and phase rows.
+
+## Compatibility Scheduler Summary
+
+For Graph replay, `SIMPLER_DFX` enables the retained AICPU scheduler timing
+bounds and summary:
 
 ```text
 Thread 0: sched_start=... sched_end=... sched_cost=3477.420us
@@ -41,11 +62,10 @@ Thread 0: Scheduler summary: total_time=3460.100us, loops=147, tasks_scheduled=3
 | `loops` | Scheduler-loop iterations |
 | `tasks_scheduled` | Mixed tasks this thread completed |
 
-All launched AICPU threads participate in scheduling their assigned cores. The
-highest-index thread performs one-time prebuilt-runtime attachment before it
-enters the same scheduler path; it is not an orchestrator thread.
+These records describe only the compatibility executor and must not be used to
+interpret ordinary resident-scheduler runs.
 
-## Optional Phase Breakdown
+## Compatibility Phase Breakdown
 
 When `SIMPLER_SCHED_PROFILING` is also enabled, the summary includes:
 
