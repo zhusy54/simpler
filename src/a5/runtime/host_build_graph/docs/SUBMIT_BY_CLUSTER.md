@@ -80,32 +80,40 @@ must launch as one cohort:
 2. TensorMap and explicit dependencies append producer local IDs to the payload's
    fanin region.
 3. Submit publishes only the finished graph data; it does not push ready tasks.
-4. After H2D, device boot scans every submitted task exactly once.
-5. A task with every fanin complete is routed to its ready queue; otherwise it
-   registers on its latest-submitted unmet producer's wake list, minimising
-   transfers between wake lists and their CAS contention.
-6. Producer completion reclassifies wake-list consumers until they become ready.
+4. After H2D, AIV schedulers collectively scan every submitted task exactly once.
+5. A task with no executable fanins is routed to its scheduler-owner Ready inbox
+   or Gang admission bit; otherwise it registers on the first executable
+   producer in stored fanin order.
+6. Producer completion resumes each detached consumer from its saved
+   `next_fanin_index`, skips producers already in `DONE`, and registers on the
+   next unfinished producer or routes the task Ready.
 
-Completion flags are monotonic, so a task never needs periodic fanin polling.
+`SchedulerTaskControl::state` is the resident readiness truth. `DONE` is
+terminal, and the closed wake-list sentinel prevents a racing registration from
+missing completion, so a task needs no periodic fanin polling.
 
 ## Dispatch and Completion
 
-- AIC and AIV tasks claim as many free cores as the current scheduler owns and
-  requeue remaining logical blocks for later waves.
-- MIX placement selects whole clusters whose used lanes can all accept the
-  task. High cluster offsets are represented by the runtime's 128-bit bitset.
-- `require_sync_start` uses local staging when possible and a generation-tagged
-  global drain when the cohort spans scheduler ownership domains.
-- Each completed lane increments `completed_subtasks`; the mixed task completes
-  exactly once when it reaches `block_num * popcount(active_mask)`.
+- Single-lane tasks use two generation-tagged dispatch slots per worker and may
+  directly refill a slot while resolving its previous completion.
+- MIX placement reserves the same pending slot on every active lane of a
+  physical cluster before any lane is published READY.
+- MIX, SPMD, and `require_sync_start` tasks enter the Gang scheduler. Admission
+  order is sync-start, MIX, then single-lane SPMD.
+- Sync-start cohorts drain their required lanes, stage all slots as GATED, and
+  release only after the generation-tagged participant tree converges.
+- Scheduler-local participant records aggregate completed subtasks, and the
+  cohort retires the graph task exactly once. Generation tags prevent stale
+  drain, stage, dispatch, or completion tokens from satisfying a later cohort.
 
 ## Executor Model
 
 The host loads and executes the orchestration shared object synchronously. The
-device has no orchestration thread: every launched AICPU thread participates in
-scheduling its assigned cores after the boot thread attaches the prebuilt graph.
-Cluster ownership is assigned during the AICore handshake and remains stable for
-the run.
+device has no orchestration thread. AICPU manages the AICore lifecycle; resident
+AIV schedulers own dependency resolution, Ready routing, Gang coordination, and
+dispatch. Cluster ownership is assigned during the AICore handshake and remains
+stable for the run. Graph replay uses a separately selected AICPU compatibility
+executor.
 
 ## Capacity
 
@@ -124,6 +132,7 @@ pytest examples tests/st --platform a2a3sim --runtime host_build_graph
 pytest examples tests/st --platform a5sim --runtime host_build_graph
 ```
 
-The `host_build_graph_wide_dispatch` scene specifically covers wide AIV work,
-sync-start MIX placement, normal MIX placement, and bit offsets above 63 with
-`aicpu_thread_num=2`.
+The A5 `mix_spmd_sync_start` scene covers resident MIX, SPMD, and sync-start
+execution. C++ scheduler tests cover admission priority, capacity rejection,
+whole-cluster reservation, generation safety, and multi-participant lifecycle
+convergence.

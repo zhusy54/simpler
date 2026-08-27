@@ -11,7 +11,7 @@
 
 #include "aicore/aicore.h"
 #include "aicore/aicore_profiling_state.h"
-// Cluster-local dependency scheduling uses one device-side protocol.
+// Cluster-local normal and gang scheduling share one device-side protocol.
 #include "scheduler/scheduler_dispatch.h"
 #include "common/platform_config.h"
 #include "dispatch_payload.h"
@@ -118,6 +118,7 @@ __aicore__ __attribute__((always_inline)) void execute_task(__gm__ DispatchPaylo
 
 __aicore__ __attribute__((always_inline)) bool
 should_commit_scheduler_trace(__gm__ void *, __gm__ SchedulerWorkerContext *, __gm__ SchedulerDispatchSlot *slot) {
+    // Gang dispatch does not publish the complete per-task trace contract.
     return slot->gang == 0;
 }
 
@@ -248,14 +249,20 @@ __aicore__ bool bootstrap_ready_graph(
             scheduler_publish_cache_line(&trace->ready_transition_cycles);
         }
         if (route == SchedulerRouteResult::ERROR) return false;
-        if (route == SchedulerRouteResult::READY_TO_ENQUEUE &&
-            !scheduler_bootstrap_ready_batch_append(
-                scheduler_state_base, scheduler, static_cast<int64_t>(task_id),
-                &batches[scheduler_metadata_core_type_index(scheduler_metadata_single_subtask_slot(metadata
-                                                                                                       ->active_mask))],
-                phase_timing_enabled ? &stats->ready : nullptr, profiling_level
-            )) {
-            return false;
+        if (route == SchedulerRouteResult::READY_TO_ENQUEUE) {
+            if (scheduler_task_is_gang(metadata->flags)) {
+                __gm__ SchedulerTaskControl *control =
+                    scheduler_task_control_at(scheduler_state_base, scheduler, static_cast<int64_t>(task_id));
+                scheduler_publish_gang_ready(scheduler_state_base, scheduler, control, metadata->flags);
+            } else if (!scheduler_bootstrap_ready_batch_append(
+                           scheduler_state_base, scheduler, static_cast<int64_t>(task_id),
+                           &batches[scheduler_metadata_core_type_index(
+                               scheduler_metadata_single_subtask_slot(metadata->active_mask)
+                           )],
+                           phase_timing_enabled ? &stats->ready : nullptr, profiling_level
+                       )) {
+                return false;
+            }
         }
         if (phase_timing_enabled) ++stats->bootstrap_task_count;
     }
@@ -321,12 +328,18 @@ __aicore__ bool bootstrap_ready_graph(
     if (phase_timing_enabled) stats->target_bootstrap_end_cycles = scheduler_cycles();
 
     // Prepare the first executable wave while the sole DMB launch gate is
-    // still closed.
+    // still closed. Gang service runs first to preserve SPMD > Mix > normal
+    // priority; normal fill is suppressed while a gang dispatch is pending.
     uint64_t ready_victim_cursors[SCHEDULER_CORE_TYPE_COUNT]{
         (scheduler->inbox_index + 1) % scheduler_count,
         (scheduler->inbox_index + 1) % scheduler_count,
     };
     bool fill_failed = false;
+    (void)scheduler_service_gang(
+        graph, scheduler_state_base, scheduler, run_control, phase_timing_enabled ? &stats->wake : nullptr,
+        phase_timing_enabled ? &stats->ready : nullptr, phase_timing_enabled ? &stats->completion : nullptr,
+        ready_owner, profiling_level
+    );
     (void)scheduler_fill_cluster_normal_slots(
         graph, scheduler_state_base, scheduler, run_control, ready_victim_cursors,
         phase_timing_enabled ? &stats->ready : nullptr, profiling_level, 0, nullptr, deferred_aiv, ready_owner,
@@ -451,6 +464,15 @@ __aicore__ bool run_ready_dispatch_loop(
                 inter_task_timing.completion.finalize_cycles += completion_timing.finalize_cycles;
             }
             scheduler_progress = completion_progress;
+            operation_start = phase_timing_enabled ? get_sys_cnt_aicore() : 0;
+            scheduler_progress =
+                scheduler_service_gang(
+                    graph, scheduler_state_base, context, run_control, phase_timing_enabled ? &stats->wake : nullptr,
+                    phase_timing_enabled ? &stats->ready : nullptr, phase_timing_enabled ? &stats->completion : nullptr,
+                    ready_owner, profiling_level
+                ) ||
+                scheduler_progress;
+            if (phase_timing_enabled) inter_task_timing.gang_service_cycles += get_sys_cnt_aicore() - operation_start;
             operation_start = phase_timing_enabled ? get_sys_cnt_aicore() : 0;
             SchedulerNormalDispatchTiming dispatch_timing{};
             bool fill_failed = false;
@@ -712,6 +734,9 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     __gm__ SchedulerWorkerContext *context = reinterpret_cast<__gm__ SchedulerWorkerContext *>(handshake->task);
     scheduler_observe_cache_line(context);
     scheduler_observe_cache_line(&context->task_metadata_offset);
+    scheduler_observe_cache_line(&context->gang_coordinator_offset);
+    context->worker_index = static_cast<uint64_t>(block_idx);
+    scheduler_publish_cache_line(&context->scheduler_state_base_address);
     __gm__ void *scheduler_state_base = reinterpret_cast<__gm__ void *>(context->scheduler_state_base_address);
     __gm__ SchedulerRunControl *run_control =
         scheduler_state_at<SchedulerRunControl>(scheduler_state_base, context->run_control_offset);

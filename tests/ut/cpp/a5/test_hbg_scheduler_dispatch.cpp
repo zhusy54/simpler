@@ -325,34 +325,6 @@ TEST(SchedulerClusterCompletion, RejectsStaleCompletionGenerationAtNamedSite) {
     );
 }
 
-TEST(SchedulerClusterCompletion, RejectsUnexpectedGangSlotAtNamedSite) {
-    FixtureStorage storage(1, 3);
-    GraphBuffer graph(1);
-    graph.executable(0, 0);
-    SchedulerWorkerContext &scheduler = storage.contexts[1];
-    scheduler.is_scheduler = 1;
-    scheduler.cluster_worker_ids[0] = 0;
-    auto *slot = scheduler_dispatch_slot_at(storage.scheduler_state->base(), &scheduler, 0, 0);
-    scheduler_initialize_free_slot(slot);
-    slot->task_id = 0;
-    slot->gang = 1;
-    scheduler_gm_store(
-        slot->publication, scheduler_dispatch_publication(slot->generation, SchedulerDispatchSlotState::READY)
-    );
-
-    SchedulerWakeStats wake_stats{};
-    SchedulerReadyStats ready_stats{};
-    SchedulerCompletionStats completion_stats{};
-    EXPECT_FALSE(scheduler_service_cluster_completion_slot(
-        graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, 0, 0, slot->generation,
-        &wake_stats, &ready_stats, &completion_stats, nullptr, false, nullptr, nullptr, nullptr,
-        &storage.owner_states[scheduler.inbox_index]
-    ));
-    EXPECT_EQ(
-        storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::COMPLETION_UNEXPECTED_GANG_SLOT)
-    );
-}
-
 TEST(SchedulerClusterCompletion, AccountsCompletedTaskWhenResolveFails) {
     FixtureStorage storage(1, 2);
     GraphBuffer graph(1);

@@ -88,14 +88,17 @@ Each sub-level macro requires `SIMPLER_DFX=1`:
 
 host_build_graph boots **scheduler-only** — the orchestrator runs on the host,
 so the device log carries no `orch_start`/`orch_end`/`orch_cost` lines and no
-`total submitted tasks` line (see the note at the top of this file). Every
-AICPU thread schedules its own core slice, so `N_sched == aicpu_thread_num`.
+`total submitted tasks` line (see the note at the top of this file). The
+per-thread scheduler logs below apply to the Graph compatibility executor.
+Ordinary DAG runs export resident AICore scheduler data through chip-swimlane
+runtime extensions instead.
 
 **What's compiled:**
 
 - Base timing counters for scheduler loop (`sched_complete/dispatch/idle/scan`)
 - Scheduler summary output (`total_time`, `loops`, `tasks_scheduled`)
-- Scheduler lifetime timestamps and cost (`sched_start`, `sched_end`, `sched_cost` — captured inside `resolve_and_dispatch_pto2()`, printed before Scheduler summary)
+- Scheduler lifetime timestamps and cost (`sched_start`, `sched_end`,
+  `sched_cost`, printed before Scheduler summary)
 
 **What's NOT compiled:**
 
