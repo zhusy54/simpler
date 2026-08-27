@@ -6,9 +6,9 @@
 device launch. The device boots scheduler-only, so its device log contains no
 orchestrator-thread block and no device-side `dlopen` timing.
 
-Host graph-construction timing belongs in host-side diagnostics. In ordinary DAG
-runs, AICPU owns lifecycle management while resident AIV workers own scheduling.
-Graph replay retains the AICPU compatibility scheduler.
+Host graph-construction timing belongs in host-side diagnostics. Ordinary DAG
+runs schedule on resident AICore workers; AICPU logs cover lifecycle timing only.
+Graph replay continues to emit the compatibility AICPU scheduler records.
 
 ## Finding the Log
 
@@ -18,12 +18,11 @@ On hardware, AICPU `LOG_INFO` records are written by CANN's dlog subsystem:
 $HOME/ascend/log/debug/device-<device_id>/device-<pid>_<timestamp>.log
 ```
 
-Find the newest file and filter lifecycle, timeout, and compatibility scheduler
-records:
+Find the newest file and filter the current scheduler and lifecycle records:
 
 ```bash
 ls -t "$HOME/ascend/log/debug/device-<device_id>"/device-*.log | head -1
-grep -E "A5 HBG AICore scheduler|sched_start=|Scheduler Phase Breakdown" <logfile>
+grep -E "A5 HBG AICore scheduler|AicoreLifecycle|sched_start=|Scheduler Phase Breakdown" <logfile>
 ```
 
 ## Resident Scheduler Capture
@@ -44,6 +43,29 @@ Gang task-level records are intentionally omitted until representative-block and
 multi-lane aggregation semantics are complete. A run containing MIX, SPMD, or
 sync-start work still produces a valid artifact; analysis must tolerate missing
 Gang task and phase rows.
+
+## Resident Scheduler Summary
+
+After a successful resident run, Host validation emits aggregate timing and
+protocol counters copied from every active worker:
+
+```text
+A5 HBG AICore scheduler HOST TIMING: payload=... kernel=... completion=... backoff=... cycles
+A5 HBG AICore scheduler COUNTERS: bootstrap_tasks=... ready_enqueues=... ready_pops=...
+```
+
+| Field | Meaning |
+| ----- | ------- |
+| `bootstrap_tasks` | Executable tasks classified during scheduler bootstrap |
+| `ready_enqueues` / `ready_pops` | Ordinary tasks published to and claimed from Ready inboxes |
+| `completion_enqueues` | Completed AIC/AIV subtasks reported to their scheduler |
+| `completion_resolves` | Graph tasks retired after completion aggregation |
+| `ready_to_kernel_*` | Aggregate and maximum Ready-to-kernel latency |
+| `backoff` / `idle_iterations` | Resident-loop idle cost and iterations |
+
+Validation also rejects nonempty Ready/completion state, occupied dispatch slots,
+open wake lists, incomplete bootstrap, or inconsistent execution counts. These
+errors are correctness failures, not profiling warnings.
 
 ## Compatibility Scheduler Summary
 

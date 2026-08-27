@@ -13,18 +13,19 @@ host: copy the graph image and publish resident scheduler state
         ↓
 device: AICPU opens the launch gate; resident AICore workers schedule and execute
         ↓
-host: collect outputs and destroy/reset per-run state
+host: validate scheduler convergence, collect outputs, and release per-run state
 ```
 
-The device has no orchestration thread. For ordinary DAG runs, AICPU owns worker
-discovery, context publication, launch gating, terminal wait, and teardown. AIV
-scheduler workers classify fanins, route Ready tasks, dispatch work, and consume
-completion generations; every active AIC/AIV worker executes its own resident
-loop.
+The device has no orchestration thread. For ordinary DAG runs, AICPU owns only
+worker discovery, context publication, launch gating, terminal wait, and
+teardown. AIV scheduler workers classify fanins, route Ready tasks, dispatch work,
+and consume completion generations; every active AIC/AIV worker executes its own
+resident loop.
 
 Runs containing `TaskKind::GRAPH` use the isolated AICPU compatibility executor.
-The Host selects this path before allocating resident scheduler state; ordinary
-runs cannot fall back after launch.
+Graph replay was added after the resident-scheduler change was developed and has
+not yet been migrated to its graph view. The Host selects this path before
+allocating resident scheduler state; ordinary runs cannot fall back after launch.
 
 This ordering is the defining constraint of the runtime. The host constructs the
 whole graph before any device task can complete.
@@ -65,14 +66,20 @@ never reaches shared memory; the bind maps it onto the status the caller sees.
 ### 2.3 Device Execution and Teardown
 
 For a resident run, AICPU discovers the physical worker topology, publishes one
-`SchedulerWorkerContext` per active lane, waits for scheduler bootstrap, and
-opens the single execution gate. AICPU waits for the Host-planned executable
-task count or the first scheduler error, then closes every resident AICore loop.
+`SchedulerWorkerContext` per active lane, waits for scheduler bootstrap, and opens
+the single execution gate. AICPU then waits for the Host-planned executable task
+count or the first scheduler error. Shutdown closes every AICore loop before the
+Host reads the final state.
 
-The Graph compatibility path retains the prebuilt arena lifecycle: its boot
-thread attaches the arena, AICPU scheduler threads execute replay nodes, and the
-last thread destroys the attached runtime before cleanup eligibility is
-published.
+After a successful run, the Host copies back the scheduler state and verifies
+that task controls are DONE/closed, Ready and completion inboxes are empty,
+dispatch slots are FREE, bootstrap and execution counts agree, and no scheduler
+error was recorded. A failed validation makes the run fail after diagnostic and
+output handling complete.
+
+The Graph compatibility path retains the prebuilt arena lifecycle: the boot
+thread attaches it, AICPU scheduler threads execute replay nodes, and the last
+thread destroys the attached runtime before cleanup eligibility is published.
 
 Publishing cleanup only after destruction prevents `deinit()` from racing the
 runtime arena or this run's host accessor.
@@ -98,7 +105,7 @@ target together and leaves them all correct.
 ### 3.1 What Ships: the Arena's Two Zones
 
 The prebuilt runtime arena described below belongs to the Graph compatibility
-path. Ordinary DAG runs additionally allocate compact resident scheduler state
+path. Ordinary DAG runs additionally allocate a compact resident scheduler state
 from Host-planned metadata; that state is not embedded in the graph image.
 
 Three rules decide every byte of the compatibility runtime arena:

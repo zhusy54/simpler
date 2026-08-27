@@ -112,8 +112,9 @@ The host loads and executes the orchestration shared object synchronously. The
 device has no orchestration thread. AICPU manages the AICore lifecycle; resident
 AIV schedulers own dependency resolution, Ready routing, Gang coordination, and
 dispatch. Cluster ownership is assigned during the AICore handshake and remains
-stable for the run. Graph replay uses a separately selected AICPU compatibility
-executor.
+stable for the run. Graph replay temporarily uses a separately selected AICPU
+compatibility executor until its node execution is represented in the resident
+graph view.
 
 ## Capacity
 
