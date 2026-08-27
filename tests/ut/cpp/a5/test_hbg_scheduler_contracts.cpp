@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cstdint>
 #include <cstdlib>
@@ -20,11 +21,31 @@
 #include <vector>
 
 #include "host_build_graph/runtime_types.h"
+#include "aicore_scheduler_error.h"
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_topology.h"
 #include "scheduler/scheduler_types.h"
 
 namespace {
+
+TEST(AicoreSchedulerError, MapsInternalFailureToExistingHostStatus) {
+    EXPECT_EQ(aicore_scheduler_runtime_error_code(0), SIMPLER_ERROR_NONE);
+    EXPECT_EQ(aicore_scheduler_runtime_error_code(1), SIMPLER_ERROR_INVALID_ARGS);
+    EXPECT_EQ(aicore_scheduler_runtime_error_code(UINT64_MAX), SIMPLER_ERROR_INVALID_ARGS);
+}
+
+TEST(AicoreSchedulerError, LatchesFirstHostVisibleFailure) {
+    std::atomic<int32_t> status{SIMPLER_ERROR_NONE};
+    EXPECT_FALSE(latch_aicore_scheduler_runtime_error(&status, 0));
+    EXPECT_EQ(status.load(std::memory_order_relaxed), SIMPLER_ERROR_NONE);
+
+    EXPECT_TRUE(latch_aicore_scheduler_runtime_error(&status, 1));
+    EXPECT_EQ(status.load(std::memory_order_relaxed), SIMPLER_ERROR_INVALID_ARGS);
+
+    status.store(SIMPLER_ERROR_READY_QUEUE_OVERFLOW, std::memory_order_relaxed);
+    EXPECT_FALSE(latch_aicore_scheduler_runtime_error(&status, 2));
+    EXPECT_EQ(status.load(std::memory_order_relaxed), SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
+}
 
 class SchedulerStateBuffer {
 public:

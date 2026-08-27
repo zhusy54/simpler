@@ -17,6 +17,7 @@
 #include "common/core_type.h"
 #include "common/platform_config.h"
 #include "dispatch_payload.h"
+#include "host_build_graph/aicore_scheduler_layout.h"
 
 #ifndef __gm__
 #define __gm__
@@ -906,6 +907,7 @@ enum class SchedulerErrorSite : uint64_t {
     DISPATCH_INVALID_CALLABLE = 45,
     DISPATCH_MATERIALIZE_FAILED = 46,
     DISPATCH_INVALID_PREDICATE = 47,
+    EXECUTOR_INVALID_DISPATCH_SLOT = 50,
     BOOTSTRAP_WAKE_INVALID_HEAD = 60,
     COMPLETION_TASK_NOT_DONE = 61,
     COMPLETION_WAKE_ALREADY_CLOSED = 62,
@@ -918,6 +920,9 @@ enum class SchedulerErrorSite : uint64_t {
     DEFERRED_RESERVATION_INVALID_OWNER = 75,
     DEFERRED_RESERVATION_INVALID_STATE = 76,
     DEFERRED_PUBLISH_INVALID_RESERVATION = 77,
+    EXECUTOR_PREFERRED_SLOT_INVALID = 78,
+    READY_OWNER_MAINTENANCE_FAILED = 79,
+    BOOTSTRAP_FAILED = 90,
 };
 
 struct alignas(128) SchedulerRunControl {
@@ -1148,35 +1153,6 @@ struct alignas(128) SchedulerTaskTrace {
     uint64_t inter_task_dispatch_publish_cycles[SCHEDULER_CORE_TYPE_COUNT];
 };
 
-struct AicoreSchedulerLayout {
-    uint64_t total_size;
-    uint64_t task_count;
-    uint64_t aic_task_count;
-    uint64_t aiv_task_count;
-    uint64_t run_control_offset;
-    uint64_t aicpu_lifecycle_traces_offset;
-    uint64_t worker_contexts_offset;
-    uint64_t dispatch_payloads_offset;
-    uint64_t dispatch_slots_offset;
-    uint64_t callable_addresses_offset;
-    uint64_t task_metadata_offset;
-    uint64_t task_controls_offset;
-    uint64_t completion_inboxes_offset;
-    uint64_t ready_inboxes_offset;
-    uint64_t ready_owner_states_offset;
-    uint64_t ready_directory_offset;
-    uint64_t trace_cells_offset;
-    uint64_t gang_coordinator_offset;
-    uint64_t gang_cohorts_offset;
-    uint64_t gang_participants_offset;
-    uint64_t gang_commands_offset;
-    uint64_t executable_task_count;
-    uint64_t executable_subtask_count;
-    uint64_t gang_task_count;
-    uint64_t aic_worker_demand;
-    uint64_t aiv_worker_demand;
-};
-
 static_assert(sizeof(SchedulerTaskMetadata) == 16, "task metadata layout changed");
 static_assert(alignof(SchedulerTaskMetadata) == 16, "task metadata alignment changed");
 static_assert(sizeof(SchedulerTaskControl) == 128, "task control layout changed");
@@ -1247,6 +1223,7 @@ inline __aicore__ __gm__ T *scheduler_state_at(__gm__ void *base, uint64_t offse
 
 #if !defined(__CCE_AICORE__)
 #include <type_traits>
+static_assert(std::is_standard_layout_v<AicoreSchedulerLayout> && std::is_trivially_copyable_v<AicoreSchedulerLayout>);
 static_assert(std::is_standard_layout_v<SchedulerTaskMetadata> && std::is_trivially_copyable_v<SchedulerTaskMetadata>);
 static_assert(std::is_standard_layout_v<SchedulerTaskControl> && std::is_trivially_copyable_v<SchedulerTaskControl>);
 static_assert(
