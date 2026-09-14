@@ -624,6 +624,9 @@ inline constexpr uint64_t SCHEDULER_WORKER_CAPACITY = 108;
 inline constexpr uint32_t SCHEDULER_PENDING_SLOT_COUNT = 2;
 inline constexpr uint32_t SCHEDULER_CALLABLE_CAPACITY = 1024;
 inline constexpr uint32_t SCHEDULER_CORE_TYPE_COUNT = 2;
+inline constexpr uint32_t SCHEDULER_READY_QUEUE_COUNT = 3;
+inline constexpr uint32_t SCHEDULER_MIX_READY_QUEUE = 2;
+inline constexpr uint32_t SCHEDULER_MIX_TRACKER_COUNT = 3;
 inline constexpr uint32_t SCHEDULER_CLUSTER_CAPACITY = SCHEDULER_WORKER_CAPACITY / 3;
 inline constexpr uint32_t SCHEDULER_CAPACITY = SCHEDULER_CLUSTER_CAPACITY;
 inline constexpr uint32_t SCHEDULER_GANG_COHORT_COUNT = 2;
@@ -733,9 +736,15 @@ struct alignas(16) SchedulerTaskMetadata {
     uint8_t active_mask;
     uint8_t flags;
     uint16_t logical_block_num;
-    uint16_t total_required_subtasks;
+    uint16_t trace_index_base;
     int32_t timing_slot;
 };
+
+inline __aicore__ uint32_t scheduler_task_trace_subtask_offset(uint8_t active_mask, uint8_t subtask_slot) {
+    if (subtask_slot >= 3 || (active_mask & (1U << subtask_slot)) == 0) return UINT32_MAX;
+    const uint32_t preceding = (1U << subtask_slot) - 1;
+    return static_cast<uint32_t>(__builtin_popcount(static_cast<uint32_t>(active_mask) & preceding));
+}
 
 inline __aicore__ bool scheduler_task_is_executable(uint8_t flags) { return (flags & SCHEDULER_TASK_EXECUTABLE) != 0; }
 
@@ -804,7 +813,7 @@ struct alignas(64) SchedulerReadyOwnerQueue {
 };
 
 struct alignas(128) SchedulerReadyOwnerState {
-    SchedulerReadyOwnerQueue queues[SCHEDULER_CORE_TYPE_COUNT];
+    SchedulerReadyOwnerQueue queues[SCHEDULER_READY_QUEUE_COUNT];
 };
 
 enum class SchedulerGangCohortState : uint64_t {
@@ -896,7 +905,7 @@ struct alignas(64) SchedulerReadyDirectoryShard {
 };
 
 struct alignas(128) SchedulerReadyDirectory {
-    SchedulerReadyDirectoryShard core_types[SCHEDULER_CORE_TYPE_COUNT][SCHEDULER_READY_DIRECTORY_SHARD_COUNT];
+    SchedulerReadyDirectoryShard core_types[SCHEDULER_READY_QUEUE_COUNT][SCHEDULER_READY_DIRECTORY_SHARD_COUNT];
     volatile uint64_t bootstrap_ready_types[SCHEDULER_WORKER_CAPACITY];
 };
 
@@ -941,6 +950,14 @@ struct alignas(128) SchedulerDispatchSlot {
     SchedulerExecutorTaskTrace executor_trace;
 };
 
+struct SchedulerMixTracker {
+    int64_t task_id{SCHEDULER_TASK_ID_INVALID};
+    uint32_t generation{0};
+    uint8_t active_mask{0};
+    uint8_t completed_mask{0};
+    uint8_t reserved[2]{};
+};
+
 // Stable device-side localization for the first scheduler failure. These values
 // are diagnostic ABI: keep existing numbers stable when adding new sites.
 enum class SchedulerErrorSite : uint64_t {
@@ -972,6 +989,13 @@ enum class SchedulerErrorSite : uint64_t {
     NORMAL_DISPATCH_INVALID_TOPOLOGY = 78,
     EXECUTOR_PREFERRED_SLOT_INVALID = 79,
     READY_OWNER_MAINTENANCE_FAILED = 80,
+    MIX_DISPATCH_INVALID_SHAPE = 81,
+    MIX_DISPATCH_INVALID_TOPOLOGY = 82,
+    MIX_DISPATCH_INVALID_CALLABLE = 83,
+    MIX_DISPATCH_MATERIALIZE_FAILED = 84,
+    MIX_COMPLETION_INVALID_TRACKER = 85,
+    MIX_COMPLETION_DUPLICATE = 86,
+    MIX_COMPLETION_RESOLVE_FAILED = 87,
     BOOTSTRAP_FAILED = 90,
     CONTEXT_READY_TIMEOUT = 91,
     BOOTSTRAP_SCAN_TIMEOUT = 92,
@@ -1017,7 +1041,7 @@ struct alignas(128) SchedulerRunControl {
     volatile uint64_t bootstrap_scan_complete;
     volatile uint64_t scheduler_timeout_cycles;
     volatile uint64_t chip_swimlane_level;
-    uint64_t lifecycle_reserved;
+    uint64_t mix_task_count;
 
     volatile uint64_t error_claimed;
     volatile uint64_t scheduler_error;
@@ -1029,7 +1053,8 @@ struct alignas(128) SchedulerRunControl {
     volatile uint64_t error_reserved_address;
     volatile uint64_t error_task_window_last_index;
     volatile uint64_t error_site;
-    uint64_t error_reserved[6];
+    uint64_t executable_subtask_count;
+    uint64_t error_reserved[5];
 };
 
 struct alignas(128) AicpuThreadLifecycleTrace {
@@ -1219,7 +1244,7 @@ static_assert(sizeof(SchedulerReadyInbox) == 128, "ready inbox layout changed");
 static_assert(alignof(SchedulerReadyInbox) == 128, "ready inbox alignment changed");
 static_assert(sizeof(SchedulerReadyOwnerQueue) == 64, "ready owner queue must occupy one cache line");
 static_assert(alignof(SchedulerReadyOwnerQueue) == 64, "ready owner queue alignment changed");
-static_assert(sizeof(SchedulerReadyOwnerState) == 128, "ready owner state must occupy two cache lines");
+static_assert(sizeof(SchedulerReadyOwnerState) == 256, "ready owner state must occupy four cache lines");
 static_assert(alignof(SchedulerReadyOwnerState) == 128, "ready owner state alignment changed");
 static_assert(sizeof(SchedulerGangCoordinator) == 256, "gang coordinator layout changed");
 static_assert(alignof(SchedulerGangCoordinator) == 128, "gang coordinator alignment changed");
@@ -1242,7 +1267,7 @@ static_assert(
 );
 static_assert(
     offsetof(SchedulerReadyDirectory, bootstrap_ready_types) ==
-        SCHEDULER_CORE_TYPE_COUNT * SCHEDULER_READY_DIRECTORY_SHARD_COUNT * 64,
+        SCHEDULER_READY_QUEUE_COUNT * SCHEDULER_READY_DIRECTORY_SHARD_COUNT * 64,
     "bootstrap flags must follow the ready directory shards"
 );
 static_assert(
@@ -1373,13 +1398,16 @@ inline bool scheduler_layout_reserve(uint64_t *cursor, uint64_t size, uint64_t a
 
 inline bool scheduler_plan_layout(
     uint64_t task_count, uint64_t aic_task_count, uint64_t aiv_task_count, AicoreSchedulerLayout *layout,
-    bool enable_activity_profiling = false
+    bool enable_activity_profiling = false, uint64_t trace_cell_count = UINT64_MAX
 ) {
-    if (layout == nullptr || aic_task_count > task_count || aiv_task_count > task_count) return false;
+    if (layout == nullptr || aic_task_count > task_count || task_count > UINT64_MAX / 2 ||
+        aiv_task_count > task_count * 2)
+        return false;
     AicoreSchedulerLayout next{};
     next.task_count = task_count;
     next.aic_task_count = aic_task_count;
     next.aiv_task_count = aiv_task_count;
+    if (trace_cell_count == UINT64_MAX) trace_cell_count = task_count;
     uint64_t cursor = 0;
     uint64_t bytes = 0;
 #define SCHEDULER_RESERVE_ARRAY(count, type, field)                 \
@@ -1403,7 +1431,7 @@ inline bool scheduler_plan_layout(
         !SCHEDULER_RESERVE_ARRAY(task_count, SchedulerTaskControl, task_controls_offset) ||
         !SCHEDULER_RESERVE_ARRAY(SCHEDULER_WORKER_CAPACITY, SchedulerCompletionInbox, completion_inboxes_offset) ||
         !SCHEDULER_RESERVE_ARRAY(
-            SCHEDULER_CORE_TYPE_COUNT * SCHEDULER_WORKER_CAPACITY, SchedulerReadyInbox, ready_inboxes_offset
+            SCHEDULER_READY_QUEUE_COUNT * SCHEDULER_WORKER_CAPACITY, SchedulerReadyInbox, ready_inboxes_offset
         ) ||
         !SCHEDULER_RESERVE_ARRAY(SCHEDULER_CAPACITY, SchedulerReadyOwnerState, ready_owner_states_offset) ||
         !scheduler_layout_reserve(
@@ -1417,7 +1445,7 @@ inline bool scheduler_plan_layout(
             SCHEDULER_GANG_COHORT_COUNT * SCHEDULER_CLUSTER_CAPACITY, SchedulerGangParticipant, gang_participants_offset
         ) ||
         !SCHEDULER_RESERVE_ARRAY(SCHEDULER_CLUSTER_CAPACITY, SchedulerGangCommand, gang_commands_offset) ||
-        !SCHEDULER_RESERVE_ARRAY(task_count, SchedulerTaskTrace, trace_cells_offset) ||
+        !SCHEDULER_RESERVE_ARRAY(trace_cell_count, SchedulerTaskTrace, trace_cells_offset) ||
         (enable_activity_profiling &&
          !SCHEDULER_RESERVE_ARRAY(SCHEDULER_CLUSTER_CAPACITY, SchedulerActivityBuffer, activity_buffers_offset)) ||
         !scheduler_layout_checked_align(cursor, SCHEDULER_STATE_ALIGNMENT, &next.total_size)) {
@@ -1445,11 +1473,11 @@ inline bool scheduler_init_data_from_layout(void *base, const AicoreSchedulerLay
         slots[i].publication = static_cast<uint64_t>(SchedulerDispatchSlotState::EMPTY);
     }
     auto *ready = scheduler_state_at<SchedulerReadyInbox>(base, layout.ready_inboxes_offset);
-    for (uint64_t i = 0; i < SCHEDULER_CORE_TYPE_COUNT * SCHEDULER_WORKER_CAPACITY; ++i)
+    for (uint64_t i = 0; i < SCHEDULER_READY_QUEUE_COUNT * SCHEDULER_WORKER_CAPACITY; ++i)
         ready[i].head = SCHEDULER_INBOX_EMPTY;
     auto *ready_owners = scheduler_state_at<SchedulerReadyOwnerState>(base, layout.ready_owner_states_offset);
     for (uint64_t owner = 0; owner < SCHEDULER_CAPACITY; ++owner) {
-        for (uint32_t type = 0; type < SCHEDULER_CORE_TYPE_COUNT; ++type)
+        for (uint32_t type = 0; type < SCHEDULER_READY_QUEUE_COUNT; ++type)
             ready_owners[owner].queues[type].pending_endpoints = SCHEDULER_READY_PENDING_EMPTY;
     }
     auto *contexts = scheduler_state_at<SchedulerWorkerContext>(base, layout.worker_contexts_offset);

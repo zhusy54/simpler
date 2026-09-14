@@ -46,7 +46,7 @@ struct AicoreSchedulerLayout {
     uint64_t gang_commands_offset;
     uint64_t executable_task_count;
     uint64_t executable_subtask_count;
-    uint64_t gang_task_count;
+    uint64_t mix_task_count;
     uint64_t aic_worker_demand;
     uint64_t aiv_worker_demand;
 };

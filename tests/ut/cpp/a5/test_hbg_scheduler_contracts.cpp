@@ -24,6 +24,7 @@
 #include "aicore_scheduler_error.h"
 #include "aicore_scheduler_state.h"
 #include "scheduler/scheduler_graph.h"
+#include "scheduler/scheduler_ready.h"
 #include "scheduler/scheduler_topology.h"
 #include "scheduler/scheduler_types.h"
 #include "scheduler/scheduler_watchdog.h"
@@ -67,11 +68,16 @@ TEST(AicoreSchedulerState, DistinguishesResidentAndExplicitLegacyModes) {
     EXPECT_TRUE(aicore_scheduler_runtime_mode_is_explicit_legacy(SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE));
 }
 
-TEST(AicoreSchedulerState, ResidentV0AcceptsOnlySingleLaneSingleBlockTasks) {
+TEST(AicoreSchedulerState, ResidentV0AcceptsSingleBlockNormalAndMixTasksOnly) {
+    EXPECT_FALSE(scheduler_resident_v0_task_shape_supported(0, 1, false));
     EXPECT_TRUE(scheduler_resident_v0_task_shape_supported(1, 1, false));
-    EXPECT_FALSE(scheduler_resident_v0_task_shape_supported(2, 1, false));
+    EXPECT_TRUE(scheduler_resident_v0_task_shape_supported(2, 1, false));
+    EXPECT_TRUE(scheduler_resident_v0_task_shape_supported(3, 1, false));
+    EXPECT_FALSE(scheduler_resident_v0_task_shape_supported(4, 1, false));
     EXPECT_FALSE(scheduler_resident_v0_task_shape_supported(1, 2, false));
+    EXPECT_FALSE(scheduler_resident_v0_task_shape_supported(3, 2, false));
     EXPECT_FALSE(scheduler_resident_v0_task_shape_supported(1, 1, true));
+    EXPECT_FALSE(scheduler_resident_v0_task_shape_supported(3, 1, true));
 }
 
 TEST(AicoreSchedulerWatchdog, UsesElapsedWallClockBudget) {
@@ -189,11 +195,11 @@ TEST(SchedulerState, PlansAndInitializesReadyState) {
         EXPECT_EQ(completion[worker].completed_generations[1], 0u);
     }
     auto *ready = scheduler_state_at<SchedulerReadyInbox>(storage.base(), layout.ready_inboxes_offset);
-    for (uint64_t inbox = 0; inbox < SCHEDULER_CORE_TYPE_COUNT * SCHEDULER_WORKER_CAPACITY; ++inbox)
+    for (uint64_t inbox = 0; inbox < SCHEDULER_READY_QUEUE_COUNT * SCHEDULER_WORKER_CAPACITY; ++inbox)
         EXPECT_EQ(ready[inbox].head, SCHEDULER_INBOX_EMPTY);
     auto *ready_owners = scheduler_state_at<SchedulerReadyOwnerState>(storage.base(), layout.ready_owner_states_offset);
     for (uint64_t owner = 0; owner < SCHEDULER_CLUSTER_CAPACITY; ++owner) {
-        for (uint32_t type = 0; type < SCHEDULER_CORE_TYPE_COUNT; ++type)
+        for (uint32_t type = 0; type < SCHEDULER_READY_QUEUE_COUNT; ++type)
             EXPECT_EQ(ready_owners[owner].queues[type].pending_endpoints, SCHEDULER_READY_PENDING_EMPTY);
     }
 
@@ -203,6 +209,19 @@ TEST(SchedulerState, PlansAndInitializesReadyState) {
     auto aiv_shard0 = reinterpret_cast<uintptr_t>(&directory->core_types[1][0]);
     EXPECT_EQ(shard1 - shard0, 64u);
     EXPECT_EQ(aiv_shard0 - shard0, SCHEDULER_READY_DIRECTORY_SHARD_COUNT * 64u);
+}
+
+TEST(SchedulerMetadata, RoutesOnlyLightweightMixToTheDedicatedQueue) {
+    EXPECT_EQ(scheduler_metadata_ready_queue_index(1, SCHEDULER_TASK_EXECUTABLE), 0u);
+    EXPECT_EQ(scheduler_metadata_ready_queue_index(2, SCHEDULER_TASK_EXECUTABLE), 1u);
+    EXPECT_EQ(
+        scheduler_metadata_ready_queue_index(7, SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_MIX),
+        SCHEDULER_MIX_READY_QUEUE
+    );
+    EXPECT_EQ(
+        scheduler_metadata_ready_queue_index(7, SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_MIX | SCHEDULER_TASK_SPMD),
+        UINT32_MAX
+    );
 }
 
 TEST(SchedulerState, PreservesCacheLineAlignmentAndArrayStride) {

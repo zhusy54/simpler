@@ -153,17 +153,25 @@ static void publish_aicore_task_timing(Runtime *runtime) {
 
     auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(scheduler_state_base, context->task_metadata_offset);
     auto *traces = scheduler_state_at<SchedulerTaskTrace>(scheduler_state_base, context->trace_cells_offset);
+    auto *run_control = aicore_scheduler_run_control(context);
+    if (run_control == nullptr) return;
     cache_invalidate_range(metadata, static_cast<size_t>(context->graph_task_count) * sizeof(*metadata));
-    cache_invalidate_range(traces, static_cast<size_t>(context->graph_task_count) * sizeof(*traces));
+    cache_invalidate_range(traces, static_cast<size_t>(run_control->executable_subtask_count) * sizeof(*traces));
 
     for (uint64_t task_id = 0; task_id < context->graph_task_count; ++task_id) {
         const int32_t slot = metadata[task_id].timing_slot;
         if (slot < 0 || slot >= NUM_TASK_TIMING_SLOTS) continue;
-        const uint64_t start = traces[task_id].kernel_start_cycles;
-        const uint64_t end = traces[task_id].kernel_end_cycles;
-        if (start == 0 || end <= start) continue;
-        if (start < records[slot].dispatch_cycle) records[slot].dispatch_cycle = start;
-        if (end > records[slot].finish_cycle) records[slot].finish_cycle = end;
+        for (uint8_t subtask_slot = 0; subtask_slot < 3; ++subtask_slot) {
+            const uint32_t trace_offset =
+                scheduler_task_trace_subtask_offset(metadata[task_id].active_mask, subtask_slot);
+            if (trace_offset == UINT32_MAX) continue;
+            const SchedulerTaskTrace &trace = traces[metadata[task_id].trace_index_base + trace_offset];
+            const uint64_t start = trace.kernel_start_cycles;
+            const uint64_t end = trace.kernel_end_cycles;
+            if (start == 0 || end <= start) continue;
+            if (start < records[slot].dispatch_cycle) records[slot].dispatch_cycle = start;
+            if (end > records[slot].finish_cycle) records[slot].finish_cycle = end;
+        }
     }
     aicpu_publish_task_timing_tail_usage(1);
 }

@@ -19,7 +19,7 @@
 #include <stdexcept>
 #include <vector>
 
-#include "scheduler/scheduler_dispatch.h"
+#include "scheduler/scheduler_mix.h"
 #include "runtime_types.h"
 
 namespace {
@@ -145,7 +145,7 @@ struct FixtureStorage {
             metadata[task].kernel_ids[2] = UINT16_MAX;
             metadata[task].active_mask = 1;
             metadata[task].logical_block_num = 1;
-            metadata[task].total_required_subtasks = 1;
+            metadata[task].trace_index_base = static_cast<uint16_t>(task);
             metadata[task].flags = SCHEDULER_TASK_EXECUTABLE;
             metadata[task].timing_slot = -1;
         }
@@ -185,6 +185,59 @@ void configure_normal_aiv_cluster(FixtureStorage &storage, uint64_t task_count) 
         storage.metadata[task].active_mask = 2;
         storage.metadata[task].flags = SCHEDULER_TASK_EXECUTABLE;
     }
+}
+
+SchedulerWorkerContext &configure_mix_cluster(FixtureStorage &storage, uint64_t task_count, uint8_t active_mask) {
+    EXPECT_GE(storage.run_control->aiv_active_worker_count, 3u);
+    storage.contexts[0].core_type = static_cast<int32_t>(CoreType::AIC);
+    storage.contexts[1].core_type = static_cast<int32_t>(CoreType::AIV);
+    storage.contexts[2].core_type = static_cast<int32_t>(CoreType::AIV);
+    SchedulerWorkerContext &scheduler = storage.contexts[2];
+    scheduler.is_scheduler = 1;
+    scheduler.scheduler_index = 0;
+    scheduler.scheduler_count = 1;
+    scheduler.inbox_index = 0;
+    scheduler.cluster_worker_ids[0] = 0;
+    scheduler.cluster_worker_ids[1] = 1;
+    scheduler.cluster_worker_ids[2] = 2;
+    storage.run_control->scheduler_count = 1;
+    auto *callables =
+        scheduler_state_at<uint64_t>(storage.scheduler_state->base(), storage.layout.callable_addresses_offset);
+    callables[1] = UINT64_C(0x1000);
+    for (uint64_t worker = 0; worker < 3; ++worker) {
+        for (uint32_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot)
+            scheduler_initialize_free_slot(
+                scheduler_dispatch_slot_at(storage.scheduler_state->base(), &scheduler, worker, slot)
+            );
+    }
+    for (uint64_t task = 0; task < task_count; ++task) {
+        storage.metadata[task].kernel_ids[0] = (active_mask & 1U) != 0 ? 1 : UINT16_MAX;
+        storage.metadata[task].kernel_ids[1] = (active_mask & 2U) != 0 ? 1 : UINT16_MAX;
+        storage.metadata[task].kernel_ids[2] = (active_mask & 4U) != 0 ? 1 : UINT16_MAX;
+        storage.metadata[task].active_mask = active_mask;
+        storage.metadata[task].flags = SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_MIX;
+        storage.metadata[task].logical_block_num = 1;
+        storage.metadata[task].trace_index_base =
+            static_cast<uint16_t>(task * static_cast<uint64_t>(__builtin_popcount(active_mask)));
+        auto *control =
+            scheduler_task_control_at(storage.scheduler_state->base(), &scheduler, static_cast<int64_t>(task));
+        control->state = static_cast<int64_t>(SchedulerTaskState::READY);
+    }
+    return scheduler;
+}
+
+void enqueue_mix_tasks(
+    FixtureStorage &storage, SchedulerWorkerContext &scheduler, uint64_t task_begin, uint64_t task_end
+) {
+    SchedulerReadyBatch batch{};
+    for (uint64_t task = task_begin; task < task_end; ++task)
+        ASSERT_TRUE(scheduler_ready_batch_append(
+            storage.scheduler_state->base(), &scheduler, static_cast<int64_t>(task), &batch, nullptr
+        ));
+    ASSERT_TRUE(scheduler_ready_batch_push(
+        storage.scheduler_state->base(), &scheduler, SCHEDULER_MIX_READY_QUEUE, scheduler.inbox_index, &batch, nullptr,
+        &storage.owner_states[scheduler.inbox_index]
+    ));
 }
 
 void enqueue_normal_aiv_tasks(
@@ -325,7 +378,7 @@ TEST(SchedulerClusterCompletion, RejectsStaleCompletionGenerationAtNamedSite) {
     );
 }
 
-TEST(SchedulerClusterCompletion, RejectsUnexpectedGangSlotAtNamedSite) {
+TEST(SchedulerClusterCompletion, RejectsMixSlotWithoutLocalTrackerAtNamedSite) {
     FixtureStorage storage(1, 3);
     GraphBuffer graph(1);
     graph.executable(0, 0);
@@ -349,7 +402,124 @@ TEST(SchedulerClusterCompletion, RejectsUnexpectedGangSlotAtNamedSite) {
         &storage.owner_states[scheduler.inbox_index]
     ));
     EXPECT_EQ(
-        storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::COMPLETION_UNEXPECTED_GANG_SLOT)
+        storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::MIX_COMPLETION_INVALID_TRACKER)
+    );
+}
+
+TEST(SchedulerMixDispatch, PublishesAllActiveLanesFromDedicatedQueue) {
+    FixtureStorage storage(1, 3);
+    GraphBuffer graph(1);
+    graph.mixed(0, 7);
+    SchedulerWorkerContext &scheduler = configure_mix_cluster(storage, 1, 7);
+    enqueue_mix_tasks(storage, scheduler, 0, 1);
+    SchedulerMixState state{};
+    scheduler_mix_state_init(&state, 0, 1);
+    bool progress = false;
+
+    const bool service_ok = scheduler_service_mix_event(
+        graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, &state, nullptr, 0,
+        &storage.owner_states[0], &progress
+    );
+    ASSERT_TRUE(service_ok) << "error_site=" << storage.run_control->error_site;
+    EXPECT_TRUE(progress);
+    EXPECT_LT(state.pending.ready.task_id, 0);
+    EXPECT_FALSE(state.probe_requested);
+    for (uint32_t lane = 0; lane < 3; ++lane) {
+        auto *slot = scheduler_dispatch_slot_at(storage.scheduler_state->base(), &scheduler, lane, 0);
+        EXPECT_EQ(scheduler_dispatch_state(slot->publication), SchedulerDispatchSlotState::READY);
+        EXPECT_EQ(slot->task_id, 0);
+        EXPECT_EQ(slot->subtask_slot, lane);
+        EXPECT_EQ(slot->gang, 1);
+        EXPECT_EQ(slot->cohort_index, 0);
+    }
+    EXPECT_EQ(state.trackers[0].task_id, 0);
+    EXPECT_EQ(state.trackers[0].active_mask, 7u);
+}
+
+TEST(SchedulerMixDispatch, PendingClaimBlocksOnlyItsTargetLanes) {
+    FixtureStorage storage(1, 3);
+    GraphBuffer graph(1);
+    graph.mixed(0, 3);
+    SchedulerWorkerContext &scheduler = configure_mix_cluster(storage, 1, 3);
+    for (uint32_t slot_index = 0; slot_index < SCHEDULER_PENDING_SLOT_COUNT; ++slot_index)
+        occupy_normal_slot(storage, scheduler, 0, slot_index, 7 + slot_index);
+    enqueue_mix_tasks(storage, scheduler, 0, 1);
+    SchedulerMixState state{};
+    scheduler_mix_state_init(&state, 0, 1);
+
+    const bool service_ok = scheduler_service_mix_event(
+        graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, &state, nullptr, 0,
+        &storage.owner_states[0], nullptr
+    );
+    ASSERT_TRUE(service_ok) << "error_site=" << storage.run_control->error_site;
+    ASSERT_EQ(state.pending.ready.task_id, 0);
+    EXPECT_EQ(scheduler_mix_pending_skip_mask(&state), UINT64_C(0x0f));
+    for (uint32_t slot_index = 0; slot_index < SCHEDULER_PENDING_SLOT_COUNT; ++slot_index) {
+        auto *unused_lane_slot = scheduler_dispatch_slot_at(storage.scheduler_state->base(), &scheduler, 2, slot_index);
+        EXPECT_EQ(scheduler_dispatch_state(unused_lane_slot->publication), SchedulerDispatchSlotState::FREE);
+    }
+}
+
+TEST(SchedulerMixDispatch, EmptyQueueMissSleepsUntilRearmedByAnEvent) {
+    FixtureStorage storage(1, 3);
+    GraphBuffer graph(1);
+    graph.mixed(0, 7);
+    SchedulerWorkerContext &scheduler = configure_mix_cluster(storage, 1, 7);
+    SchedulerMixState state{};
+    scheduler_mix_state_init(&state, 0, 1);
+
+    ASSERT_TRUE(scheduler_service_mix_event(
+        graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, &state, nullptr, 0,
+        &storage.owner_states[0], nullptr
+    ));
+    ASSERT_FALSE(state.probe_requested);
+    storage.owner_states[0].queues[SCHEDULER_MIX_READY_QUEUE].pending_endpoints = 0;
+    EXPECT_TRUE(scheduler_service_mix_event(
+        graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, &state, nullptr, 0,
+        &storage.owner_states[0], nullptr
+    ));
+    EXPECT_EQ(state.pending.ready.task_id, SCHEDULER_TASK_ID_INVALID);
+    EXPECT_EQ(state.trackers[0].task_id, SCHEDULER_TASK_ID_INVALID);
+    EXPECT_EQ(storage.owner_states[0].queues[SCHEDULER_MIX_READY_QUEUE].pending_endpoints, 0u);
+}
+
+TEST(SchedulerMixCompletion, ResolvesOnlyAfterEveryLaneCompletes) {
+    FixtureStorage storage(1, 3);
+    GraphBuffer graph(1);
+    graph.mixed(0, 3);
+    SchedulerWorkerContext &scheduler = configure_mix_cluster(storage, 1, 3);
+    enqueue_mix_tasks(storage, scheduler, 0, 1);
+    SchedulerMixState state{};
+    scheduler_mix_state_init(&state, 0, 1);
+    ASSERT_TRUE(scheduler_service_mix_event(
+        graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, &state, nullptr, 0,
+        &storage.owner_states[0], nullptr
+    ));
+    auto *aic_slot = scheduler_dispatch_slot_at(storage.scheduler_state->base(), &scheduler, 0, 0);
+    auto *aiv_slot = scheduler_dispatch_slot_at(storage.scheduler_state->base(), &scheduler, 1, 0);
+
+    ASSERT_TRUE(scheduler_service_cluster_completion_slot(
+        graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, 1, 0, aiv_slot->generation,
+        nullptr, nullptr, nullptr, nullptr, 0, nullptr, nullptr, &storage.owner_states[0], state.trackers,
+        SCHEDULER_READY_QUEUE_COUNT
+    ));
+    EXPECT_EQ(storage.run_control->resolved_task_count, 0u);
+    EXPECT_EQ(state.trackers[0].completed_mask, 2u);
+    EXPECT_EQ(
+        scheduler_task_control_at(storage.scheduler_state->base(), &scheduler, 0)->state,
+        static_cast<int64_t>(SchedulerTaskState::READY)
+    );
+
+    ASSERT_TRUE(scheduler_service_cluster_completion_slot(
+        graph.graph(), storage.scheduler_state->base(), &scheduler, storage.run_control, 0, 0, aic_slot->generation,
+        nullptr, nullptr, nullptr, nullptr, 0, nullptr, nullptr, &storage.owner_states[0], state.trackers,
+        SCHEDULER_READY_QUEUE_COUNT
+    ));
+    EXPECT_EQ(storage.run_control->resolved_task_count, 1u);
+    EXPECT_EQ(state.trackers[0].task_id, SCHEDULER_TASK_ID_INVALID);
+    EXPECT_EQ(
+        scheduler_task_control_at(storage.scheduler_state->base(), &scheduler, 0)->state,
+        static_cast<int64_t>(SchedulerTaskState::DONE)
     );
 }
 

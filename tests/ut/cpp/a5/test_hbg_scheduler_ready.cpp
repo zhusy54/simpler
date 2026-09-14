@@ -159,7 +159,7 @@ struct FixtureStorage {
             metadata[task].kernel_ids[2] = UINT16_MAX;
             metadata[task].active_mask = 1;
             metadata[task].logical_block_num = 1;
-            metadata[task].total_required_subtasks = 1;
+            metadata[task].trace_index_base = static_cast<uint16_t>(task);
             metadata[task].flags = SCHEDULER_TASK_EXECUTABLE;
         }
     }
@@ -428,7 +428,7 @@ TEST(SchedulerReadyInbox, OwnerStateInitializationRestoresEmptySentinels) {
 
     scheduler_ready_owner_init(&owner_state);
 
-    for (uint32_t type = 0; type < SCHEDULER_CORE_TYPE_COUNT; ++type) {
+    for (uint32_t type = 0; type < SCHEDULER_READY_QUEUE_COUNT; ++type) {
         EXPECT_EQ(owner_state.queues[type].pending_endpoints, SCHEDULER_READY_PENDING_EMPTY);
         EXPECT_EQ(owner_state.queues[type].advertised, 0u);
     }

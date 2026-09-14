@@ -86,7 +86,7 @@ inline __aicore__ bool scheduler_ready_pending_endpoint_fits(int64_t task_id) {
 
 inline __aicore__ void scheduler_ready_owner_init(__gm__ SchedulerReadyOwnerState *owner_state) {
     if (owner_state == nullptr) return;
-    for (uint32_t type = 0; type < SCHEDULER_CORE_TYPE_COUNT; ++type) {
+    for (uint32_t type = 0; type < SCHEDULER_READY_QUEUE_COUNT; ++type) {
         scheduler_gm_store(owner_state->queues[type].pending_endpoints, SCHEDULER_READY_PENDING_EMPTY);
         scheduler_gm_store(owner_state->queues[type].advertised, UINT64_C(0));
     }
@@ -128,6 +128,12 @@ inline __aicore__ uint8_t scheduler_metadata_single_subtask_slot(uint8_t active_
     if (active_mask == 1U) return 0;
     if (active_mask == 2U) return 1;
     return UINT8_MAX;
+}
+
+inline __aicore__ uint32_t scheduler_metadata_ready_queue_index(uint8_t active_mask, uint8_t flags) {
+    if (scheduler_task_is_mix(flags) && !scheduler_task_is_spmd(flags)) return SCHEDULER_MIX_READY_QUEUE;
+    const uint8_t subtask_slot = scheduler_metadata_single_subtask_slot(active_mask);
+    return subtask_slot == UINT8_MAX ? UINT32_MAX : scheduler_metadata_core_type_index(subtask_slot);
 }
 
 inline __aicore__ SchedulerPredicateResult
@@ -207,6 +213,34 @@ inline __aicore__ __gm__ SchedulerTaskMetadata *scheduler_task_metadata_at(
         scheduler_state_base,
         context->task_metadata_offset + static_cast<uint64_t>(task_id) * sizeof(SchedulerTaskMetadata)
     );
+}
+
+inline __aicore__ __gm__ SchedulerTaskTrace *scheduler_task_trace_at(
+    __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *context,
+    __gm__ const SchedulerTaskMetadata *metadata, uint8_t subtask_slot
+) {
+    const uint32_t offset = scheduler_task_trace_subtask_offset(metadata->active_mask, subtask_slot);
+    if (offset == UINT32_MAX) return nullptr;
+    __gm__ SchedulerTaskTrace *traces =
+        scheduler_state_at<SchedulerTaskTrace>(scheduler_state_base, context->trace_cells_offset);
+    return &traces[static_cast<uint32_t>(metadata->trace_index_base) + offset];
+}
+
+inline __aicore__ void scheduler_task_traces_set_ready_transition(
+    __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *context, int64_t task_id, bool publish
+) {
+    __gm__ SchedulerTaskMetadata *metadata = scheduler_task_metadata_at(scheduler_state_base, context, task_id);
+    scheduler_observe_cache_line(metadata);
+    const uint64_t cycles = scheduler_cycles();
+    for (uint8_t subtask_slot = 0; subtask_slot < 3; ++subtask_slot) {
+        if ((metadata->active_mask & (1U << subtask_slot)) == 0) continue;
+        __gm__ SchedulerTaskTrace *trace =
+            scheduler_task_trace_at(scheduler_state_base, context, metadata, subtask_slot);
+        if (publish) scheduler_observe_cache_line(&trace->ready_transition_cycles);
+        trace->ready_transition_cycles = cycles;
+        if (publish) scheduler_publish_cache_line(&trace->ready_transition_cycles);
+        else scheduler_writeback_cache_line(&trace->ready_transition_cycles);
+    }
 }
 
 inline __aicore__ __gm__ SchedulerCompletionInbox *scheduler_completion_inbox_at(
@@ -496,10 +530,7 @@ inline __aicore__ bool scheduler_bootstrap_ready_batch_append(
     }
     batch->tail = task_id;
     if (scheduler_phase_timing_enabled(profiling_level)) {
-        __gm__ SchedulerTaskTrace *cells =
-            scheduler_state_at<SchedulerTaskTrace>(scheduler_state_base, context->trace_cells_offset);
-        cells[task_id].ready_transition_cycles = scheduler_cycles();
-        scheduler_writeback_cache_line(&cells[task_id].ready_transition_cycles);
+        scheduler_task_traces_set_ready_transition(scheduler_state_base, context, task_id, false);
     }
     ++batch->count;
     if (stats != nullptr) ++stats->enqueue_count;
@@ -511,7 +542,7 @@ inline __aicore__ bool scheduler_bootstrap_ready_batch_publish(
     uint64_t inbox_index, SchedulerReadyBatch *batch, SchedulerReadyStats *stats, uint64_t *ready_types
 ) {
     if (batch == nullptr || batch->head == SCHEDULER_INBOX_EMPTY) return true;
-    if (core_type_index >= SCHEDULER_CORE_TYPE_COUNT || inbox_index >= SCHEDULER_CAPACITY || batch->tail < 0 ||
+    if (core_type_index >= SCHEDULER_READY_QUEUE_COUNT || inbox_index >= SCHEDULER_CAPACITY || batch->tail < 0 ||
         ready_types == nullptr)
         return false;
     __gm__ SchedulerReadyInbox *inbox =
@@ -535,7 +566,7 @@ inline __aicore__ bool scheduler_bootstrap_ready_directory_publish(
     uint32_t shard_count = static_cast<uint32_t>(
         (scheduler_count + SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD - 1) / SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD
     );
-    for (uint32_t type = 0; type < SCHEDULER_CORE_TYPE_COUNT; ++type) {
+    for (uint32_t type = 0; type < SCHEDULER_READY_QUEUE_COUNT; ++type) {
         for (uint32_t shard = 0; shard < shard_count; ++shard) {
             uint64_t bits = 0;
             uint64_t shard_begin = static_cast<uint64_t>(shard) * SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD;
@@ -572,12 +603,7 @@ inline __aicore__ bool scheduler_ready_batch_append(
     }
     batch->tail = task_id;
     if (scheduler_phase_timing_enabled(profiling_level)) {
-        __gm__ SchedulerTaskTrace *cells =
-            scheduler_state_at<SchedulerTaskTrace>(scheduler_state_base, context->trace_cells_offset);
-        __gm__ SchedulerTaskTrace *trace = &cells[task_id];
-        scheduler_observe_cache_line(&trace->ready_transition_cycles);
-        trace->ready_transition_cycles = scheduler_cycles();
-        scheduler_publish_cache_line(&trace->ready_transition_cycles);
+        scheduler_task_traces_set_ready_transition(scheduler_state_base, context, task_id, true);
     }
     ++batch->count;
     if (stats != nullptr) ++stats->enqueue_count;
@@ -651,7 +677,7 @@ inline __aicore__ bool scheduler_ready_owner_maintain_type(
     __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *context, uint32_t core_type_index,
     __gm__ SchedulerReadyOwnerState *owner_state
 ) {
-    if (owner_state == nullptr || core_type_index >= SCHEDULER_CORE_TYPE_COUNT ||
+    if (owner_state == nullptr || core_type_index >= SCHEDULER_READY_QUEUE_COUNT ||
         context->inbox_index >= SCHEDULER_CAPACITY)
         return false;
     __gm__ SchedulerReadyOwnerQueue *owner_queue = &owner_state->queues[core_type_index];
@@ -693,9 +719,10 @@ inline __aicore__ bool scheduler_ready_owner_maintain_type(
 
 inline __aicore__ bool scheduler_ready_owner_maintain(
     __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *context,
-    __gm__ SchedulerReadyOwnerState *owner_state
+    __gm__ SchedulerReadyOwnerState *owner_state, uint32_t queue_count = SCHEDULER_CORE_TYPE_COUNT
 ) {
-    for (uint32_t type = 0; type < SCHEDULER_CORE_TYPE_COUNT; ++type) {
+    if (queue_count > SCHEDULER_READY_QUEUE_COUNT) return false;
+    for (uint32_t type = 0; type < queue_count; ++type) {
         if (!scheduler_ready_owner_maintain_type(scheduler_state_base, context, type, owner_state)) return false;
     }
     return true;
@@ -706,7 +733,7 @@ inline __aicore__ bool scheduler_ready_batch_push(
     uint64_t inbox_index, SchedulerReadyBatch *batch, SchedulerReadyStats *stats,
     __gm__ SchedulerReadyOwnerState *owner_state
 ) {
-    if (batch == nullptr || owner_state == nullptr || core_type_index >= SCHEDULER_CORE_TYPE_COUNT ||
+    if (batch == nullptr || owner_state == nullptr || core_type_index >= SCHEDULER_READY_QUEUE_COUNT ||
         inbox_index >= SCHEDULER_CAPACITY || inbox_index != context->inbox_index)
         return false;
     if (batch->head == SCHEDULER_INBOX_EMPTY) return true;
@@ -854,7 +881,7 @@ inline __aicore__ bool scheduler_claim_ready_for_slot(
 ) {
     if (victim_cursor == nullptr || claim == nullptr || owner_state == nullptr || scheduler_count == 0 ||
         scheduler_count > SCHEDULER_CAPACITY || context->inbox_index >= scheduler_count ||
-        core_type_index >= SCHEDULER_CORE_TYPE_COUNT)
+        core_type_index >= SCHEDULER_READY_QUEUE_COUNT)
         return false;
     *claim = {};
     if (!scheduler_ready_owner_maintain_type(scheduler_state_base, context, core_type_index, owner_state)) return false;
@@ -893,7 +920,7 @@ inline __aicore__ bool scheduler_ready_directory_nonempty(
     uint32_t core_type_index
 ) {
     if (scheduler_count == 0 || scheduler_count > SCHEDULER_CAPACITY || context->inbox_index >= scheduler_count ||
-        core_type_index >= SCHEDULER_CORE_TYPE_COUNT)
+        core_type_index >= SCHEDULER_READY_QUEUE_COUNT)
         return false;
     __gm__ SchedulerReadyDirectory *directory = scheduler_ready_directory_at(scheduler_state_base, context);
     return scheduler_load_ready_directory_shard(directory, scheduler_count, core_type_index, context->inbox_index) != 0;
@@ -933,7 +960,7 @@ inline __aicore__ bool scheduler_fill_dispatch_slot(
     metadata.active_mask = metadata_source->active_mask;
     metadata.flags = metadata_source->flags;
     metadata.logical_block_num = metadata_source->logical_block_num;
-    metadata.total_required_subtasks = metadata_source->total_required_subtasks;
+    metadata.trace_index_base = metadata_source->trace_index_base;
     metadata.timing_slot = metadata_source->timing_slot;
     const uint8_t subtask_slot = scheduler_metadata_single_subtask_slot(metadata.active_mask);
     __gm__ SchedulerWorkerContext *target =
@@ -1024,9 +1051,8 @@ inline __aicore__ bool scheduler_fill_dispatch_slot(
         scheduler_publish_cache_line(&control->next_waiter);
     }
     if (task_timing_enabled) {
-        __gm__ SchedulerTaskTrace *traces =
-            scheduler_state_at<SchedulerTaskTrace>(scheduler_state_base, scheduler->trace_cells_offset);
-        __gm__ SchedulerTaskTrace *trace = &traces[ready_claim.task_id];
+        __gm__ SchedulerTaskTrace *trace =
+            scheduler_task_trace_at(scheduler_state_base, scheduler, metadata_source, subtask_slot);
         trace->worker_id = slot_claim.worker_id;
         trace->task_id = static_cast<uint64_t>(ready_claim.task_id);
         if (phase_timing_enabled) {
@@ -1054,9 +1080,10 @@ inline __aicore__ bool scheduler_resolve_completion(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *context,
     __gm__ SchedulerRunControl *run_control, int64_t task_id, SchedulerWakeStats *wake_stats,
     SchedulerReadyStats *ready_stats, SchedulerCompletionStats *completion_stats,
-    __gm__ SchedulerReadyOwnerState *owner_state, uint64_t profiling_level = 0, bool validate_done_state = true
+    __gm__ SchedulerReadyOwnerState *owner_state, uint64_t profiling_level = 0, bool validate_done_state = true,
+    uint32_t ready_queue_count = SCHEDULER_CORE_TYPE_COUNT
 ) {
-    if (owner_state == nullptr) return false;
+    if (owner_state == nullptr || ready_queue_count > SCHEDULER_READY_QUEUE_COUNT) return false;
     __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, context, task_id);
     if (validate_done_state && scheduler_gm_query(control->state) != static_cast<int64_t>(SchedulerTaskState::DONE)) {
         scheduler_record_error(
@@ -1082,7 +1109,7 @@ inline __aicore__ bool scheduler_resolve_completion(
         return false;
     }
     if (wake_stats != nullptr) ++wake_stats->wake_close_count;
-    SchedulerReadyBatch batches[SCHEDULER_CORE_TYPE_COUNT]{};
+    SchedulerReadyBatch batches[SCHEDULER_READY_QUEUE_COUNT]{};
     while (waiter >= 0) {
         if (static_cast<uint64_t>(waiter) >= graph.task_count) {
             scheduler_record_error(
@@ -1109,32 +1136,25 @@ inline __aicore__ bool scheduler_resolve_completion(
                 );
                 return false;
             }
-            if (scheduler_task_is_gang(metadata->flags)) {
-                scheduler_publish_gang_ready(scheduler_state_base, context, waiter_control, metadata->flags);
-            } else {
-                const uint8_t subtask_slot = scheduler_metadata_single_subtask_slot(metadata->active_mask);
-                if (subtask_slot == UINT8_MAX) {
-                    scheduler_record_error(
-                        run_control, waiter, SchedulerGraphResult::UNSUPPORTED_SHAPE, &graph, context,
-                        SchedulerErrorSite::COMPLETION_INVALID_SHAPE
-                    );
-                    return false;
-                }
-                if (!scheduler_ready_batch_append(
-                        scheduler_state_base, context, waiter,
-                        &batches[scheduler_metadata_core_type_index(subtask_slot)], ready_stats, profiling_level
-                    )) {
-                    scheduler_record_error(
-                        run_control, waiter, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
-                        SchedulerErrorSite::COMPLETION_READY_APPEND_FAILED
-                    );
-                    return false;
-                }
+            const uint32_t ready_queue = scheduler_metadata_ready_queue_index(metadata->active_mask, metadata->flags);
+            if (ready_queue >= ready_queue_count ||
+                !scheduler_ready_batch_append(
+                    scheduler_state_base, context, waiter, &batches[ready_queue], ready_stats, profiling_level
+                )) {
+                scheduler_record_error(
+                    run_control, waiter,
+                    ready_queue >= ready_queue_count ? SchedulerGraphResult::UNSUPPORTED_SHAPE :
+                                                       SchedulerGraphResult::INVALID_ARGUMENTS,
+                    &graph, context,
+                    ready_queue >= ready_queue_count ? SchedulerErrorSite::COMPLETION_INVALID_SHAPE :
+                                                       SchedulerErrorSite::COMPLETION_READY_APPEND_FAILED
+                );
+                return false;
             }
         }
         waiter = next;
     }
-    for (uint32_t type = 0; type < SCHEDULER_CORE_TYPE_COUNT; ++type) {
+    for (uint32_t type = 0; type < ready_queue_count; ++type) {
         if (!scheduler_ready_batch_push(
                 scheduler_state_base, context, type, context->inbox_index, &batches[type], ready_stats, owner_state
             )) {
