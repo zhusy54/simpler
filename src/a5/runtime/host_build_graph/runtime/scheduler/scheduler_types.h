@@ -624,9 +624,10 @@ inline constexpr uint64_t SCHEDULER_WORKER_CAPACITY = 108;
 inline constexpr uint32_t SCHEDULER_PENDING_SLOT_COUNT = 2;
 inline constexpr uint32_t SCHEDULER_CALLABLE_CAPACITY = 1024;
 inline constexpr uint32_t SCHEDULER_CORE_TYPE_COUNT = 2;
+inline constexpr uint32_t SCHEDULER_READY_QUEUE_COUNT = 5;
 inline constexpr uint32_t SCHEDULER_CLUSTER_CAPACITY = SCHEDULER_WORKER_CAPACITY / 3;
 inline constexpr uint32_t SCHEDULER_CAPACITY = SCHEDULER_CLUSTER_CAPACITY;
-inline constexpr uint32_t SCHEDULER_GANG_COHORT_COUNT = 2;
+inline constexpr uint32_t SCHEDULER_COHORT_COUNT = 2;
 inline constexpr uint32_t SCHEDULER_ACTIVITY_CAPACITY = 1024;
 inline constexpr uint64_t SCHEDULER_PROFILING_TASK_TIMING_LEVEL = 1;
 inline constexpr uint64_t SCHEDULER_PROFILING_SCHEDULE_TIMING_LEVEL = 2;
@@ -671,6 +672,19 @@ enum class SchedulerReadySource : uint8_t {
 enum class SchedulerPublicationMode : uint8_t {
     DISPATCH = 0,
     REFILL = 1,
+};
+
+enum class SchedulerReadyQueueIndex : uint32_t {
+    NORMAL_AIC = 0,
+    NORMAL_AIV = 1,
+    REGULAR_SPMD_AIC = 2,
+    REGULAR_SPMD_AIV = 3,
+    REGULAR_MIX = 4,
+};
+
+enum class SchedulerCohortPolicy : uint32_t {
+    REGULAR = 0,
+    SYNC_START = 1,
 };
 
 struct SchedulerIdleRecord {
@@ -755,7 +769,7 @@ inline __aicore__ bool scheduler_task_has_predicate(uint8_t flags) {
     return (flags & SCHEDULER_TASK_HAS_PREDICATE) != 0;
 }
 
-inline __aicore__ bool scheduler_task_is_gang(uint8_t flags) {
+inline __aicore__ bool scheduler_task_is_cohort(uint8_t flags) {
     return (flags & (SCHEDULER_TASK_MIX | SCHEDULER_TASK_SPMD)) != 0;
 }
 
@@ -764,6 +778,22 @@ inline __aicore__ uint32_t scheduler_task_priority_bit(uint8_t flags) {
     if (scheduler_task_is_mix(flags)) return 2U;
     if (scheduler_task_is_spmd(flags)) return 4U;
     return 0;
+}
+
+inline __aicore__ uint32_t scheduler_task_resource_mask(uint8_t flags, uint8_t active_mask) {
+    if (scheduler_task_is_mix(flags)) return active_mask & 7U;
+    if ((active_mask & 1U) != 0) return 1U;
+    return 6U;
+}
+
+inline __aicore__ uint32_t scheduler_task_ready_queue(uint8_t flags, uint8_t active_mask) {
+    if (scheduler_task_is_mix(flags)) return static_cast<uint32_t>(SchedulerReadyQueueIndex::REGULAR_MIX);
+    if (scheduler_task_is_spmd(flags)) {
+        return (active_mask & 1U) != 0 ? static_cast<uint32_t>(SchedulerReadyQueueIndex::REGULAR_SPMD_AIC) :
+                                         static_cast<uint32_t>(SchedulerReadyQueueIndex::REGULAR_SPMD_AIV);
+    }
+    return (active_mask & 1U) != 0 ? static_cast<uint32_t>(SchedulerReadyQueueIndex::NORMAL_AIC) :
+                                     static_cast<uint32_t>(SchedulerReadyQueueIndex::NORMAL_AIV);
 }
 
 struct alignas(128) SchedulerTaskControl {
@@ -804,10 +834,10 @@ struct alignas(64) SchedulerReadyOwnerQueue {
 };
 
 struct alignas(128) SchedulerReadyOwnerState {
-    SchedulerReadyOwnerQueue queues[SCHEDULER_CORE_TYPE_COUNT];
+    SchedulerReadyOwnerQueue queues[SCHEDULER_READY_QUEUE_COUNT];
 };
 
-enum class SchedulerGangCohortState : uint64_t {
+enum class SchedulerCohortState : uint64_t {
     FREE = 0,
     DRAINING = 1,
     STAGING = 2,
@@ -815,20 +845,22 @@ enum class SchedulerGangCohortState : uint64_t {
     DISPATCHING = 4,
     EXECUTING = 5,
     RETIRING = 6,
+    CLAIMING = 7,
 };
 
-struct alignas(128) SchedulerGangCoordinator {
-    volatile uint64_t ready_priority_bits;
-    uint8_t priority_line_padding[56];
+struct alignas(128) SchedulerCohortCoordinator {
+    volatile uint64_t priority_lane_counts[3];
+    volatile uint64_t normal_dispatch_inflight[3];
+    uint8_t priority_line_padding[16];
 
     volatile uint64_t active_dispatch_cohort;
     uint64_t next_generation;
     uint64_t scan_cursor;
-    uint64_t gang_task_count;
+    uint64_t next_sync_scheduler;
+    uint64_t cohort_task_count;
     uint64_t scheduler_count;
     uint64_t cohort_count;
-    uint64_t reserved0;
-    uint64_t owner_reserved;
+    volatile uint64_t sync_ready_bits;
 
     uint64_t admitted_count;
     uint64_t sync_drain_count;
@@ -838,7 +870,7 @@ struct alignas(128) SchedulerGangCoordinator {
     uint64_t reserved[3];
 };
 
-struct alignas(128) SchedulerGangCohort {
+struct alignas(128) SchedulerCohort {
     volatile uint64_t state;
     int64_t task_id;
     uint64_t generation;
@@ -847,17 +879,21 @@ struct alignas(128) SchedulerGangCohort {
     uint64_t logical_block_num;
     uint64_t participant_count;
     uint64_t local_stride;
+    uint64_t policy;
+    uint64_t owner_scheduler;
+    uint64_t base_scheduler;
+    volatile uint64_t participant_bitmap;
+    volatile uint64_t completion_bitmap;
     uint64_t admitted_cycles;
-    uint64_t drain_complete_cycles;
-    uint64_t stage_complete_cycles;
     uint64_t dispatch_complete_cycles;
     uint64_t completion_cycles;
-    uint64_t reserved[3];
 };
 
 // One Scheduler owns one participant cell. The second line contains generation
-// tokens observed only by its parent in the binary Scheduler tree.
-struct alignas(128) SchedulerGangParticipant {
+// tokens observed only by its parent in the binary Scheduler tree. REGULAR
+// block-claim cursors occupy a separate atomic line so owner writeback of local
+// completion counters cannot overwrite a peer's cache-bypassing CAS.
+struct alignas(128) SchedulerCohortParticipant {
     volatile uint64_t config_generation;
     int64_t task_id;
     uint32_t active_mask;
@@ -866,7 +902,6 @@ struct alignas(128) SchedulerGangParticipant {
     uint32_t local_published_subtasks;
     uint32_t local_completed_subtasks;
     uint32_t block_stride;
-    uint32_t next_block[2];
     uint32_t participant_count;
     uint32_t forwarded_state;
     uint64_t forwarded_generation;
@@ -879,14 +914,18 @@ struct alignas(128) SchedulerGangParticipant {
     volatile uint64_t dispatch_subtree_token;
     volatile uint64_t completion_local_token;
     volatile uint64_t completion_subtree_token;
+    uint8_t token_line_padding[8];
+
+    volatile uint32_t next_block[2];
+    uint8_t claim_line_padding[120];
 };
 
 // Each Scheduler polls its own command line. Scheduler0 seeds the root and every
 // parent forwards transitions to two children, avoiding a globally contended
 // cohort line and bounding sync-start release skew by the tree depth.
-struct alignas(128) SchedulerGangCommand {
-    volatile uint64_t generation[SCHEDULER_GANG_COHORT_COUNT];
-    volatile uint64_t state[SCHEDULER_GANG_COHORT_COUNT];
+struct alignas(128) SchedulerCohortCommand {
+    volatile uint64_t generation[SCHEDULER_COHORT_COUNT];
+    volatile uint64_t state[SCHEDULER_COHORT_COUNT];
     uint8_t padding[96];
 };
 
@@ -896,7 +935,7 @@ struct alignas(64) SchedulerReadyDirectoryShard {
 };
 
 struct alignas(128) SchedulerReadyDirectory {
-    SchedulerReadyDirectoryShard core_types[SCHEDULER_CORE_TYPE_COUNT][SCHEDULER_READY_DIRECTORY_SHARD_COUNT];
+    SchedulerReadyDirectoryShard queues[SCHEDULER_READY_QUEUE_COUNT][SCHEDULER_READY_DIRECTORY_SHARD_COUNT];
     volatile uint64_t bootstrap_ready_types[SCHEDULER_WORKER_CAPACITY];
 };
 
@@ -932,8 +971,7 @@ struct alignas(128) SchedulerDispatchSlot {
     uint32_t block_idx;
     uint32_t cohort_generation;
     uint8_t cohort_index;
-    uint8_t gang;
-    uint8_t metadata_padding[2];
+    uint8_t metadata_padding[3];
 
     volatile uint64_t publication;
     uint8_t publication_padding[56];
@@ -964,10 +1002,10 @@ enum class SchedulerErrorSite : uint64_t {
     COMPLETION_RESOLVE_FAILED = 68,
     COMPLETION_REFILL_CLAIM_FAILED = 69,
     COMPLETION_REFILL_DISPATCH_FAILED = 70,
-    GANG_INVALID_CALLABLE = 71,
-    GANG_MATERIALIZE_FAILED = 72,
-    GANG_UNSUPPORTED_SHAPE = 73,
-    COMPLETION_INVALID_GANG_PARTICIPANT = 81,
+    COHORT_INVALID_CALLABLE = 71,
+    COHORT_MATERIALIZE_FAILED = 72,
+    COHORT_UNSUPPORTED_SHAPE = 73,
+    COMPLETION_INVALID_COHORT_PARTICIPANT = 81,
     COMPLETION_GENERATION_MISMATCH = 74,
     DEFERRED_RESERVATION_INVALID_OWNER = 75,
     DEFERRED_RESERVATION_INVALID_STATE = 76,
@@ -1001,8 +1039,8 @@ struct alignas(128) SchedulerRunControl {
     uint64_t ready_inboxes_offset;
     uint64_t ready_directory_offset;
     uint64_t aiv_worker_demand;
-    uint64_t gang_coordinator_offset;
-    uint64_t gang_cohorts_offset;
+    uint64_t cohort_coordinator_offset;
+    uint64_t cohort_cohorts_offset;
     uint64_t scheduler_count;
 
     volatile uint64_t executed_task_count;
@@ -1095,10 +1133,10 @@ struct alignas(128) SchedulerWorkerContext {
     uint64_t bootstrap_target_aiv_cycles;
     uint64_t bootstrap_timing_reserved[2];
 
-    volatile uint64_t gang_coordinator_offset;
-    volatile uint64_t gang_cohorts_offset;
-    volatile uint64_t gang_participants_offset;
-    volatile uint64_t gang_commands_offset;
+    volatile uint64_t cohort_coordinator_offset;
+    volatile uint64_t cohort_cohorts_offset;
+    volatile uint64_t cohort_participants_offset;
+    volatile uint64_t cohort_commands_offset;
     volatile uint64_t scheduler_count;
     volatile uint64_t cluster_count;
     volatile uint64_t cluster_index;
@@ -1222,20 +1260,21 @@ static_assert(sizeof(SchedulerReadyInbox) == 128, "ready inbox layout changed");
 static_assert(alignof(SchedulerReadyInbox) == 128, "ready inbox alignment changed");
 static_assert(sizeof(SchedulerReadyOwnerQueue) == 64, "ready owner queue must occupy one cache line");
 static_assert(alignof(SchedulerReadyOwnerQueue) == 64, "ready owner queue alignment changed");
-static_assert(sizeof(SchedulerReadyOwnerState) == 128, "ready owner state must occupy two cache lines");
+static_assert(sizeof(SchedulerReadyOwnerState) == 384, "ready owner state layout changed");
 static_assert(alignof(SchedulerReadyOwnerState) == 128, "ready owner state alignment changed");
-static_assert(sizeof(SchedulerGangCoordinator) == 256, "gang coordinator layout changed");
-static_assert(alignof(SchedulerGangCoordinator) == 128, "gang coordinator alignment changed");
+static_assert(sizeof(SchedulerCohortCoordinator) == 256, "cohort coordinator layout changed");
+static_assert(alignof(SchedulerCohortCoordinator) == 128, "cohort coordinator alignment changed");
 static_assert(
-    offsetof(SchedulerGangCoordinator, active_dispatch_cohort) == 64,
-    "owner-only gang state must not share the priority line"
+    offsetof(SchedulerCohortCoordinator, active_dispatch_cohort) == 64,
+    "owner-only cohort state must not share the priority line"
 );
-static_assert(sizeof(SchedulerGangCohort) == 128, "gang cohort layout changed");
-static_assert(alignof(SchedulerGangCohort) == 128, "gang cohort alignment changed");
-static_assert(sizeof(SchedulerGangParticipant) == 128, "gang participant layout changed");
-static_assert(alignof(SchedulerGangParticipant) == 128, "gang participant alignment changed");
-static_assert(sizeof(SchedulerGangCommand) == 128, "gang command layout changed");
-static_assert(alignof(SchedulerGangCommand) == 128, "gang command alignment changed");
+static_assert(sizeof(SchedulerCohort) == 128, "cohort record layout changed");
+static_assert(alignof(SchedulerCohort) == 128, "cohort record alignment changed");
+static_assert(sizeof(SchedulerCohortParticipant) == 256, "cohort participant layout changed");
+static_assert(alignof(SchedulerCohortParticipant) == 128, "cohort participant alignment changed");
+static_assert(offsetof(SchedulerCohortParticipant, next_block) == 128, "block claims need an isolated atomic line");
+static_assert(sizeof(SchedulerCohortCommand) == 128, "cohort command layout changed");
+static_assert(alignof(SchedulerCohortCommand) == 128, "cohort command alignment changed");
 static_assert(sizeof(SchedulerReadyDirectoryShard) == 64, "ready directory shard must occupy one cache line");
 static_assert(alignof(SchedulerReadyDirectoryShard) == 64, "ready directory shard alignment changed");
 static_assert(SCHEDULER_CAPACITY <= SCHEDULER_WORKER_CAPACITY, "scheduler capacity exceeds worker storage");
@@ -1245,7 +1284,7 @@ static_assert(
 );
 static_assert(
     offsetof(SchedulerReadyDirectory, bootstrap_ready_types) ==
-        SCHEDULER_CORE_TYPE_COUNT * SCHEDULER_READY_DIRECTORY_SHARD_COUNT * 64,
+        SCHEDULER_READY_QUEUE_COUNT * SCHEDULER_READY_DIRECTORY_SHARD_COUNT * 64,
     "bootstrap flags must follow the ready directory shards"
 );
 static_assert(
@@ -1278,7 +1317,7 @@ static_assert(sizeof(AicpuThreadLifecycleTrace) == 128, "AICPU lifecycle trace l
 static_assert(sizeof(SchedulerWorkerContext) == 1024, "worker context layout changed");
 static_assert(alignof(SchedulerWorkerContext) == 128, "worker context alignment changed");
 static_assert(offsetof(SchedulerWorkerContext, task_metadata_offset) == 128, "runtime offsets changed");
-static_assert(offsetof(SchedulerWorkerContext, gang_coordinator_offset) == 256, "topology offsets changed");
+static_assert(offsetof(SchedulerWorkerContext, cohort_coordinator_offset) == 256, "topology offsets changed");
 static_assert(offsetof(SchedulerWorkerContext, bootstrap_task_count) == 384, "worker stats offset changed");
 static_assert(offsetof(SchedulerWorkerContext, wake_cas_retry_count) == 512, "wake stats offset changed");
 static_assert(offsetof(SchedulerWorkerContext, completion_enqueue_cycles) == 640, "termination stats offset changed");
@@ -1323,13 +1362,15 @@ static_assert(
     std::is_standard_layout_v<SchedulerReadyOwnerState> && std::is_trivially_copyable_v<SchedulerReadyOwnerState>
 );
 static_assert(
-    std::is_standard_layout_v<SchedulerGangCoordinator> && std::is_trivially_copyable_v<SchedulerGangCoordinator>
+    std::is_standard_layout_v<SchedulerCohortCoordinator> && std::is_trivially_copyable_v<SchedulerCohortCoordinator>
 );
-static_assert(std::is_standard_layout_v<SchedulerGangCohort> && std::is_trivially_copyable_v<SchedulerGangCohort>);
+static_assert(std::is_standard_layout_v<SchedulerCohort> && std::is_trivially_copyable_v<SchedulerCohort>);
 static_assert(
-    std::is_standard_layout_v<SchedulerGangParticipant> && std::is_trivially_copyable_v<SchedulerGangParticipant>
+    std::is_standard_layout_v<SchedulerCohortParticipant> && std::is_trivially_copyable_v<SchedulerCohortParticipant>
 );
-static_assert(std::is_standard_layout_v<SchedulerGangCommand> && std::is_trivially_copyable_v<SchedulerGangCommand>);
+static_assert(
+    std::is_standard_layout_v<SchedulerCohortCommand> && std::is_trivially_copyable_v<SchedulerCohortCommand>
+);
 static_assert(
     std::is_standard_layout_v<SchedulerReadyDirectory> && std::is_trivially_copyable_v<SchedulerReadyDirectory>
 );
@@ -1406,20 +1447,21 @@ inline bool scheduler_plan_layout(
         !SCHEDULER_RESERVE_ARRAY(task_count, SchedulerTaskControl, task_controls_offset) ||
         !SCHEDULER_RESERVE_ARRAY(SCHEDULER_WORKER_CAPACITY, SchedulerCompletionInbox, completion_inboxes_offset) ||
         !SCHEDULER_RESERVE_ARRAY(
-            SCHEDULER_CORE_TYPE_COUNT * SCHEDULER_WORKER_CAPACITY, SchedulerReadyInbox, ready_inboxes_offset
+            SCHEDULER_READY_QUEUE_COUNT * SCHEDULER_WORKER_CAPACITY, SchedulerReadyInbox, ready_inboxes_offset
         ) ||
         !SCHEDULER_RESERVE_ARRAY(SCHEDULER_CAPACITY, SchedulerReadyOwnerState, ready_owner_states_offset) ||
         !scheduler_layout_reserve(
             &cursor, sizeof(SchedulerReadyDirectory), alignof(SchedulerReadyDirectory), &next.ready_directory_offset
         ) ||
         !scheduler_layout_reserve(
-            &cursor, sizeof(SchedulerGangCoordinator), alignof(SchedulerGangCoordinator), &next.gang_coordinator_offset
+            &cursor, sizeof(SchedulerCohortCoordinator), alignof(SchedulerCohortCoordinator),
+            &next.cohort_coordinator_offset
         ) ||
-        !SCHEDULER_RESERVE_ARRAY(SCHEDULER_GANG_COHORT_COUNT, SchedulerGangCohort, gang_cohorts_offset) ||
+        !SCHEDULER_RESERVE_ARRAY(SCHEDULER_COHORT_COUNT, SchedulerCohort, cohort_cohorts_offset) ||
         !SCHEDULER_RESERVE_ARRAY(
-            SCHEDULER_GANG_COHORT_COUNT * SCHEDULER_CLUSTER_CAPACITY, SchedulerGangParticipant, gang_participants_offset
+            SCHEDULER_COHORT_COUNT * SCHEDULER_CLUSTER_CAPACITY, SchedulerCohortParticipant, cohort_participants_offset
         ) ||
-        !SCHEDULER_RESERVE_ARRAY(SCHEDULER_CLUSTER_CAPACITY, SchedulerGangCommand, gang_commands_offset) ||
+        !SCHEDULER_RESERVE_ARRAY(SCHEDULER_CLUSTER_CAPACITY, SchedulerCohortCommand, cohort_commands_offset) ||
         !SCHEDULER_RESERVE_ARRAY(task_count, SchedulerTaskTrace, trace_cells_offset) ||
         (enable_activity_profiling &&
          !SCHEDULER_RESERVE_ARRAY(SCHEDULER_CLUSTER_CAPACITY, SchedulerActivityBuffer, activity_buffers_offset)) ||
@@ -1445,14 +1487,15 @@ inline bool scheduler_init_data_from_layout(void *base, const AicoreSchedulerLay
     auto *slots = scheduler_state_at<SchedulerDispatchSlot>(base, layout.dispatch_slots_offset);
     for (uint64_t i = 0; i < SCHEDULER_WORKER_CAPACITY * SCHEDULER_PENDING_SLOT_COUNT; ++i) {
         slots[i].task_id = SCHEDULER_TASK_ID_INVALID;
+        slots[i].cohort_index = UINT8_MAX;
         slots[i].publication = static_cast<uint64_t>(SchedulerDispatchSlotState::EMPTY);
     }
     auto *ready = scheduler_state_at<SchedulerReadyInbox>(base, layout.ready_inboxes_offset);
-    for (uint64_t i = 0; i < SCHEDULER_CORE_TYPE_COUNT * SCHEDULER_WORKER_CAPACITY; ++i)
+    for (uint64_t i = 0; i < SCHEDULER_READY_QUEUE_COUNT * SCHEDULER_WORKER_CAPACITY; ++i)
         ready[i].head = SCHEDULER_INBOX_EMPTY;
     auto *ready_owners = scheduler_state_at<SchedulerReadyOwnerState>(base, layout.ready_owner_states_offset);
     for (uint64_t owner = 0; owner < SCHEDULER_CAPACITY; ++owner) {
-        for (uint32_t type = 0; type < SCHEDULER_CORE_TYPE_COUNT; ++type)
+        for (uint32_t type = 0; type < SCHEDULER_READY_QUEUE_COUNT; ++type)
             ready_owners[owner].queues[type].pending_endpoints = SCHEDULER_READY_PENDING_EMPTY;
     }
     auto *contexts = scheduler_state_at<SchedulerWorkerContext>(base, layout.worker_contexts_offset);
@@ -1466,16 +1509,16 @@ inline bool scheduler_init_data_from_layout(void *base, const AicoreSchedulerLay
         contexts[worker].cluster_worker_ids[1] = UINT64_MAX;
         contexts[worker].cluster_worker_ids[2] = UINT64_MAX;
     }
-    auto *coordinator = scheduler_state_at<SchedulerGangCoordinator>(base, layout.gang_coordinator_offset);
+    auto *coordinator = scheduler_state_at<SchedulerCohortCoordinator>(base, layout.cohort_coordinator_offset);
     coordinator->active_dispatch_cohort = UINT64_MAX;
-    coordinator->cohort_count = SCHEDULER_GANG_COHORT_COUNT;
-    auto *cohorts = scheduler_state_at<SchedulerGangCohort>(base, layout.gang_cohorts_offset);
-    for (uint32_t i = 0; i < SCHEDULER_GANG_COHORT_COUNT; ++i) {
-        cohorts[i].state = static_cast<uint64_t>(SchedulerGangCohortState::FREE);
+    coordinator->cohort_count = SCHEDULER_COHORT_COUNT;
+    auto *cohorts = scheduler_state_at<SchedulerCohort>(base, layout.cohort_cohorts_offset);
+    for (uint32_t i = 0; i < SCHEDULER_COHORT_COUNT; ++i) {
+        cohorts[i].state = static_cast<uint64_t>(SchedulerCohortState::FREE);
         cohorts[i].task_id = SCHEDULER_TASK_ID_INVALID;
     }
-    auto *participants = scheduler_state_at<SchedulerGangParticipant>(base, layout.gang_participants_offset);
-    for (uint32_t i = 0; i < SCHEDULER_GANG_COHORT_COUNT * SCHEDULER_CLUSTER_CAPACITY; ++i)
+    auto *participants = scheduler_state_at<SchedulerCohortParticipant>(base, layout.cohort_participants_offset);
+    for (uint32_t i = 0; i < SCHEDULER_COHORT_COUNT * SCHEDULER_CLUSTER_CAPACITY; ++i)
         participants[i].task_id = SCHEDULER_TASK_ID_INVALID;
     return true;
 }

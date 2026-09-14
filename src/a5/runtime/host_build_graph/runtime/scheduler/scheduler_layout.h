@@ -40,13 +40,13 @@ struct AicoreSchedulerLayout {
     uint64_t ready_directory_offset;
     uint64_t trace_cells_offset;
     uint64_t activity_buffers_offset;
-    uint64_t gang_coordinator_offset;
-    uint64_t gang_cohorts_offset;
-    uint64_t gang_participants_offset;
-    uint64_t gang_commands_offset;
+    uint64_t cohort_coordinator_offset;
+    uint64_t cohort_cohorts_offset;
+    uint64_t cohort_participants_offset;
+    uint64_t cohort_commands_offset;
     uint64_t executable_task_count;
     uint64_t executable_subtask_count;
-    uint64_t gang_task_count;
+    uint64_t cohort_task_count;
     uint64_t aic_worker_demand;
     uint64_t aiv_worker_demand;
 };

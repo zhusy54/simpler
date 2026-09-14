@@ -67,11 +67,15 @@ TEST(AicoreSchedulerState, DistinguishesResidentAndExplicitLegacyModes) {
     EXPECT_TRUE(aicore_scheduler_runtime_mode_is_explicit_legacy(SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE));
 }
 
-TEST(AicoreSchedulerState, ResidentV0AcceptsOnlySingleLaneSingleBlockTasks) {
+TEST(AicoreSchedulerState, ResidentV0AcceptsRegularAndSyncStartCohortShapes) {
     EXPECT_TRUE(scheduler_resident_v0_task_shape_supported(1, 1, false));
-    EXPECT_FALSE(scheduler_resident_v0_task_shape_supported(2, 1, false));
-    EXPECT_FALSE(scheduler_resident_v0_task_shape_supported(1, 2, false));
+    EXPECT_TRUE(scheduler_resident_v0_task_shape_supported(2, 1, false));
+    EXPECT_TRUE(scheduler_resident_v0_task_shape_supported(1, 2, false));
+    EXPECT_TRUE(scheduler_resident_v0_task_shape_supported(3, 2, true));
     EXPECT_FALSE(scheduler_resident_v0_task_shape_supported(1, 1, true));
+    EXPECT_FALSE(scheduler_resident_v0_task_shape_supported(0, 1, false));
+    EXPECT_FALSE(scheduler_resident_v0_task_shape_supported(4, 1, false));
+    EXPECT_FALSE(scheduler_resident_v0_task_shape_supported(1, 0, false));
 }
 
 TEST(AicoreSchedulerWatchdog, UsesElapsedWallClockBudget) {
@@ -198,9 +202,9 @@ TEST(SchedulerState, PlansAndInitializesReadyState) {
     }
 
     auto *directory = scheduler_state_at<SchedulerReadyDirectory>(storage.base(), layout.ready_directory_offset);
-    auto shard0 = reinterpret_cast<uintptr_t>(&directory->core_types[0][0]);
-    auto shard1 = reinterpret_cast<uintptr_t>(&directory->core_types[0][1]);
-    auto aiv_shard0 = reinterpret_cast<uintptr_t>(&directory->core_types[1][0]);
+    auto shard0 = reinterpret_cast<uintptr_t>(&directory->queues[0][0]);
+    auto shard1 = reinterpret_cast<uintptr_t>(&directory->queues[0][1]);
+    auto aiv_shard0 = reinterpret_cast<uintptr_t>(&directory->queues[1][0]);
     EXPECT_EQ(shard1 - shard0, 64u);
     EXPECT_EQ(aiv_shard0 - shard0, SCHEDULER_READY_DIRECTORY_SHARD_COUNT * 64u);
 }

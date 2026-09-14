@@ -68,7 +68,7 @@ __aicore__ __attribute__((always_inline)) void execute_task(__gm__ DispatchPaylo
 
 __aicore__ __attribute__((always_inline)) bool
 should_commit_scheduler_trace(__gm__ void *, __gm__ SchedulerWorkerContext *, __gm__ SchedulerDispatchSlot *slot) {
-    return slot->gang == 0;
+    return slot->cohort_index == UINT8_MAX;
 }
 
 __aicore__ __attribute__((always_inline)) void local_backoff(uint32_t iterations) {
@@ -165,7 +165,7 @@ __aicore__ bool bootstrap_ready_graph(
     if (scheduler_count == 0 || scheduler->inbox_index >= scheduler_count || ready_owner == nullptr) return false;
     const bool phase_timing_enabled = scheduler_phase_timing_enabled(profiling_level);
     if (phase_timing_enabled) stats->bootstrap_start_cycles = scheduler_cycles();
-    SchedulerReadyBatch batches[SCHEDULER_CORE_TYPE_COUNT]{};
+    SchedulerReadyBatch batches[SCHEDULER_READY_QUEUE_COUNT]{};
     uint64_t tasks_per_scheduler = graph.task_count / scheduler_count;
     uint64_t remainder = graph.task_count % scheduler_count;
     uint64_t task_begin = scheduler->inbox_index * tasks_per_scheduler +
@@ -184,20 +184,31 @@ __aicore__ bool bootstrap_ready_graph(
                         ) :
                         SchedulerRouteResult::READY_TO_ENQUEUE;
         if (route == SchedulerRouteResult::ERROR) return false;
-        if (route == SchedulerRouteResult::READY_TO_ENQUEUE &&
-            !scheduler_bootstrap_ready_batch_append(
-                scheduler_state_base, scheduler, static_cast<int64_t>(task_id),
-                &batches[scheduler_metadata_core_type_index(scheduler_metadata_single_subtask_slot(metadata
-                                                                                                       ->active_mask))],
-                phase_timing_enabled ? &stats->ready : nullptr, profiling_level
-            )) {
-            return false;
+        if (route == SchedulerRouteResult::READY_TO_ENQUEUE) {
+            __gm__ SchedulerTaskControl *control =
+                scheduler_task_control_at(scheduler_state_base, scheduler, static_cast<int64_t>(task_id));
+            if (scheduler_task_requires_sync_start(metadata->flags)) {
+                scheduler_publish_cohort_ready(
+                    scheduler_state_base, scheduler, control, metadata->flags, metadata->active_mask
+                );
+            } else {
+                if (scheduler_task_is_cohort(metadata->flags))
+                    scheduler_publish_regular_cohort_priority(
+                        scheduler_state_base, scheduler, metadata->flags, metadata->active_mask
+                    );
+                if (!scheduler_bootstrap_ready_batch_append(
+                        scheduler_state_base, scheduler, static_cast<int64_t>(task_id),
+                        &batches[scheduler_task_ready_queue(metadata->flags, metadata->active_mask)],
+                        phase_timing_enabled ? &stats->ready : nullptr, profiling_level
+                    ))
+                    return false;
+            }
         }
         if (phase_timing_enabled) ++stats->bootstrap_task_count;
     }
     scheduler_cache_barrier();
     uint64_t ready_types = 0;
-    for (uint32_t type = 0; type < SCHEDULER_CORE_TYPE_COUNT; ++type) {
+    for (uint32_t type = 0; type < SCHEDULER_READY_QUEUE_COUNT; ++type) {
         if (!scheduler_bootstrap_ready_batch_publish(
                 scheduler_state_base, scheduler, type, scheduler->inbox_index, &batches[type],
                 phase_timing_enabled ? &stats->ready : nullptr, &ready_types
@@ -230,7 +241,7 @@ __aicore__ bool bootstrap_ready_graph(
             if (barrier_backoff < kMaximumBackoffIterations) barrier_backoff <<= 1;
         }
     }
-    for (uint32_t type = 0; type < SCHEDULER_CORE_TYPE_COUNT; ++type) {
+    for (uint32_t type = 0; type < SCHEDULER_READY_QUEUE_COUNT; ++type) {
         scheduler_gm_store(
             ready_owner->queues[type].advertised, (ready_types & (UINT64_C(1) << type)) != 0 ? UINT64_C(1) : UINT64_C(0)
         );
@@ -258,14 +269,20 @@ __aicore__ bool bootstrap_ready_graph(
 
     // Prepare the first executable wave while the sole DMB launch gate is
     // still closed.
-    uint64_t ready_victim_cursors[SCHEDULER_CORE_TYPE_COUNT]{
-        (scheduler->inbox_index + 1) % scheduler_count,
-        (scheduler->inbox_index + 1) % scheduler_count,
-    };
+    uint64_t ready_victim_cursors[SCHEDULER_READY_QUEUE_COUNT]{};
+    for (uint32_t queue = 0; queue < SCHEDULER_READY_QUEUE_COUNT; ++queue)
+        ready_victim_cursors[queue] = (scheduler->inbox_index + 1) % scheduler_count;
+    (void)scheduler_service_cohort(
+        graph, scheduler_state_base, scheduler, run_control, phase_timing_enabled ? &stats->wake : nullptr,
+        phase_timing_enabled ? &stats->ready : nullptr, phase_timing_enabled ? &stats->completion : nullptr,
+        ready_owner, profiling_level
+    );
+    __gm__ SchedulerCohortCoordinator *coordinator = scheduler_cohort_coordinator_at(scheduler_state_base, scheduler);
+    SchedulerDeferredAivQueue *normal_deferred = coordinator->cohort_task_count == 0 ? deferred_aiv : nullptr;
     bool fill_failed = false;
     (void)scheduler_fill_cluster_normal_slots(
         graph, scheduler_state_base, scheduler, run_control, ready_victim_cursors,
-        phase_timing_enabled ? &stats->ready : nullptr, profiling_level, 0, deferred_aiv, ready_owner, &fill_failed
+        phase_timing_enabled ? &stats->ready : nullptr, profiling_level, 0, normal_deferred, ready_owner, &fill_failed
     );
     if (fill_failed) return false;
     // No peer can make progress while the launch gate is closed. Materialize
@@ -299,10 +316,13 @@ __aicore__ bool run_ready_dispatch_loop(
     if (scheduler_worker) {
         ready_owner = scheduler_ready_owner_state_at(scheduler_state_base, context);
     }
-    uint64_t ready_victim_cursors[SCHEDULER_CORE_TYPE_COUNT]{
-        scheduler_worker ? (context->inbox_index + 1) % scheduler_count : 0,
-        scheduler_worker ? (context->inbox_index + 1) % scheduler_count : 0,
-    };
+    uint64_t ready_victim_cursors[SCHEDULER_READY_QUEUE_COUNT]{};
+    for (uint32_t queue = 0; queue < SCHEDULER_READY_QUEUE_COUNT; ++queue)
+        ready_victim_cursors[queue] = scheduler_worker ? (context->inbox_index + 1) % scheduler_count : 0;
+    __gm__ SchedulerCohortCoordinator *coordinator =
+        scheduler_worker ? scheduler_cohort_coordinator_at(scheduler_state_base, context) : nullptr;
+    SchedulerDeferredAivQueue *normal_deferred =
+        scheduler_worker && coordinator->cohort_task_count == 0 ? deferred_aiv : nullptr;
     uint64_t seen_publication[SCHEDULER_PENDING_SLOT_COUNT]{};
     uint32_t scan_start = 0;
     uint32_t backoff_iterations = kInitialBackoffIterations;
@@ -339,19 +359,19 @@ __aicore__ bool run_ready_dispatch_loop(
             return false;
         }
         uint32_t preferred_ready_slot = UINT32_MAX;
-        if (scheduler_worker && deferred_aiv != nullptr && deferred_aiv->count != 0) {
-            const uint32_t deferred_before = deferred_aiv->count;
+        if (scheduler_worker && normal_deferred != nullptr && normal_deferred->count != 0) {
+            const uint32_t deferred_before = normal_deferred->count;
             if (!scheduler_drain_deferred_aiv_to_peer(
-                    graph, scheduler_state_base, context, run_control, deferred_aiv,
+                    graph, scheduler_state_base, context, run_control, normal_deferred,
                     phase_timing_enabled ? &stats->wake : nullptr, phase_timing_enabled ? &stats->ready : nullptr,
                     phase_timing_enabled ? &stats->completion : nullptr, profiling_level, ready_owner
                 ))
                 return false;
-            scheduler_progress = deferred_aiv->count != deferred_before;
-            if (deferred_aiv->count != 0 && !scheduler_publish_deferred_aiv_local(
-                                                graph, scheduler_state_base, context, run_control, deferred_aiv,
-                                                profiling_level, &preferred_ready_slot
-                                            ))
+            scheduler_progress = normal_deferred->count != deferred_before;
+            if (normal_deferred->count != 0 && !scheduler_publish_deferred_aiv_local(
+                                                   graph, scheduler_state_base, context, run_control, normal_deferred,
+                                                   profiling_level, &preferred_ready_slot
+                                               ))
                 return false;
         }
         if (scheduler_worker && preferred_ready_slot == UINT32_MAX) {
@@ -362,27 +382,34 @@ __aicore__ bool run_ready_dispatch_loop(
                 ready_victim_cursors, profiling_level, &direct_refilled_slot_mask, ready_owner
             );
             scheduler_progress = completion_progress;
+            scheduler_progress =
+                scheduler_service_cohort(
+                    graph, scheduler_state_base, context, run_control, phase_timing_enabled ? &stats->wake : nullptr,
+                    phase_timing_enabled ? &stats->ready : nullptr, phase_timing_enabled ? &stats->completion : nullptr,
+                    ready_owner, profiling_level
+                ) ||
+                scheduler_progress;
             bool fill_failed = false;
             const bool dispatch_progress = scheduler_fill_cluster_normal_slots(
                 graph, scheduler_state_base, context, run_control, ready_victim_cursors,
                 phase_timing_enabled ? &stats->ready : nullptr, profiling_level, direct_refilled_slot_mask,
-                deferred_aiv, ready_owner, &fill_failed
+                normal_deferred, ready_owner, &fill_failed
             );
             scheduler_progress = dispatch_progress || scheduler_progress;
             if (fill_failed) return false;
-            if (deferred_aiv != nullptr && deferred_aiv->count != 0) {
-                const uint32_t deferred_before = deferred_aiv->count;
+            if (normal_deferred != nullptr && normal_deferred->count != 0) {
+                const uint32_t deferred_before = normal_deferred->count;
                 if (!scheduler_drain_deferred_aiv_to_peer(
-                        graph, scheduler_state_base, context, run_control, deferred_aiv,
+                        graph, scheduler_state_base, context, run_control, normal_deferred,
                         phase_timing_enabled ? &stats->wake : nullptr, phase_timing_enabled ? &stats->ready : nullptr,
                         phase_timing_enabled ? &stats->completion : nullptr, profiling_level, ready_owner
                     ))
                     return false;
-                scheduler_progress = scheduler_progress || deferred_aiv->count != deferred_before;
-                if (deferred_aiv->count != 0 && !scheduler_publish_deferred_aiv_local(
-                                                    graph, scheduler_state_base, context, run_control, deferred_aiv,
-                                                    profiling_level, &preferred_ready_slot
-                                                ))
+                scheduler_progress = scheduler_progress || normal_deferred->count != deferred_before;
+                if (normal_deferred->count != 0 && !scheduler_publish_deferred_aiv_local(
+                                                       graph, scheduler_state_base, context, run_control,
+                                                       normal_deferred, profiling_level, &preferred_ready_slot
+                                                   ))
                     return false;
             }
         }

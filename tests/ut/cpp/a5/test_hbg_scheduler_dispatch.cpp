@@ -126,10 +126,10 @@ struct FixtureStorage {
             context.worker_contexts_offset = layout.worker_contexts_offset;
             context.dispatch_slots_offset = layout.dispatch_slots_offset;
             context.callable_addresses_offset = layout.callable_addresses_offset;
-            context.gang_coordinator_offset = layout.gang_coordinator_offset;
-            context.gang_cohorts_offset = layout.gang_cohorts_offset;
-            context.gang_participants_offset = layout.gang_participants_offset;
-            context.gang_commands_offset = layout.gang_commands_offset;
+            context.cohort_coordinator_offset = layout.cohort_coordinator_offset;
+            context.cohort_cohorts_offset = layout.cohort_cohorts_offset;
+            context.cohort_participants_offset = layout.cohort_participants_offset;
+            context.cohort_commands_offset = layout.cohort_commands_offset;
             context.dispatch_payload_offset =
                 layout.dispatch_payloads_offset + worker * SCHEDULER_PENDING_SLOT_COUNT * sizeof(DispatchPayload);
             context.graph_task_count = task_count;
@@ -213,7 +213,7 @@ void occupy_normal_slot(
     auto *slot = scheduler_dispatch_slot_at(storage.scheduler_state->base(), &scheduler, worker_id, pending_slot);
     slot->task_id = task_id;
     slot->subtask_slot = 1;
-    slot->gang = 0;
+    slot->cohort_index = UINT8_MAX;
     scheduler_gm_store(
         slot->publication, scheduler_dispatch_publication(slot->generation, SchedulerDispatchSlotState::READY)
     );
@@ -233,7 +233,7 @@ prepare_completed_normal_slot(FixtureStorage &storage, SchedulerWorkerContext &s
     scheduler_initialize_free_slot(slot);
     slot->task_id = 0;
     slot->subtask_slot = 0;
-    slot->gang = 0;
+    slot->cohort_index = UINT8_MAX;
     scheduler_gm_store(
         slot->publication, scheduler_dispatch_publication(slot->generation, SchedulerDispatchSlotState::READY)
     );
@@ -267,7 +267,7 @@ TEST(SchedulerClusterCompletion, SpscGenerationCompletesNormalTask) {
     auto *slot = scheduler_dispatch_slot_at(storage.scheduler_state->base(), &scheduler, 0, 0);
     scheduler_initialize_free_slot(slot);
     slot->task_id = 0;
-    slot->gang = 0;
+    slot->cohort_index = UINT8_MAX;
     slot->executor_trace.generation = slot->generation;
     slot->executor_trace.kernel_start_cycles = 100;
     slot->executor_trace.kernel_end_cycles = 200;
@@ -325,7 +325,7 @@ TEST(SchedulerClusterCompletion, RejectsStaleCompletionGenerationAtNamedSite) {
     );
 }
 
-TEST(SchedulerClusterCompletion, RejectsUnexpectedGangSlotAtNamedSite) {
+TEST(SchedulerClusterCompletion, RejectsInvalidCohortParticipantAtNamedSite) {
     FixtureStorage storage(1, 3);
     GraphBuffer graph(1);
     graph.executable(0, 0);
@@ -335,7 +335,7 @@ TEST(SchedulerClusterCompletion, RejectsUnexpectedGangSlotAtNamedSite) {
     auto *slot = scheduler_dispatch_slot_at(storage.scheduler_state->base(), &scheduler, 0, 0);
     scheduler_initialize_free_slot(slot);
     slot->task_id = 0;
-    slot->gang = 1;
+    slot->cohort_index = 0;
     scheduler_gm_store(
         slot->publication, scheduler_dispatch_publication(slot->generation, SchedulerDispatchSlotState::READY)
     );
@@ -349,7 +349,8 @@ TEST(SchedulerClusterCompletion, RejectsUnexpectedGangSlotAtNamedSite) {
         &storage.owner_states[scheduler.inbox_index]
     ));
     EXPECT_EQ(
-        storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::COMPLETION_UNEXPECTED_GANG_SLOT)
+        storage.run_control->error_site,
+        static_cast<uint64_t>(SchedulerErrorSite::COMPLETION_INVALID_COHORT_PARTICIPANT)
     );
 }
 
@@ -497,7 +498,7 @@ TEST(SchedulerClusterCompletion, DirectlyRefillsCompletedSlotWhenReadyTaskExists
     const uint32_t completed_generation = slot->generation;
     slot->task_id = 0;
     slot->subtask_slot = 0;
-    slot->gang = 0;
+    slot->cohort_index = UINT8_MAX;
     slot->executor_trace.generation = completed_generation;
     scheduler_gm_store(
         slot->publication, scheduler_dispatch_publication(completed_generation, SchedulerDispatchSlotState::READY)

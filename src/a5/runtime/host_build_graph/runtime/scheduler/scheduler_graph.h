@@ -57,7 +57,8 @@ enum class SchedulerGraphResult : uint64_t {
 
 inline constexpr bool
 scheduler_resident_v0_task_shape_supported(uint32_t active_subtasks, uint32_t logical_block_num, bool sync_start) {
-    return active_subtasks == 1 && logical_block_num == 1 && !sync_start;
+    return active_subtasks >= 1 && active_subtasks <= 3 && logical_block_num >= 1 &&
+           (!sync_start || logical_block_num > 1);
 }
 
 struct SchedulerGraphView {

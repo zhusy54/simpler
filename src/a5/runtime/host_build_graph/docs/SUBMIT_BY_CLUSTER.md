@@ -82,7 +82,7 @@ must launch as one cohort:
 3. Submit publishes only the finished graph data; it does not push ready tasks.
 4. After H2D, AIV schedulers collectively scan every submitted task exactly once.
 5. A task with no executable fanins is routed to its scheduler-owner Ready inbox
-   or Gang admission bit; otherwise it registers on the first executable
+   or Cohort admission bit; otherwise it registers on the first executable
    producer in stored fanin order.
 6. Producer completion resumes each detached consumer from its saved
    `next_fanin_index`, skips producers already in `DONE`, and registers on the
@@ -94,23 +94,26 @@ missing completion, so a task needs no periodic fanin polling.
 
 ## Dispatch and Completion
 
-- Single-lane tasks use two generation-tagged dispatch slots per worker and may
-  directly refill a slot while resolving its previous completion.
-- MIX placement reserves the same pending slot on every active lane of a
-  physical cluster before any lane is published READY.
-- MIX, SPMD, and `require_sync_start` tasks enter the Gang scheduler. Admission
-  order is sync-start, MIX, then single-lane SPMD.
-- Sync-start cohorts drain their required lanes, stage all slots as GATED, and
-  release only after the generation-tagged participant tree converges.
-- Scheduler-local participant records aggregate completed subtasks, and the
-  cohort retires the graph task exactly once. Generation tags prevent stale
-  drain, stage, dispatch, or completion tokens from satisfying a later cohort.
+- Single-block, single-lane tasks use two generation-tagged dispatch slots per
+  worker. Direct completion refill is disabled for graphs containing Cohort
+  tasks so a later Cohort priority transition cannot inherit a held reservation.
+- REGULAR SPMD/MIX tasks use dedicated Ready queues. Any Scheduler may claim one
+  of two Cohort records, dispatch its rotated primary logical blocks, and steal
+  unclaimed blocks from another Scheduler's sequence when it has local capacity.
+- MIX placement reserves one lane-local pending slot on every active lane before
+  any lane is published READY; the pending slot indices may differ by lane.
+- SYNC_START admission is coordinated by Scheduler 0. Its starting Scheduler is
+  rotated, required lanes are drained, every block is staged GATED, and release
+  occurs only after the generation-tagged participant tree converges.
+- Resource-lane priority counters stop new normal dispatch before Cohort Ready is
+  published. Scheduler-local participant records aggregate the subtasks actually
+  executed on that Cluster, and the Cohort task is retired exactly once.
 
 ## Executor Model
 
 The host loads and executes the orchestration shared object synchronously. The
 device has no orchestration thread. AICPU manages the AICore lifecycle; resident
-AIV schedulers own dependency resolution, Ready routing, Gang coordination, and
+AIV schedulers own dependency resolution, Ready routing, Cohort coordination, and
 dispatch. Cluster ownership is assigned during the AICore handshake and remains
 stable for the run. Graph replay uses a separately selected AICPU compatibility
 executor.

@@ -38,12 +38,12 @@ pytest <scene> --platform a5sim --enable-chip-swimlane 3
 
 The scheduler streams identify `producer: "aicore"`. Level 3 includes bootstrap,
 fanin, Ready claim, normal dispatch/completion, resolve, and idle records. The
-resident tail trace also accounts time spent in Gang service.
+resident tail trace also accounts time spent in Cohort service.
 
-Gang task-level records are intentionally omitted until representative-block and
+Cohort task-level records are intentionally omitted until representative-block and
 multi-lane aggregation semantics are complete. A run containing MIX, SPMD, or
 sync-start work still produces a valid artifact; analysis must tolerate missing
-Gang task and phase rows.
+Cohort task and phase rows.
 
 ## Compatibility Scheduler Summary
 

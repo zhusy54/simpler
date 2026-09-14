@@ -966,7 +966,7 @@ bool create_scheduler_state(
     uint64_t aiv_task_count = 0;
     uint64_t executable_task_count = 0;
     uint64_t executable_subtask_count = 0;
-    uint64_t gang_task_count = 0;
+    uint64_t cohort_task_count = 0;
     uint64_t aic_worker_demand = 0;
     uint64_t aiv_worker_demand = 0;
     int64_t legacy_shape_task_id = -1;
@@ -1092,7 +1092,7 @@ bool create_scheduler_state(
             ++aiv_task_count;
             aiv_worker_demand = std::max<uint64_t>(aiv_worker_demand, logical_block_num * active_aiv_subtasks);
         }
-        if (scheduler_task_is_gang(metadata.flags)) ++gang_task_count;
+        if (scheduler_task_is_cohort(metadata.flags)) ++cohort_task_count;
         executable_subtask_count += expected_subtasks;
         ++executable_task_count;
     }
@@ -1121,7 +1121,7 @@ bool create_scheduler_state(
     }
     layout.executable_task_count = executable_task_count;
     layout.executable_subtask_count = executable_subtask_count;
-    layout.gang_task_count = gang_task_count;
+    layout.cohort_task_count = cohort_task_count;
     layout.aic_worker_demand = aic_worker_demand;
     layout.aiv_worker_demand = aiv_worker_demand;
 
@@ -1180,14 +1180,15 @@ bool create_scheduler_state(
     run_control->task_metadata_offset = layout.task_metadata_offset;
     run_control->ready_inboxes_offset = layout.ready_inboxes_offset;
     run_control->ready_directory_offset = layout.ready_directory_offset;
-    run_control->gang_coordinator_offset = layout.gang_coordinator_offset;
-    run_control->gang_cohorts_offset = layout.gang_cohorts_offset;
+    run_control->cohort_coordinator_offset = layout.cohort_coordinator_offset;
+    run_control->cohort_cohorts_offset = layout.cohort_cohorts_offset;
     run_control->scheduler_timeout_cycles = SCHEDULER_TIMEOUT_CYCLES;
     run_control->error_task_id = UINT64_MAX;
     run_control->error_core_id = UINT64_MAX;
     run_control->error_core_type = UINT64_MAX;
-    auto *gang_coordinator = scheduler_state_at<SchedulerGangCoordinator>(host_base, layout.gang_coordinator_offset);
-    gang_coordinator->gang_task_count = gang_task_count;
+    auto *cohort_coordinator =
+        scheduler_state_at<SchedulerCohortCoordinator>(host_base, layout.cohort_coordinator_offset);
+    cohort_coordinator->cohort_task_count = cohort_task_count;
 
     auto *contexts = scheduler_state_at<SchedulerWorkerContext>(host_base, layout.worker_contexts_offset);
     int32_t aic_rank = 0;
@@ -1211,10 +1212,10 @@ bool create_scheduler_state(
         context.callable_addresses_offset = layout.callable_addresses_offset;
         context.runtime_worker_count = static_cast<uint64_t>(runtime->get_worker_count());
         context.bootstrap_done = 0;
-        context.gang_coordinator_offset = layout.gang_coordinator_offset;
-        context.gang_cohorts_offset = layout.gang_cohorts_offset;
-        context.gang_participants_offset = layout.gang_participants_offset;
-        context.gang_commands_offset = layout.gang_commands_offset;
+        context.cohort_coordinator_offset = layout.cohort_coordinator_offset;
+        context.cohort_cohorts_offset = layout.cohort_cohorts_offset;
+        context.cohort_participants_offset = layout.cohort_participants_offset;
+        context.cohort_commands_offset = layout.cohort_commands_offset;
         context.graph_storage_address = device_sm_address + device_segments.storage;
         context.graph_reserved_address = 0;
         context.scheduler_state_base_address = aligned_address;

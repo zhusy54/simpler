@@ -312,8 +312,8 @@ resident AIV schedulers collectively scan every submitted task exactly once:
 
 - a single-lane task whose fanins are all complete is routed to its
   scheduler-owner Ready inbox;
-- a Gang task whose fanins are all complete publishes its priority bit for
-  cohort admission;
+- a REGULAR SPMD/MIX task whose fanins are all complete enters its dedicated
+  Ready queue, while a SYNC_START task publishes the global admission signal;
 - otherwise it registers on the first executable producer in stored fanin
   order; and
 - producer completion resumes the consumer from its saved `next_fanin_index`,
@@ -326,36 +326,41 @@ closed sentinel, so the consumer-pull scheme cannot miss a completion and does
 not require periodic dependency polling.
 
 The dispatchable shapes are `AIC`, `AIV`, and `MIX`; `DUMMY` tasks do not enter
-Gang scheduling.
+Cohort scheduling.
 
 The separately selected Graph compatibility executor retains its AICPU early-
 dispatch publish lists and gated doorbells. Those lists are not part of the
-resident scheduler's dependency or Gang contract.
+resident scheduler's dependency or Cohort contract.
 
 ## 7. Dispatch and Completion
 
-Single-lane tasks use two generation-tagged dispatch slots per worker. Their
-completion path marks the task DONE, resolves its wake list, and may refill the
-same slot directly.
+Single-block, single-lane tasks use two generation-tagged dispatch slots per
+worker. Their completion path marks the task DONE, resolves its wake list, and
+may refill the same slot directly when the graph contains no Cohort tasks.
 
-MIX, SPMD, and sync-start tasks use the Gang scheduler:
+MIX, SPMD, and sync-start tasks use the Cohort scheduler:
 
-1. Scheduler 0 admits Ready cohorts in sync-start, MIX, then single-lane SPMD
-   order.
-2. MIX reserves the same free pending slot on every active lane of one physical
-   cluster before any lane becomes READY.
-3. Sync-start first drains the lanes it needs, stages every participant slot as
-   GATED, and releases the cohort only after the generation-tagged stage tree
-   converges.
-4. Non-sync SPMD dispatches in waves when its logical block count exceeds the
-   available pending slots.
-5. Each Scheduler aggregates its participant completions. Scheduler 0 resolves
-   the graph task once the completion tree converges, then retires the generation
-   before the cohort slot can be reused.
+1. There are two reusable Cohort records. Any Scheduler may claim a free record
+   and a REGULAR SPMD/MIX task from the dedicated Ready queues; SYNC_START
+   admission remains coordinated by Scheduler 0.
+2. REGULAR logical blocks have a rotated primary assignment. For AIC and MIX,
+   rank `i` starts from block `i` with stride `N`; AIV uses two sequences starting
+   from `2i` and `2i+1` with stride `2N`. An idle Scheduler may atomically claim
+   a block from another Scheduler's sequence and execute it on its own Cluster.
+3. MIX reserves one free pending slot on each active lane before publishing any
+   lane. The lane-local slot indices do not need to match.
+4. SYNC_START rotates its first logical block across Scheduler indices. It first
+   drains the required resource lanes, stages all blocks as GATED, and releases
+   them only after the generation-tagged participant tree converges.
+5. Each Scheduler aggregates the completions that actually ran on its Cluster.
+   The record owner resolves a REGULAR task after its participant bitmap
+   completes; Scheduler 0 resolves SYNC_START after its completion tree converges.
 
-The active cohort and pending Gang priority bits suppress normal dispatch during
-admission, drain, staging, and release. Generation-tagged command and completion
-tokens prevent a previous cohort from satisfying a reused slot.
+When a Cohort task becomes Ready, it raises counters only for the AIC/AIV lanes it
+needs and waits for already-entered normal dispatchers to leave. Subsequent normal
+dispatch cannot publish work onto those lanes until Cohort dispatch is complete.
+Generation-tagged command, block-claim, and completion state prevents a previous
+record use from satisfying a later one.
 
 ## 8. Scalar Access During Construction
 

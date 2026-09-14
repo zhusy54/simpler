@@ -52,12 +52,14 @@ inline __aicore__ bool scheduler_fill_cluster_normal_slots(
 ) {
     if (failed != nullptr) *failed = false;
     if (scheduler->is_scheduler == 0) return false;
+    __gm__ SchedulerCohortCoordinator *coordinator = scheduler_cohort_coordinator_at(scheduler_state_base, scheduler);
     const uint32_t aic_core_type = static_cast<uint32_t>(CoreType::AIC);
     uint64_t state_probe_start_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
     bool progress = false;
 
     // AIC has no peer lane in its Cluster, so preserve the existing slot order.
-    if (scheduler_ready_directory_nonempty(
+    if (!scheduler_cohort_lane_has_priority(coordinator, 0) &&
+        scheduler_ready_directory_nonempty(
             scheduler_state_base, scheduler, scheduler->scheduler_count, aic_core_type
         )) {
         bool aic_ready_available = true;
@@ -76,15 +78,21 @@ inline __aicore__ bool scheduler_fill_cluster_normal_slots(
                     scheduler_dispatch_slot_at(scheduler_state_base, scheduler, worker_id, pending_slot);
                 const uint64_t publication = scheduler_gm_query(slot->publication);
                 if (scheduler_dispatch_state(publication) != SchedulerDispatchSlotState::FREE) continue;
+                if (!scheduler_normal_lane_enter(coordinator, cluster_lane)) {
+                    aic_ready_available = false;
+                    break;
+                }
                 SchedulerReadyClaim ready{};
                 if (!scheduler_claim_ready_for_slot(
                         graph, scheduler_state_base, scheduler, run_control, scheduler->scheduler_count, aic_core_type,
                         &ready_victim_cursors[aic_core_type], ready_stats, &ready, owner_state
                     )) {
+                    scheduler_normal_lane_leave(coordinator, cluster_lane);
                     if (failed != nullptr) *failed = true;
                     return progress;
                 }
                 if (ready.task_id < 0) {
+                    scheduler_normal_lane_leave(coordinator, cluster_lane);
                     aic_ready_available = false;
                     break;
                 }
@@ -102,9 +110,11 @@ inline __aicore__ bool scheduler_fill_cluster_normal_slots(
                 if (!scheduler_fill_dispatch_slot(
                         graph, scheduler_state_base, scheduler, run_control, claim, ready, profiling_level
                     )) {
+                    scheduler_normal_lane_leave(coordinator, cluster_lane);
                     if (failed != nullptr) *failed = true;
                     return progress;
                 }
+                scheduler_normal_lane_leave(coordinator, cluster_lane);
                 progress = true;
                 state_probe_start_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
             }
@@ -119,6 +129,7 @@ inline __aicore__ bool scheduler_fill_cluster_normal_slots(
         uint64_t publications[SCHEDULER_PENDING_SLOT_COUNT]{};
         uint32_t free_mask{0};
         uint32_t occupied_slots{0};
+        uint32_t cluster_lane{UINT32_MAX};
         bool is_scheduler{false};
     };
     const uint32_t aiv_core_type = static_cast<uint32_t>(CoreType::AIV);
@@ -129,6 +140,7 @@ inline __aicore__ bool scheduler_fill_cluster_normal_slots(
         AivWorkerSlots aiv_workers[PLATFORM_AIV_CORES_PER_BLOCKDIM]{};
         uint32_t aiv_worker_count = 0;
         for (uint32_t cluster_lane = 0; cluster_lane < PLATFORM_CORES_PER_BLOCKDIM; ++cluster_lane) {
+            if (scheduler_cohort_lane_has_priority(coordinator, cluster_lane)) continue;
             const uint64_t worker_id = scheduler->cluster_worker_ids[cluster_lane];
             if (worker_id >= scheduler->runtime_worker_count) continue;
             __gm__ SchedulerWorkerContext *target =
@@ -144,6 +156,7 @@ inline __aicore__ bool scheduler_fill_cluster_normal_slots(
             }
             AivWorkerSlots &worker = aiv_workers[aiv_worker_count++];
             worker.worker_id = worker_id;
+            worker.cluster_lane = cluster_lane;
             worker.is_scheduler = worker_id == scheduler->worker_index;
             for (uint32_t pending_slot = 0; pending_slot < SCHEDULER_PENDING_SLOT_COUNT; ++pending_slot) {
                 if ((skip_slot_mask & (UINT64_C(1) << (cluster_lane * SCHEDULER_PENDING_SLOT_COUNT + pending_slot))) !=
@@ -178,6 +191,7 @@ inline __aicore__ bool scheduler_fill_cluster_normal_slots(
             worker.free_mask &= ~(1U << pending_slot);
             if (worker.is_scheduler && (deferred_aiv == nullptr || deferred_aiv->count >= SCHEDULER_PENDING_SLOT_COUNT))
                 break;
+            if (!scheduler_normal_lane_enter(coordinator, worker.cluster_lane)) continue;
             const uint64_t publication = worker.publications[pending_slot];
             SchedulerFreeSlotClaim claim{
                 worker.worker_id,
@@ -198,6 +212,7 @@ inline __aicore__ bool scheduler_fill_cluster_normal_slots(
                     slot->publication,
                     scheduler_dispatch_publication(claim.generation, SchedulerDispatchSlotState::FREE)
                 );
+                scheduler_normal_lane_leave(coordinator, worker.cluster_lane);
                 if (failed != nullptr) *failed = true;
                 return progress;
             }
@@ -206,6 +221,7 @@ inline __aicore__ bool scheduler_fill_cluster_normal_slots(
                     slot->publication,
                     scheduler_dispatch_publication(claim.generation, SchedulerDispatchSlotState::FREE)
                 );
+                scheduler_normal_lane_leave(coordinator, worker.cluster_lane);
                 break;
             }
             ready.state_probe_start_cycles = state_probe_start_cycles;
@@ -216,15 +232,18 @@ inline __aicore__ bool scheduler_fill_cluster_normal_slots(
                 progress = true;
                 state_probe_start_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
                 entry.ready.state_probe_end_cycles = state_probe_start_cycles;
+                scheduler_normal_lane_leave(coordinator, worker.cluster_lane);
                 continue;
             }
             ready.state_probe_end_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
             if (!scheduler_fill_dispatch_slot(
                     graph, scheduler_state_base, scheduler, run_control, claim, ready, profiling_level
                 )) {
+                scheduler_normal_lane_leave(coordinator, worker.cluster_lane);
                 if (failed != nullptr) *failed = true;
                 return progress;
             }
+            scheduler_normal_lane_leave(coordinator, worker.cluster_lane);
             ++worker.occupied_slots;
             progress = true;
             state_probe_start_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
@@ -322,7 +341,7 @@ inline __aicore__ bool scheduler_drain_deferred_aiv_to_peer(
                     static_cast<uint32_t>(completed_generations >> (pending_slot * 32));
                 if (completed_generation != generation) continue;
                 scheduler_observe_cache_line(peer_slot);
-                if (peer_slot->gang != 0) continue;
+                if (peer_slot->cohort_index != UINT8_MAX) continue;
                 if (!scheduler_service_cluster_completion_slot(
                         graph, scheduler_state_base, scheduler, run_control, static_cast<uint32_t>(peer_lane),
                         pending_slot, completed_generation, wake_stats, ready_stats, completion_stats, nullptr,

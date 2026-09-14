@@ -138,10 +138,10 @@ struct FixtureStorage {
             context.worker_contexts_offset = layout.worker_contexts_offset;
             context.dispatch_slots_offset = layout.dispatch_slots_offset;
             context.callable_addresses_offset = layout.callable_addresses_offset;
-            context.gang_coordinator_offset = layout.gang_coordinator_offset;
-            context.gang_cohorts_offset = layout.gang_cohorts_offset;
-            context.gang_participants_offset = layout.gang_participants_offset;
-            context.gang_commands_offset = layout.gang_commands_offset;
+            context.cohort_coordinator_offset = layout.cohort_coordinator_offset;
+            context.cohort_cohorts_offset = layout.cohort_cohorts_offset;
+            context.cohort_participants_offset = layout.cohort_participants_offset;
+            context.cohort_commands_offset = layout.cohort_commands_offset;
             context.dispatch_payload_offset =
                 layout.dispatch_payloads_offset + worker * SCHEDULER_PENDING_SLOT_COUNT * sizeof(DispatchPayload);
             context.graph_task_count = task_count;
@@ -327,8 +327,8 @@ TEST(SchedulerBootstrap, PublishesExclusiveInboxAndAggregatesDirectory) {
     EXPECT_EQ(controls[0].next_waiter, 1);
     EXPECT_EQ(controls[1].next_waiter, SCHEDULER_INBOX_EMPTY);
     EXPECT_EQ(scheduler_ready_inbox_at(storage.scheduler_state->base(), &storage.contexts[1], 0, 0)->head, 0);
-    EXPECT_EQ(directory->core_types[0][0].bits, 1u);
-    EXPECT_EQ(directory->core_types[1][0].bits, 0u);
+    EXPECT_EQ(directory->queues[0][0].bits, 1u);
+    EXPECT_EQ(directory->queues[1][0].bits, 0u);
     EXPECT_EQ(stats.enqueue_count, 2u);
     EXPECT_EQ(stats.batch_count, 1u);
 }
@@ -400,7 +400,7 @@ TEST(SchedulerReadyInbox, BatchPushAndOwnerMaintenancePreserveFifoAndDirectory) 
     auto *directory = scheduler_state_at<SchedulerReadyDirectory>(
         storage.scheduler_state->base(), storage.layout.ready_directory_offset
     );
-    EXPECT_NE(directory->core_types[0][0].bits & 1, 0u);
+    EXPECT_NE(directory->queues[0][0].bits & 1, 0u);
     for (uint64_t index = 0; index < kTasks; ++index) {
         int64_t task = SCHEDULER_TASK_ID_INVALID;
         ASSERT_TRUE(scheduler_ready_pop_from_inbox(
@@ -414,11 +414,11 @@ TEST(SchedulerReadyInbox, BatchPushAndOwnerMaintenancePreserveFifoAndDirectory) 
         graph.graph(), storage.scheduler_state->base(), &storage.contexts[0], storage.run_control, 0, 0, &task, &stats
     ));
     EXPECT_EQ(task, SCHEDULER_TASK_ID_INVALID);
-    EXPECT_NE(directory->core_types[0][0].bits & 1, 0u);
+    EXPECT_NE(directory->queues[0][0].bits & 1, 0u);
     ASSERT_TRUE(
         scheduler_ready_owner_maintain_type(storage.scheduler_state->base(), &storage.contexts[0], 0, &owner_state)
     );
-    EXPECT_EQ(directory->core_types[0][0].bits & 1, 0u);
+    EXPECT_EQ(directory->queues[0][0].bits & 1, 0u);
     EXPECT_EQ(stats.pop_count, kTasks);
 }
 
@@ -599,10 +599,10 @@ TEST(SchedulerReadyInbox, StealsOnlyFromMarkedVictim) {
 TEST(SchedulerReadyInbox, DirectoryShardIgnoresSchedulerTail) {
     FixtureStorage storage(1, 9);
     auto *directory = scheduler_ready_directory_at(storage.scheduler_state->base(), &storage.contexts[0]);
-    directory->core_types[0][1].bits = UINT64_C(1) << 6;
+    directory->queues[0][1].bits = UINT64_C(1) << 6;
     EXPECT_EQ(scheduler_load_ready_directory_shard(directory, 9, 0, 7), 0u);
 
-    directory->core_types[0][1].bits = UINT64_C(1) << 1;
+    directory->queues[0][1].bits = UINT64_C(1) << 1;
     EXPECT_EQ(scheduler_load_ready_directory_shard(directory, 9, 0, 7), UINT64_C(1) << 1);
 }
 
@@ -616,10 +616,10 @@ TEST(SchedulerReadyInbox, BootstrapPublishesIndependentDirectoryShards) {
 
     ASSERT_TRUE(scheduler_bootstrap_ready_directory_publish(storage.scheduler_state->base(), &storage.contexts[0], 14));
 
-    EXPECT_EQ(directory->core_types[0][0].bits, (UINT64_C(1) << 0) | (UINT64_C(1) << 6));
-    EXPECT_EQ(directory->core_types[1][0].bits, 0u);
-    EXPECT_EQ(directory->core_types[0][1].bits, UINT64_C(1) << 6);
-    EXPECT_EQ(directory->core_types[1][1].bits, (UINT64_C(1) << 0) | (UINT64_C(1) << 6));
+    EXPECT_EQ(directory->queues[0][0].bits, (UINT64_C(1) << 0) | (UINT64_C(1) << 6));
+    EXPECT_EQ(directory->queues[1][0].bits, 0u);
+    EXPECT_EQ(directory->queues[0][1].bits, UINT64_C(1) << 6);
+    EXPECT_EQ(directory->queues[1][1].bits, (UINT64_C(1) << 0) | (UINT64_C(1) << 6));
 }
 
 TEST(SchedulerReadyInbox, SparseDirectoryWrapsWithinShard) {
