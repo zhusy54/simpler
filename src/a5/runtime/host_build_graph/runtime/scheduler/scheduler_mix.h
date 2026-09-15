@@ -13,10 +13,29 @@
 
 #include "scheduler_dispatch.h"
 
+struct SchedulerMixTaskMetadata {
+    uint16_t kernel_ids[3]{};
+    uint8_t active_mask{0};
+    uint8_t flags{0};
+    uint16_t logical_block_num{0};
+    uint16_t trace_index_base{0};
+    int32_t timing_slot{-1};
+};
+static_assert(sizeof(SchedulerMixTaskMetadata) == 16, "Mix metadata cache must stay compact");
+
+struct SchedulerMixDispatchPlan {
+    SchedulerMixTaskMetadata metadata{};
+    SchedulerResolvedPayloadSource payload_source{};
+    uint64_t callable_addresses[PLATFORM_CORES_PER_BLOCKDIM]{};
+    uint8_t physical_lanes[PLATFORM_CORES_PER_BLOCKDIM]{0, 1, 2};
+    bool predicate_passes{true};
+};
+
 struct SchedulerPendingMixDispatch {
     SchedulerReadyClaim ready{};
-    uint8_t active_mask{0};
+    SchedulerMixTaskMetadata metadata{};
 };
+static_assert(sizeof(SchedulerPendingMixDispatch) == 56, "Pending Mix state must stay compact");
 
 struct SchedulerMixState {
     SchedulerPendingMixDispatch pending{};
@@ -61,9 +80,11 @@ inline __aicore__ int32_t scheduler_mix_find_free_pending_slot(
 
 inline __aicore__ uint64_t scheduler_mix_pending_skip_mask(const SchedulerMixState *state) {
     if (state == nullptr || state->pending.ready.task_id < 0) return 0;
+    uint8_t physical_mask = state->pending.metadata.active_mask;
+    if ((physical_mask & 1U) != 0 && scheduler_mix_popcount(physical_mask & 6U) == 1) physical_mask |= 6U;
     uint64_t result = 0;
     for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
-        if ((state->pending.active_mask & (1U << lane)) == 0) continue;
+        if ((physical_mask & (1U << lane)) == 0) continue;
         for (uint32_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot)
             result |= UINT64_C(1) << (lane * SCHEDULER_PENDING_SLOT_COUNT + slot);
     }
@@ -72,9 +93,9 @@ inline __aicore__ uint64_t scheduler_mix_pending_skip_mask(const SchedulerMixSta
 
 inline __aicore__ bool scheduler_mix_validate_claim(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *scheduler,
-    __gm__ SchedulerRunControl *run_control, const SchedulerReadyClaim &ready, uint8_t *active_mask
+    __gm__ SchedulerRunControl *run_control, const SchedulerReadyClaim &ready, SchedulerPendingMixDispatch *pending
 ) {
-    if (ready.task_id < 0 || static_cast<uint64_t>(ready.task_id) >= graph.task_count || active_mask == nullptr)
+    if (ready.task_id < 0 || static_cast<uint64_t>(ready.task_id) >= graph.task_count || pending == nullptr)
         return false;
     __gm__ SchedulerTaskMetadata *metadata = scheduler_task_metadata_at(scheduler_state_base, scheduler, ready.task_id);
     scheduler_observe_cache_line(metadata);
@@ -88,9 +109,14 @@ inline __aicore__ bool scheduler_mix_validate_claim(
         );
         return false;
     }
-    *active_mask = metadata->active_mask & 7U;
+    const uint8_t active_mask = metadata->active_mask & 7U;
+    const uint8_t active_aiv_mask = active_mask & 6U;
+    const bool single_aiv = (active_mask & 1U) != 0 && scheduler_mix_popcount(active_aiv_mask) == 1;
+    bool active_aiv_candidate = false;
     for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
-        if ((*active_mask & (1U << lane)) == 0) continue;
+        bool validate_lane = (active_mask & (1U << lane)) != 0;
+        if (single_aiv && lane > 0) validate_lane = true;
+        if (!validate_lane) continue;
         const uint64_t worker_id = scheduler->cluster_worker_ids[lane];
         if (worker_id >= scheduler->runtime_worker_count) {
             scheduler_record_error(
@@ -103,47 +129,104 @@ inline __aicore__ bool scheduler_mix_validate_claim(
         scheduler_observe_cache_line(target);
         const int32_t expected_core_type =
             lane == 0 ? static_cast<int32_t>(CoreType::AIC) : static_cast<int32_t>(CoreType::AIV);
-        if (target->active == 0 || target->core_type != expected_core_type) {
+        if (target->core_type != expected_core_type || (target->active == 0 && !(single_aiv && lane > 0))) {
             scheduler_record_error(
                 run_control, ready.task_id, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
                 SchedulerErrorSite::MIX_DISPATCH_INVALID_TOPOLOGY
             );
             return false;
         }
+        if (single_aiv && lane > 0 && target->active != 0) active_aiv_candidate = true;
     }
+    if (single_aiv && !active_aiv_candidate) {
+        scheduler_record_error(
+            run_control, ready.task_id, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
+            SchedulerErrorSite::MIX_DISPATCH_INVALID_TOPOLOGY
+        );
+        return false;
+    }
+    pending->ready = ready;
+    pending->metadata.kernel_ids[0] = metadata->kernel_ids[0];
+    pending->metadata.kernel_ids[1] = metadata->kernel_ids[1];
+    pending->metadata.kernel_ids[2] = metadata->kernel_ids[2];
+    pending->metadata.active_mask = active_mask;
+    pending->metadata.flags = metadata->flags;
+    pending->metadata.logical_block_num = metadata->logical_block_num;
+    pending->metadata.trace_index_base = metadata->trace_index_base;
+    pending->metadata.timing_slot = metadata->timing_slot;
+    return true;
+}
+
+inline __aicore__ bool scheduler_mix_prepare_plan(
+    const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *scheduler,
+    __gm__ SchedulerRunControl *run_control, const SchedulerPendingMixDispatch &pending, SchedulerMixDispatchPlan *plan
+) {
+    if (plan == nullptr) return false;
+    SchedulerMixDispatchPlan prepared{};
+    prepared.metadata = pending.metadata;
+
+    const uint8_t active_aiv_mask = prepared.metadata.active_mask & 6U;
+    if ((prepared.metadata.active_mask & 1U) != 0 && scheduler_mix_popcount(active_aiv_mask) == 1) {
+        const uint8_t logical_aiv = (active_aiv_mask & 2U) != 0 ? 1 : 2;
+        prepared.physical_lanes[logical_aiv] = scheduler->cluster_worker_ids[2] == scheduler->worker_index ? 1 : 2;
+    }
+    SchedulerGraphResult status =
+        scheduler_resolve_task_payload_source(graph, pending.ready.task_id, &prepared.payload_source);
+    if (status != SchedulerGraphResult::OK) {
+        scheduler_record_error(
+            run_control, pending.ready.task_id, status, &graph, scheduler,
+            SchedulerErrorSite::MIX_DISPATCH_MATERIALIZE_FAILED
+        );
+        return false;
+    }
+    __gm__ uint64_t *callable_table =
+        scheduler_state_at<uint64_t>(scheduler_state_base, scheduler->callable_addresses_offset);
+    for (uint8_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
+        if ((prepared.metadata.active_mask & (1U << lane)) == 0) continue;
+        if (!scheduler_lookup_callable_address(
+                callable_table, prepared.metadata.kernel_ids[lane], &prepared.callable_addresses[lane]
+            )) {
+            scheduler_record_error(
+                run_control, pending.ready.task_id, SchedulerGraphResult::INVALID_CALLABLE, &graph, scheduler,
+                SchedulerErrorSite::MIX_DISPATCH_INVALID_CALLABLE
+            );
+            return false;
+        }
+    }
+    if (scheduler_task_has_predicate(prepared.metadata.flags)) {
+        const SchedulerPredicateResult predicate = scheduler_evaluate_task_predicate(graph, pending.ready.task_id);
+        if (predicate == SchedulerPredicateResult::MALFORMED) {
+            scheduler_record_error(
+                run_control, pending.ready.task_id, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
+                SchedulerErrorSite::MIX_DISPATCH_MATERIALIZE_FAILED
+            );
+            return false;
+        }
+        prepared.predicate_passes = predicate != SchedulerPredicateResult::FAIL;
+    }
+    *plan = prepared;
     return true;
 }
 
 inline __aicore__ bool scheduler_mix_prepare_lane(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *scheduler,
-    __gm__ SchedulerRunControl *run_control, const SchedulerReadyClaim &ready, uint8_t subtask_slot,
-    uint32_t pending_slot, uint32_t tracker_index, uint32_t tracker_generation
+    __gm__ SchedulerRunControl *run_control, const SchedulerReadyClaim &ready, const SchedulerMixDispatchPlan &plan,
+    uint8_t subtask_slot, uint32_t pending_slot, uint32_t tracker_index, uint32_t tracker_generation
 ) {
-    const uint64_t worker_id = scheduler->cluster_worker_ids[subtask_slot];
-    __gm__ SchedulerTaskMetadata *metadata = scheduler_task_metadata_at(scheduler_state_base, scheduler, ready.task_id);
-    const uint16_t kernel_id = metadata->kernel_ids[subtask_slot];
-    __gm__ uint64_t *callable_addresses =
-        scheduler_state_at<uint64_t>(scheduler_state_base, scheduler->callable_addresses_offset);
-    uint64_t callable_address = 0;
-    if (!scheduler_lookup_callable_address(callable_addresses, kernel_id, &callable_address)) {
-        scheduler_record_error(
-            run_control, ready.task_id, SchedulerGraphResult::INVALID_CALLABLE, &graph, scheduler,
-            SchedulerErrorSite::MIX_DISPATCH_INVALID_CALLABLE
-        );
-        return false;
-    }
-
+    const uint8_t physical_lane = plan.physical_lanes[subtask_slot];
+    const uint64_t worker_id = scheduler->cluster_worker_ids[physical_lane];
+    const uint16_t kernel_id = plan.metadata.kernel_ids[subtask_slot];
     __gm__ SchedulerWorkerContext *target = scheduler_worker_context_at(scheduler_state_base, scheduler, worker_id);
     __gm__ SchedulerDispatchSlot *slot =
         scheduler_dispatch_slot_at(scheduler_state_base, scheduler, worker_id, pending_slot);
     const uint64_t publication = scheduler_gm_query(slot->publication);
-    if (scheduler_dispatch_state(publication) != SchedulerDispatchSlotState::FILLING) return false;
+    if (scheduler_dispatch_state(publication) != SchedulerDispatchSlotState::FREE) return false;
     uint32_t generation = scheduler_dispatch_generation(publication) + 1;
     if (generation == 0) generation = 1;
     slot->task_id = ready.task_id;
     slot->kernel_id = kernel_id;
     slot->subtask_slot = subtask_slot;
-    slot->has_fanin = scheduler_task_has_fanin(metadata->flags) ? 1 : 0;
+    slot->has_fanin = scheduler_task_has_fanin(plan.metadata.flags) ? 1 : 0;
     slot->pending_slot = static_cast<uint8_t>(pending_slot);
     slot->block_num = 1;
     slot->generation = generation;
@@ -163,23 +246,58 @@ inline __aicore__ bool scheduler_mix_prepare_lane(
         scheduler_state_base,
         target->dispatch_payload_offset + static_cast<uint64_t>(pending_slot) * sizeof(DispatchPayload)
     );
-    SchedulerGraphResult status =
-        scheduler_materialize_task_payload_resolved(graph, task, callable_address, payload, 0, 1);
-    if (status == SchedulerGraphResult::OK && scheduler_task_has_predicate(metadata->flags)) {
-        const SchedulerPredicateResult predicate = scheduler_evaluate_task_predicate(graph, ready.task_id);
-        if (predicate == SchedulerPredicateResult::MALFORMED) status = SchedulerGraphResult::INVALID_ARGUMENTS;
-        if (predicate == SchedulerPredicateResult::FAIL) payload->function_bin_addr = 0;
-    }
+    SchedulerDispatchPayloadDirtyMask dirty_mask = 0;
+    SchedulerGraphResult status = scheduler_materialize_task_payload_from_source(
+        task, plan.callable_addresses[subtask_slot], plan.payload_source, payload, &dirty_mask, 0, 1
+    );
+    if (status == SchedulerGraphResult::OK && !plan.predicate_passes) payload->function_bin_addr = 0;
     if (status != SchedulerGraphResult::OK) {
         scheduler_record_error(
             run_control, ready.task_id, status, &graph, scheduler, SchedulerErrorSite::MIX_DISPATCH_MATERIALIZE_FAILED
         );
         return false;
     }
-    scheduler_publish_dispatch_payload(payload);
-    scheduler_gm_store(
-        slot->publication, scheduler_dispatch_publication(generation, SchedulerDispatchSlotState::GATED)
-    );
+    if (subtask_slot != 0) payload->global_context.sub_block_id = physical_lane == 2 ? 1 : 0;
+    scheduler_publish_dispatch_payload(payload, dirty_mask);
+    return true;
+}
+
+inline __aicore__ bool scheduler_mix_claim_free_slots(
+    __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *scheduler, SchedulerMixDispatchPlan *plan,
+    int32_t *pending_slots
+) {
+    const uint8_t active_mask = plan->metadata.active_mask;
+    const uint8_t active_aiv_mask = active_mask & 6U;
+    const bool single_aiv = (active_mask & 1U) != 0 && scheduler_mix_popcount(active_aiv_mask) == 1;
+    const uint8_t logical_aiv = (active_aiv_mask & 2U) != 0 ? 1 : 2;
+    for (uint8_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
+        if ((active_mask & (1U << lane)) == 0 || (single_aiv && lane == logical_aiv)) continue;
+        const uint8_t physical_lane = plan->physical_lanes[lane];
+        pending_slots[lane] = scheduler_mix_find_free_pending_slot(
+            scheduler_state_base, scheduler, scheduler->cluster_worker_ids[physical_lane]
+        );
+        if (pending_slots[lane] < 0) return false;
+    }
+    if (!single_aiv) return true;
+
+    const uint8_t preferred_lane = plan->physical_lanes[logical_aiv];
+    __gm__ SchedulerWorkerContext *preferred =
+        scheduler_worker_context_at(scheduler_state_base, scheduler, scheduler->cluster_worker_ids[preferred_lane]);
+    pending_slots[logical_aiv] = -1;
+    if (preferred->active != 0)
+        pending_slots[logical_aiv] = scheduler_mix_find_free_pending_slot(
+            scheduler_state_base, scheduler, scheduler->cluster_worker_ids[preferred_lane]
+        );
+    if (pending_slots[logical_aiv] >= 0) return true;
+    const uint8_t fallback_lane = preferred_lane == 1 ? 2 : 1;
+    __gm__ SchedulerWorkerContext *fallback =
+        scheduler_worker_context_at(scheduler_state_base, scheduler, scheduler->cluster_worker_ids[fallback_lane]);
+    if (fallback->active != 0)
+        pending_slots[logical_aiv] = scheduler_mix_find_free_pending_slot(
+            scheduler_state_base, scheduler, scheduler->cluster_worker_ids[fallback_lane]
+        );
+    if (pending_slots[logical_aiv] < 0) return false;
+    plan->physical_lanes[logical_aiv] = fallback_lane;
     return true;
 }
 
@@ -196,44 +314,36 @@ inline __aicore__ bool scheduler_mix_dispatch_pending(
     const int32_t tracker_index = scheduler_mix_free_tracker(state);
     if (tracker_index < 0) return true;
 
+    SchedulerMixDispatchPlan plan{};
+    if (!scheduler_mix_prepare_plan(graph, scheduler_state_base, scheduler, run_control, state->pending, &plan))
+        return false;
     int32_t pending_slots[PLATFORM_CORES_PER_BLOCKDIM] = {-1, -1, -1};
-    for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
-        if ((state->pending.active_mask & (1U << lane)) == 0) continue;
-        pending_slots[lane] =
-            scheduler_mix_find_free_pending_slot(scheduler_state_base, scheduler, scheduler->cluster_worker_ids[lane]);
-        if (pending_slots[lane] < 0) return true;
-    }
-
-    for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
-        if ((state->pending.active_mask & (1U << lane)) == 0) continue;
-        __gm__ SchedulerDispatchSlot *slot = scheduler_dispatch_slot_at(
-            scheduler_state_base, scheduler, scheduler->cluster_worker_ids[lane],
-            static_cast<uint32_t>(pending_slots[lane])
-        );
-        const uint32_t generation = scheduler_dispatch_generation(scheduler_gm_query(slot->publication));
-        scheduler_gm_store(
-            slot->publication, scheduler_dispatch_publication(generation, SchedulerDispatchSlotState::FILLING)
-        );
-    }
+    if (!scheduler_mix_claim_free_slots(scheduler_state_base, scheduler, &plan, pending_slots)) return true;
 
     uint32_t tracker_generation = state->next_generation++;
     if (tracker_generation == 0) tracker_generation = state->next_generation++;
     for (uint8_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
-        if ((state->pending.active_mask & (1U << lane)) == 0) continue;
+        if ((plan.metadata.active_mask & (1U << lane)) == 0) continue;
         if (!scheduler_mix_prepare_lane(
-                graph, scheduler_state_base, scheduler, run_control, state->pending.ready, lane,
+                graph, scheduler_state_base, scheduler, run_control, state->pending.ready, plan, lane,
                 static_cast<uint32_t>(pending_slots[lane]), static_cast<uint32_t>(tracker_index), tracker_generation
             ))
             return false;
     }
 
+    SchedulerMixTracker &tracker = state->trackers[static_cast<uint32_t>(tracker_index)];
+    tracker.task_id = state->pending.ready.task_id;
+    tracker.generation = tracker_generation;
+    tracker.active_mask = plan.metadata.active_mask;
+    tracker.completed_mask = 0;
+
     if (task_timing_enabled) {
-        __gm__ SchedulerTaskMetadata *metadata =
-            scheduler_task_metadata_at(scheduler_state_base, scheduler, state->pending.ready.task_id);
         for (uint8_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
-            if ((state->pending.active_mask & (1U << lane)) == 0) continue;
-            __gm__ SchedulerTaskTrace *trace = scheduler_task_trace_at(scheduler_state_base, scheduler, metadata, lane);
-            trace->worker_id = scheduler->cluster_worker_ids[lane];
+            if ((plan.metadata.active_mask & (1U << lane)) == 0) continue;
+            __gm__ SchedulerTaskTrace *trace = scheduler_task_trace_at(
+                scheduler_state_base, scheduler, plan.metadata.trace_index_base, plan.metadata.active_mask, lane
+            );
+            trace->worker_id = scheduler->cluster_worker_ids[plan.physical_lanes[lane]];
             trace->task_id = static_cast<uint64_t>(state->pending.ready.task_id);
             if (phase_timing_enabled) {
                 trace->ready_source = static_cast<uint64_t>(state->pending.ready.source);
@@ -251,11 +361,6 @@ inline __aicore__ bool scheduler_mix_dispatch_pending(
         }
     }
 
-    SchedulerMixTracker &tracker = state->trackers[static_cast<uint32_t>(tracker_index)];
-    tracker.task_id = state->pending.ready.task_id;
-    tracker.generation = tracker_generation;
-    tracker.active_mask = state->pending.active_mask;
-    tracker.completed_mask = 0;
 #if defined(__CCE_AICORE__)
     OUT_OF_ORDER_STORE_BARRIER();
 #else
@@ -270,16 +375,16 @@ inline __aicore__ bool scheduler_mix_dispatch_pending(
         scheduler_publish_cache_line(&control->next_waiter);
     }
     for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
-        if ((state->pending.active_mask & (1U << lane)) == 0) continue;
+        if ((plan.metadata.active_mask & (1U << lane)) == 0) continue;
         __gm__ SchedulerDispatchSlot *slot = scheduler_dispatch_slot_at(
-            scheduler_state_base, scheduler, scheduler->cluster_worker_ids[lane],
+            scheduler_state_base, scheduler, scheduler->cluster_worker_ids[plan.physical_lanes[lane]],
             static_cast<uint32_t>(pending_slots[lane])
         );
         scheduler_gm_publish(
             slot->publication, scheduler_dispatch_publication(slot->generation, SchedulerDispatchSlotState::READY)
         );
     }
-    state->pending = SchedulerPendingMixDispatch{};
+    state->pending.ready.task_id = SCHEDULER_TASK_ID_INVALID;
     state->probe_requested = true;
     if (dispatched != nullptr) *dispatched = true;
     return true;
@@ -319,11 +424,8 @@ static __attribute__((noinline)) __aicore__ bool scheduler_service_mix_event(
         }
         ready.state_probe_start_cycles = probe_start;
         ready.state_probe_end_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
-        uint8_t active_mask = 0;
-        if (!scheduler_mix_validate_claim(graph, scheduler_state_base, scheduler, run_control, ready, &active_mask))
+        if (!scheduler_mix_validate_claim(graph, scheduler_state_base, scheduler, run_control, ready, &state->pending))
             return false;
-        state->pending.ready = ready;
-        state->pending.active_mask = active_mask;
         if (progress != nullptr) *progress = true;
     }
     return true;

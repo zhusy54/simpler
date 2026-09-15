@@ -30,15 +30,38 @@ inline __aicore__ void scheduler_account_failed_completion(
     scheduler_gm_fetch_add(run_control->resolved_task_count, UINT64_C(1));
 }
 
+inline __aicore__ void scheduler_publish_mix_completion_traces(
+    __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *scheduler, uint16_t trace_index_base,
+    uint8_t active_mask, bool schedule_timing_enabled, bool phase_timing_enabled
+) {
+    for (uint8_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
+        if ((active_mask & (1U << lane)) == 0) continue;
+        __gm__ SchedulerTaskTrace *trace =
+            scheduler_task_trace_at(scheduler_state_base, scheduler, trace_index_base, active_mask, lane);
+        scheduler_writeback_cache_line(trace);
+        scheduler_writeback_cache_line(&trace->kernel_start_cycles);
+        if (phase_timing_enabled) scheduler_writeback_cache_line(&trace->ready_transition_cycles);
+        if (schedule_timing_enabled) scheduler_writeback_cache_line(&trace->dispatch_start_cycles);
+        if (phase_timing_enabled) scheduler_writeback_cache_line(&trace->descriptor_cache_observed_cycles);
+    }
+    scheduler_cache_barrier();
+    for (uint8_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
+        if ((active_mask & (1U << lane)) == 0) continue;
+        __gm__ SchedulerTaskTrace *trace =
+            scheduler_task_trace_at(scheduler_state_base, scheduler, trace_index_base, active_mask, lane);
+        scheduler_gm_publish(trace->valid, UINT64_C(1));
+    }
+    scheduler_cache_barrier();
+}
+
 inline __aicore__ bool scheduler_service_mix_completion_slot(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *scheduler,
     __gm__ SchedulerRunControl *run_control, uint32_t pending_slot, uint32_t completed_generation,
     SchedulerWakeStats *wake_stats, SchedulerReadyStats *ready_stats, SchedulerCompletionStats *completion_stats,
     SchedulerMixTracker *mix_trackers, __gm__ SchedulerReadyOwnerState *owner_state, uint32_t ready_queue_count,
     uint64_t profiling_level, __gm__ SchedulerCompletionInbox *completion_line, __gm__ SchedulerDispatchSlot *slot,
-    __gm__ SchedulerWorkerContext *target, uint64_t completion_start
+    __gm__ SchedulerWorkerContext *target, uint64_t completion_start, SchedulerReadyClaim *direct_mix_ready
 ) {
-    scheduler_observe_cache_line(slot);
     const int64_t task_id = slot->task_id;
     const uint32_t tracker_index = slot->cohort_index;
     if (task_id < 0 || static_cast<uint64_t>(task_id) >= graph.task_count || mix_trackers == nullptr ||
@@ -127,25 +150,23 @@ inline __aicore__ bool scheduler_service_mix_completion_slot(
     if (completed_trace != nullptr) {
         if (chip_task_timing_enabled) {
             if (phase_timing_enabled) completed_trace->complete_end_cycles = scheduler_cycles();
-            scheduler_writeback_cache_line(completed_trace);
-            scheduler_writeback_cache_line(&completed_trace->kernel_start_cycles);
-            if (phase_timing_enabled) scheduler_writeback_cache_line(&completed_trace->ready_transition_cycles);
-            if (schedule_timing_enabled) scheduler_writeback_cache_line(&completed_trace->dispatch_start_cycles);
-            if (phase_timing_enabled)
-                scheduler_writeback_cache_line(&completed_trace->descriptor_cache_observed_cycles);
-            scheduler_cache_barrier();
-            scheduler_gm_publish(completed_trace->valid, UINT64_C(1));
         } else {
             scheduler_publish_cache_line(&completed_trace->kernel_start_cycles);
         }
     }
     if (tracker.completed_mask != tracker.active_mask) return true;
+    if (chip_task_timing_enabled) {
+        scheduler_publish_mix_completion_traces(
+            scheduler_state_base, scheduler, metadata->trace_index_base, metadata->active_mask, schedule_timing_enabled,
+            phase_timing_enabled
+        );
+    }
 
     __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, scheduler, task_id);
     scheduler_gm_store(control->state, static_cast<int64_t>(SchedulerTaskState::DONE));
     if (!scheduler_resolve_completion(
             graph, scheduler_state_base, scheduler, run_control, task_id, wake_stats, ready_stats, completion_stats,
-            owner_state, profiling_level, false, ready_queue_count
+            owner_state, profiling_level, false, ready_queue_count, direct_mix_ready
         )) {
         scheduler_account_failed_completion(
             graph, scheduler, run_control, task_id, SchedulerErrorSite::MIX_COMPLETION_RESOLVE_FAILED
@@ -153,6 +174,7 @@ inline __aicore__ bool scheduler_service_mix_completion_slot(
         return false;
     }
     tracker.task_id = SCHEDULER_TASK_ID_INVALID;
+    tracker.generation = 0;
     tracker.active_mask = 0;
     tracker.completed_mask = 0;
     scheduler_gm_fetch_add(run_control->resolved_task_count, UINT64_C(1));
@@ -166,7 +188,7 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
     SchedulerCompletionStats *completion_stats, uint64_t *ready_victim_cursors, uint64_t profiling_level,
     const SchedulerReadyClaim *replacement_ready, bool *direct_refilled,
     __gm__ SchedulerReadyOwnerState *owner_state = nullptr, SchedulerMixTracker *mix_trackers = nullptr,
-    uint32_t ready_queue_count = SCHEDULER_CORE_TYPE_COUNT
+    uint32_t ready_queue_count = SCHEDULER_CORE_TYPE_COUNT, SchedulerReadyClaim *direct_mix_ready = nullptr
 ) {
     if (direct_refilled != nullptr) *direct_refilled = false;
     if (cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM || pending_slot >= SCHEDULER_PENDING_SLOT_COUNT ||
@@ -204,7 +226,7 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
         return scheduler_service_mix_completion_slot(
             graph, scheduler_state_base, scheduler, run_control, pending_slot, completed_generation, wake_stats,
             ready_stats, completion_stats, mix_trackers, owner_state, ready_queue_count, profiling_level,
-            completion_line, slot, target, completion_start
+            completion_line, slot, target, completion_start, direct_mix_ready
         );
     __gm__ SchedulerTaskMetadata *metadata = scheduler_task_metadata_at(scheduler_state_base, scheduler, task_id);
     scheduler_observe_cache_line(metadata);
@@ -362,7 +384,8 @@ inline __aicore__ bool scheduler_service_cluster_completions(
     __gm__ SchedulerRunControl *run_control, SchedulerWakeStats *wake_stats, SchedulerReadyStats *ready_stats,
     SchedulerCompletionStats *completion_stats, uint64_t *ready_victim_cursors = nullptr, uint64_t profiling_level = 0,
     uint64_t *direct_refilled_slot_mask = nullptr, __gm__ SchedulerReadyOwnerState *owner_state = nullptr,
-    SchedulerMixTracker *mix_trackers = nullptr, uint32_t ready_queue_count = SCHEDULER_CORE_TYPE_COUNT
+    SchedulerMixTracker *mix_trackers = nullptr, uint32_t ready_queue_count = SCHEDULER_CORE_TYPE_COUNT,
+    SchedulerReadyClaim *direct_mix_ready = nullptr
 ) {
     if (scheduler->is_scheduler == 0) return false;
     if (direct_refilled_slot_mask != nullptr) *direct_refilled_slot_mask = 0;
@@ -393,7 +416,8 @@ inline __aicore__ bool scheduler_service_cluster_completions(
                 if (!scheduler_service_cluster_completion_slot(
                         graph, scheduler_state_base, scheduler, run_control, cluster_lane, pending_slot,
                         completed_generation, wake_stats, ready_stats, completion_stats, ready_victim_cursors,
-                        profiling_level, nullptr, &direct_refilled, owner_state, mix_trackers, ready_queue_count
+                        profiling_level, nullptr, &direct_refilled, owner_state, mix_trackers, ready_queue_count,
+                        direct_mix_ready
                     ))
                     return false;
                 if (direct_refilled && direct_refilled_slot_mask != nullptr)

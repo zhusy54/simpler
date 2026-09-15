@@ -135,3 +135,27 @@ struct alignas(64) DispatchPayload {
 static_assert(sizeof(DispatchPayload) == 512, "DispatchPayload hardware ABI size drift");
 static_assert(offsetof(DispatchPayload, args) == 64, "args[] must start at cache line 1 (control block = CL0)");
 static_assert(offsetof(DispatchPayload, src_payload) < 64, "src_payload (gate) must live on the CL0 control block");
+
+using SchedulerDispatchPayloadDirtyMask = uint8_t;
+
+inline constexpr uint32_t SCHEDULER_DISPATCH_PAYLOAD_CACHE_LINE_SIZE = 64;
+inline constexpr uint32_t SCHEDULER_DISPATCH_PAYLOAD_CACHE_LINE_COUNT = sizeof(DispatchPayload) / 64;
+inline constexpr SchedulerDispatchPayloadDirtyMask SCHEDULER_DISPATCH_PAYLOAD_CONTROL_DIRTY = 1U;
+
+inline constexpr __aicore__ SchedulerDispatchPayloadDirtyMask
+scheduler_dispatch_payload_dirty_mask(int32_t argument_count) {
+    SchedulerDispatchPayloadDirtyMask mask = SCHEDULER_DISPATCH_PAYLOAD_CONTROL_DIRTY;
+    if (argument_count > 0) {
+        const uint32_t last_argument_line = static_cast<uint32_t>(
+            (offsetof(DispatchPayload, args) + static_cast<uint64_t>(argument_count - 1) * sizeof(uint64_t)) /
+            SCHEDULER_DISPATCH_PAYLOAD_CACHE_LINE_SIZE
+        );
+        for (uint32_t line = 1; line <= last_argument_line; ++line)
+            mask = static_cast<SchedulerDispatchPayloadDirtyMask>(mask | (1U << line));
+    }
+    constexpr uint32_t context_line =
+        offsetof(DispatchPayload, global_context) / SCHEDULER_DISPATCH_PAYLOAD_CACHE_LINE_SIZE;
+    return static_cast<SchedulerDispatchPayloadDirtyMask>(mask | (1U << context_line));
+}
+
+static_assert(SCHEDULER_DISPATCH_PAYLOAD_CACHE_LINE_COUNT == 8, "DispatchPayload cache-line count changed");

@@ -375,15 +375,24 @@ __aicore__ bool run_ready_dispatch_loop_impl(
         }
         if (scheduler_worker && preferred_ready_slot == UINT32_MAX) {
             uint64_t direct_refilled_slot_mask = 0;
+            SchedulerReadyClaim *direct_mix_ready_output = nullptr;
+            if constexpr (HasMix) {
+                if (mix_state->pending.ready.task_id < 0) direct_mix_ready_output = &mix_state->pending.ready;
+            }
             const bool completion_progress = scheduler_service_cluster_completions(
                 graph, scheduler_state_base, context, run_control, phase_timing_enabled ? &stats->wake : nullptr,
                 phase_timing_enabled ? &stats->ready : nullptr, phase_timing_enabled ? &stats->completion : nullptr,
                 HasMix ? nullptr : ready_victim_cursors, profiling_level, &direct_refilled_slot_mask, ready_owner,
-                HasMix ? mix_state->trackers : nullptr, ready_queue_count
+                HasMix ? mix_state->trackers : nullptr, ready_queue_count, direct_mix_ready_output
             );
             scheduler_progress = completion_progress;
             uint64_t mix_skip_slot_mask = 0;
             if constexpr (HasMix) {
+                if (mix_state->pending.ready.task_id >= 0 &&
+                    !scheduler_mix_validate_claim(
+                        graph, scheduler_state_base, context, run_control, mix_state->pending.ready, &mix_state->pending
+                    ))
+                    return false;
                 if (completion_progress) mix_state->probe_requested = true;
                 bool mix_progress = false;
                 if (!scheduler_service_mix_event(
@@ -515,7 +524,6 @@ __aicore__ bool run_ready_dispatch_loop_impl(
             }
             execute_task(payload);
             uint64_t kernel_end = get_sys_cnt_aicore();
-            scheduler_publish_dispatch_payload(payload);
             __gm__ SchedulerCompletionInbox *completion_line =
                 scheduler_completion_inbox_at(scheduler_state_base, context, context->worker_index);
             uint64_t completion_start = get_sys_cnt_aicore();

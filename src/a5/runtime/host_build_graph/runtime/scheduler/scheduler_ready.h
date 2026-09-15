@@ -216,14 +216,23 @@ inline __aicore__ __gm__ SchedulerTaskMetadata *scheduler_task_metadata_at(
 }
 
 inline __aicore__ __gm__ SchedulerTaskTrace *scheduler_task_trace_at(
-    __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *context,
-    __gm__ const SchedulerTaskMetadata *metadata, uint8_t subtask_slot
+    __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *context, uint16_t trace_index_base,
+    uint8_t active_mask, uint8_t subtask_slot
 ) {
-    const uint32_t offset = scheduler_task_trace_subtask_offset(metadata->active_mask, subtask_slot);
+    const uint32_t offset = scheduler_task_trace_subtask_offset(active_mask, subtask_slot);
     if (offset == UINT32_MAX) return nullptr;
     __gm__ SchedulerTaskTrace *traces =
         scheduler_state_at<SchedulerTaskTrace>(scheduler_state_base, context->trace_cells_offset);
-    return &traces[static_cast<uint32_t>(metadata->trace_index_base) + offset];
+    return &traces[static_cast<uint32_t>(trace_index_base) + offset];
+}
+
+inline __aicore__ __gm__ SchedulerTaskTrace *scheduler_task_trace_at(
+    __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *context,
+    __gm__ const SchedulerTaskMetadata *metadata, uint8_t subtask_slot
+) {
+    return scheduler_task_trace_at(
+        scheduler_state_base, context, metadata->trace_index_base, metadata->active_mask, subtask_slot
+    );
 }
 
 inline __aicore__ void scheduler_task_traces_set_ready_transition(
@@ -1019,11 +1028,14 @@ inline __aicore__ bool scheduler_fill_dispatch_slot(
     __gm__ DispatchPayload *payload =
         scheduler_state_at<DispatchPayload>(scheduler_state_base, dispatch_payload_offset);
     SchedulerGraphResult status = SchedulerGraphResult::OK;
+    SchedulerDispatchPayloadDirtyMask payload_dirty_mask = SCHEDULER_DISPATCH_PAYLOAD_CONTROL_DIRTY;
     if (inline_task) {
         payload->function_bin_addr = 0;
         payload->src_payload = 0;
     } else {
-        status = scheduler_materialize_task_payload_resolved(graph, task, callable_address, payload);
+        status = scheduler_materialize_task_payload_resolved(
+            graph, task, callable_address, payload, 0, 1, &payload_dirty_mask
+        );
         if (status == SchedulerGraphResult::OK && scheduler_task_has_predicate(metadata.flags)) {
             const SchedulerPredicateResult predicate = scheduler_evaluate_task_predicate(graph, ready_claim.task_id);
             if (predicate == SchedulerPredicateResult::MALFORMED) {
@@ -1042,7 +1054,7 @@ inline __aicore__ bool scheduler_fill_dispatch_slot(
         );
         return false;
     }
-    scheduler_publish_dispatch_payload(payload);
+    scheduler_publish_dispatch_payload(payload, payload_dirty_mask);
     __gm__ SchedulerTaskControl *control =
         scheduler_task_control_at(scheduler_state_base, scheduler, ready_claim.task_id);
     if (phase_timing_enabled) {
@@ -1081,7 +1093,7 @@ inline __aicore__ bool scheduler_resolve_completion(
     __gm__ SchedulerRunControl *run_control, int64_t task_id, SchedulerWakeStats *wake_stats,
     SchedulerReadyStats *ready_stats, SchedulerCompletionStats *completion_stats,
     __gm__ SchedulerReadyOwnerState *owner_state, uint64_t profiling_level = 0, bool validate_done_state = true,
-    uint32_t ready_queue_count = SCHEDULER_CORE_TYPE_COUNT
+    uint32_t ready_queue_count = SCHEDULER_CORE_TYPE_COUNT, SchedulerReadyClaim *direct_mix_ready = nullptr
 ) {
     if (owner_state == nullptr || ready_queue_count > SCHEDULER_READY_QUEUE_COUNT) return false;
     __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, context, task_id);
@@ -1153,6 +1165,20 @@ inline __aicore__ bool scheduler_resolve_completion(
             }
         }
         waiter = next;
+    }
+    uint64_t ready_count = 0;
+    for (uint32_t type = 0; type < ready_queue_count; ++type)
+        ready_count += batches[type].count;
+    if (direct_mix_ready != nullptr && direct_mix_ready->task_id < 0 && ready_queue_count > SCHEDULER_MIX_READY_QUEUE &&
+        ready_count == 1 && batches[SCHEDULER_MIX_READY_QUEUE].count == 1) {
+        const uint64_t direct_cycles = phase_timing_enabled ? scheduler_cycles() : 0;
+        direct_mix_ready->task_id = batches[SCHEDULER_MIX_READY_QUEUE].head;
+        direct_mix_ready->inbox_index = context->inbox_index;
+        direct_mix_ready->source = SchedulerReadySource::LOCAL;
+        direct_mix_ready->publication_mode = SchedulerPublicationMode::REFILL;
+        direct_mix_ready->state_probe_start_cycles = direct_cycles;
+        direct_mix_ready->state_probe_end_cycles = direct_cycles;
+        scheduler_ready_batch_reset(&batches[SCHEDULER_MIX_READY_QUEUE]);
     }
     for (uint32_t type = 0; type < ready_queue_count; ++type) {
         if (!scheduler_ready_batch_push(

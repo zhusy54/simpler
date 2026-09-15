@@ -697,7 +697,6 @@ enum class SchedulerDispatchSlotState : uint8_t {
     FREE = 1,
     FILLING = 2,
     READY = 3,
-    GATED = 4,
 };
 
 enum SchedulerTaskMetadataFlags : uint8_t {
@@ -957,6 +956,7 @@ struct SchedulerMixTracker {
     uint8_t completed_mask{0};
     uint8_t reserved[2]{};
 };
+static_assert(sizeof(SchedulerMixTracker) == 16, "Mix tracker must remain compact AICore-local state");
 
 // Stable device-side localization for the first scheduler failure. These values
 // are diagnostic ABI: keep existing numbers stable when adding new sites.

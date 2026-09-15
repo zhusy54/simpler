@@ -393,12 +393,38 @@ TEST(SchedulerDispatchPayload, DisablesDeferredCompletionWithoutASlab) {
     EXPECT_FALSE(payload.local_context.async_ctx.task_token.is_valid());
     EXPECT_EQ(payload.global_context.sub_block_id, 0);
 
+    task.subtask_slot = 1;
+    task.core_type = CoreType::AIV;
+    ASSERT_EQ(
+        scheduler_materialize_task_payload_resolved(graph.graph(), task, 0x1000, &payload), SchedulerGraphResult::OK
+    );
+    EXPECT_EQ(payload.global_context.sub_block_id, 0);
+
     task.subtask_slot = 2;
     task.core_type = CoreType::AIV;
     ASSERT_EQ(
         scheduler_materialize_task_payload_resolved(graph.graph(), task, 0x1000, &payload), SchedulerGraphResult::OK
     );
     EXPECT_EQ(payload.global_context.sub_block_id, 1);
+}
+
+TEST(SchedulerDispatchPayload, ComputesOnlyTheCacheLinesWrittenByMaterialization) {
+    EXPECT_EQ(scheduler_dispatch_payload_dirty_mask(0), UINT8_C(0x81));
+    EXPECT_EQ(scheduler_dispatch_payload_dirty_mask(1), UINT8_C(0x83));
+    EXPECT_EQ(scheduler_dispatch_payload_dirty_mask(8), UINT8_C(0x83));
+    EXPECT_EQ(scheduler_dispatch_payload_dirty_mask(9), UINT8_C(0x87));
+    EXPECT_EQ(scheduler_dispatch_payload_dirty_mask(48), UINT8_C(0xff));
+
+    GraphBuffer graph(1);
+    graph.executable(0, 0);
+    DispatchPayload payload{};
+    SchedulerTaskInfo task{0, 1, 0, CoreType::AIC};
+    SchedulerDispatchPayloadDirtyMask dirty_mask = 0;
+    ASSERT_EQ(
+        scheduler_materialize_task_payload_resolved(graph.graph(), task, 0x1000, &payload, 0, 1, &dirty_mask),
+        SchedulerGraphResult::OK
+    );
+    EXPECT_EQ(dirty_mask, UINT8_C(0x81));
 }
 
 TEST(SchedulerDispatchPayload, RejectsInvalidGraphBoundsBeforeReadingPayload) {

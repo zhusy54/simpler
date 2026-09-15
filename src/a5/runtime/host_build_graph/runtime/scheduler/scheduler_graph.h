@@ -82,6 +82,13 @@ struct SchedulerTaskInfo {
     CoreType core_type;
 };
 
+struct SchedulerResolvedPayloadSource {
+    uint64_t tensors_address{0};
+    uint64_t scalars_address{0};
+    int32_t tensor_count{0};
+    int32_t scalar_count{0};
+};
+
 struct SchedulerTaskShape {
     int64_t task_id;
     int32_t kernel_ids[3];
@@ -179,19 +186,16 @@ scheduler_classify_task_shape(const SchedulerGraphView &graph, int64_t task_id, 
     return SchedulerGraphResult::OK;
 }
 
-inline __aicore__ SchedulerGraphResult scheduler_materialize_task_payload_resolved(
-    const SchedulerGraphView &graph, const SchedulerTaskInfo &task, uint64_t function_bin_address,
-    __gm__ DispatchPayload *dispatch_payload, int32_t block_idx = 0, int32_t block_num = 1
+inline __aicore__ SchedulerGraphResult scheduler_resolve_task_payload_source(
+    const SchedulerGraphView &graph, int64_t task_id, SchedulerResolvedPayloadSource *source
 ) {
-    if (dispatch_payload == nullptr || function_bin_address == 0 || block_idx < 0 || block_num <= 0 ||
-        block_idx >= block_num) {
-        return SchedulerGraphResult::INVALID_CALLABLE;
-    }
+    if (source == nullptr) return SchedulerGraphResult::INVALID_ARGUMENTS;
+    *source = SchedulerResolvedPayloadSource{};
     if (graph.reserved != 0) return SchedulerGraphResult::INVALID_ARGUMENTS;
-    if (graph.storage_address == 0 || task.task_id < 0 || static_cast<uint64_t>(task.task_id) >= graph.task_count) {
+    if (graph.storage_address == 0 || task_id < 0 || static_cast<uint64_t>(task_id) >= graph.task_count) {
         return SchedulerGraphResult::INVALID_TASK_COUNT;
     }
-    __gm__ uint8_t *payload = scheduler_graph_payload(graph, task.task_id);
+    __gm__ uint8_t *payload = scheduler_graph_payload(graph, task_id);
     int32_t tensor_count = *reinterpret_cast<__gm__ int32_t *>(payload + TASKPAYLOAD_TENSOR_COUNT_OFFSET);
     int32_t scalar_count = *reinterpret_cast<__gm__ int32_t *>(payload + TASKPAYLOAD_SCALAR_COUNT_OFFSET);
     if (tensor_count < 0 || tensor_count > MAX_TENSOR_ARGS || scalar_count < 0 || scalar_count > MAX_SCALAR_ARGS ||
@@ -206,15 +210,32 @@ inline __aicore__ SchedulerGraphResult scheduler_materialize_task_payload_resolv
     if ((tensor_count > 0 && tensors_delta == 0) || (scalar_count > 0 && scalars_delta == 0)) {
         return SchedulerGraphResult::INVALID_ARGUMENTS;
     }
+    source->tensors_address = reinterpret_cast<uint64_t>(tensors_field + tensors_delta);
+    source->scalars_address = reinterpret_cast<uint64_t>(scalars_field + scalars_delta);
+    source->tensor_count = tensor_count;
+    source->scalar_count = scalar_count;
+    return SchedulerGraphResult::OK;
+}
+
+inline __aicore__ SchedulerGraphResult scheduler_materialize_task_payload_from_source(
+    const SchedulerTaskInfo &task, uint64_t function_bin_address, const SchedulerResolvedPayloadSource &source,
+    __gm__ DispatchPayload *dispatch_payload, SchedulerDispatchPayloadDirtyMask *dirty_mask = nullptr,
+    int32_t block_idx = 0, int32_t block_num = 1
+) {
+    if (dirty_mask != nullptr) *dirty_mask = 0;
+    if (dispatch_payload == nullptr || function_bin_address == 0 || block_idx < 0 || block_num <= 0 ||
+        block_idx >= block_num) {
+        return SchedulerGraphResult::INVALID_CALLABLE;
+    }
     dispatch_payload->function_bin_addr = function_bin_address;
-    __gm__ uint8_t *tensors = tensors_field + tensors_delta;
-    __gm__ uint64_t *scalars = reinterpret_cast<__gm__ uint64_t *>(scalars_field + scalars_delta);
+    __gm__ uint8_t *tensors = reinterpret_cast<__gm__ uint8_t *>(source.tensors_address);
+    __gm__ uint64_t *scalars = reinterpret_cast<__gm__ uint64_t *>(source.scalars_address);
     int32_t n = 0;
-    for (int32_t i = 0; i < tensor_count; ++i) {
+    for (int32_t i = 0; i < source.tensor_count; ++i) {
         dispatch_payload->args[n++] =
             reinterpret_cast<uint64_t>(tensors + static_cast<uint64_t>(i) * TASKPAYLOAD_TENSOR_STRIDE);
     }
-    for (int32_t i = 0; i < scalar_count; ++i)
+    for (int32_t i = 0; i < source.scalar_count; ++i)
         dispatch_payload->args[n++] = scalars[i];
 
     dispatch_payload->src_payload = 0;
@@ -227,5 +248,19 @@ inline __aicore__ SchedulerGraphResult scheduler_materialize_task_payload_resolv
     dispatch_payload->args[PAYLOAD_GLOBAL_CONTEXT_INDEX] =
         reinterpret_cast<uint64_t>(&dispatch_payload->global_context);
     dispatch_payload->global_context.sub_block_id = task.subtask_slot == 2 ? 1 : 0;
+    if (dirty_mask != nullptr) *dirty_mask = scheduler_dispatch_payload_dirty_mask(n);
     return SchedulerGraphResult::OK;
+}
+
+inline __aicore__ SchedulerGraphResult scheduler_materialize_task_payload_resolved(
+    const SchedulerGraphView &graph, const SchedulerTaskInfo &task, uint64_t function_bin_address,
+    __gm__ DispatchPayload *dispatch_payload, int32_t block_idx = 0, int32_t block_num = 1,
+    SchedulerDispatchPayloadDirtyMask *dirty_mask = nullptr
+) {
+    SchedulerResolvedPayloadSource source{};
+    SchedulerGraphResult status = scheduler_resolve_task_payload_source(graph, task.task_id, &source);
+    if (status != SchedulerGraphResult::OK) return status;
+    return scheduler_materialize_task_payload_from_source(
+        task, function_bin_address, source, dispatch_payload, dirty_mask, block_idx, block_num
+    );
 }
