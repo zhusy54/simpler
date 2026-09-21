@@ -978,7 +978,7 @@ struct alignas(128) SchedulerRunControl {
     volatile uint64_t bootstrap_scan_complete;
     volatile uint64_t scheduler_timeout_cycles;
     volatile uint64_t chip_swimlane_level;
-    uint64_t lifecycle_reserved;
+    uint64_t sampled_task_timing_enabled;
 
     volatile uint64_t error_claimed;
     volatile uint64_t scheduler_error;
@@ -1016,7 +1016,7 @@ struct alignas(128) SchedulerWorkerContext {
     volatile int32_t core_type;
     int32_t physical_core_id;
     volatile int32_t type_rank;
-    volatile int32_t active;
+    uint32_t worker_reserved;
     volatile uint64_t run_control_offset;
     volatile uint64_t task_controls_offset;
     // Base of this run's ChipTaskStorage array. One address: a task's descriptor

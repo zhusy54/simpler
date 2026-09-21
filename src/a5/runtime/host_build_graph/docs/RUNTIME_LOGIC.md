@@ -17,7 +17,7 @@ host: collect outputs and destroy/reset per-run state
 ```
 
 The device has no orchestration thread. The resident scheduler uses one AIV
-Scheduler per active cluster; AICPU initializes, monitors, and tears down the
+Scheduler per discovered cluster; AICPU initializes, monitors, and tears down the
 workers. The explicit legacy path uses AICPU scheduling.
 
 This ordering is the defining constraint of the runtime. The host constructs the
@@ -407,7 +407,8 @@ Each READY acquire initializes a fresh core-local configuration. Dispatch and
 completion use cached worker IDs; the Executor derives payload addresses from
 one shared region offset and the worker ID. Narrow offsets are validated before
 conversion, and every cluster member must agree with the fixed payload stride.
-Worker participation remains controlled by the shared GM context.
+All discovered clusters and all three lanes in each cluster participate.
+Graph demand is checked against available capacity; it does not mask workers.
 
 Owner pending endpoints and publication masks are private to the Scheduler.
 Self-execution notifications contain only a pending-slot mask: the slot stays
@@ -415,11 +416,18 @@ READY with the same generation until the local Executor claims it, so the ready
 token is reconstructed from the slot. Completion generation validation still
 prevents stale notifications from freeing or refilling a pending slot.
 
-The local configuration occupies 96 bytes under the 64-bit ABI. Local state also
-contains six timing slots and completion generations. Only the two self-execution
-slots have local Executor traces; remote traces reside in SSBUF. Sampling is
-derived from the timing-slot range. The complete local state occupies 496 bytes.
-Profiling storage is present even when profiling is disabled.
+The local configuration occupies 80 bytes and the base local state 248 bytes
+under the 64-bit ABI, including its optional profiling pointer. A separate
+240-byte profiling state holds six timing slots, two self-execution traces,
+worker trace caches, profiling offsets, and the loop counter/valid mask.
+Remote traces reside in SSBUF. Sampling is derived from the timing-slot range.
+
+The host records whether any task requests sampled timing in the run control.
+Only a run with chip profiling or sampled timing enters the resident function
+specialization that allocates profiling state; the plain specialization does
+not allocate it. These functions do not inline into the common entry. The
+combined local state with profiling is 488 bytes. These sizes exclude other
+function locals, worker statistics and compiler spills.
 
 Before bootstrap, every participating core invalidates its entire data cache.
 The callable table and task metadata are immutable throughout that run, allowing
@@ -450,7 +458,7 @@ publication precedes each count flush. The AICPU watchdog remains 20 seconds
 by default, so continuously busy work without count publication can reach
 that timeout.
 
-Directory queries are skipped when no active, unreserved FREE slot can accept
+Directory queries are skipped when no unreserved FREE slot can accept
 work. Idle polling backs off from 8 to at most 32 iterations. Dispatch trace
 GM writes follow ready publication; Host tooling computes ready-to-kernel
 latency from the recorded timestamps.

@@ -65,8 +65,8 @@ local object is broken, or establish an eight-argument hardware limit.
 - Metadata and callable addresses are immutable after startup publication.
   After READY acquire, local configuration caches three worker IDs and a common
   payload-region offset, immutable region offsets, scheduler index/count,
-  completion-ID stride, and self/scheduler lanes. Participation and core type
-  checks still read the shared worker context.
+  completion-ID stride, and self/scheduler lanes. All discovered cluster lanes
+  participate; core-type checks read the shared worker context.
   Graph metadata reuses the existing graph view; startup trace timestamps remain
   lazily observed after Executor publication. Mutable wake-list links still require invalidation and a DSB.
 - Resolved counts accumulate locally across scheduling passes, including
@@ -79,7 +79,7 @@ local object is broken, or establish an eight-argument hardware limit.
   interrupts the busy path; the device op timeout remains 45 seconds.
 - `scheduler_refresh_ready_inbox` publishes pending owner work and updates the
   directory's stealable-work bits. Locally empty types require no refresh.
-  A type's directory query is skipped when no active, unreserved FREE slot can
+  A type's directory query is skipped when no unreserved FREE slot can
   accept work, respecting the direct-refill skip mask and deferred AIV capacity.
 - Profiling loop IDs are core-local. Bootstrap records and the first main-loop
   records retain loop ID zero. The shared context has no `profiling_loop_iter`

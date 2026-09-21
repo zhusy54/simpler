@@ -52,7 +52,7 @@ inline __aicore__ bool scheduler_has_usable_slot(
         const uint64_t worker_id = local->config.worker_ids[lane];
         if (worker_id >= local->config.runtime_worker_count) continue;
         auto *target = scheduler_worker_context_at(scheduler_state_base, local, worker_id);
-        if (target->active == 0 || target->core_type != static_cast<int32_t>(core_type)) continue;
+        if (target->core_type != static_cast<int32_t>(core_type)) continue;
         if (core_type == static_cast<uint32_t>(CoreType::AIV) && lane == local->config.self_lane &&
             (deferred_aiv == nullptr || deferred_aiv->count >= SCHEDULER_PENDING_SLOT_COUNT))
             continue;
@@ -90,7 +90,7 @@ inline __aicore__ bool scheduler_fill_cluster_normal_slots(
             if (worker_id >= scheduler->config.runtime_worker_count) continue;
             __gm__ SchedulerWorkerContext *target =
                 scheduler_worker_context_at(scheduler_state_base, scheduler, worker_id);
-            if (target->active == 0 || target->core_type != static_cast<int32_t>(CoreType::AIC)) continue;
+            if (target->core_type != static_cast<int32_t>(CoreType::AIC)) continue;
             for (uint32_t pending_slot = 0; pending_slot < SCHEDULER_PENDING_SLOT_COUNT; ++pending_slot) {
                 if ((skip_slot_mask & (UINT64_C(1) << (cluster_lane * SCHEDULER_PENDING_SLOT_COUNT + pending_slot))) !=
                     0)
@@ -153,7 +153,7 @@ inline __aicore__ bool scheduler_fill_cluster_normal_slots(
             if (worker_id >= scheduler->config.runtime_worker_count) continue;
             __gm__ SchedulerWorkerContext *target =
                 scheduler_worker_context_at(scheduler_state_base, scheduler, worker_id);
-            if (target->active == 0 || target->core_type != static_cast<int32_t>(CoreType::AIV)) continue;
+            if (target->core_type != static_cast<int32_t>(CoreType::AIV)) continue;
             if (aiv_worker_count >= PLATFORM_AIV_CORES_PER_BLOCKDIM) {
                 scheduler_record_error(
                     run_control, SCHEDULER_TASK_ID_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
@@ -275,8 +275,7 @@ scheduler_deferred_aiv_peer_lane(__gm__ void *scheduler_state_base, SchedulerLoc
         if (worker_id == scheduler->worker_id()) continue;
         __gm__ SchedulerWorkerContext *target = scheduler_worker_context_at(scheduler_state_base, scheduler, worker_id);
         scheduler_observe_cache_line(target);
-        if (target->active != 0 && target->core_type == static_cast<int32_t>(CoreType::AIV))
-            return static_cast<int32_t>(cluster_lane);
+        if (target->core_type == static_cast<int32_t>(CoreType::AIV)) return static_cast<int32_t>(cluster_lane);
     }
     return -1;
 }
@@ -290,9 +289,6 @@ inline __aicore__ bool scheduler_drain_deferred_aiv_to_peer(
     if (queue == nullptr || queue->count == 0) return true;
     if (ssbuf_region == nullptr || scheduler == nullptr) return false;
     const int32_t peer_lane = scheduler_deferred_aiv_peer_lane(scheduler_state_base, scheduler);
-    // A Scheduler may be the only active AIV in its Cluster (for example, a
-    // single-root AIV graph). There is then nothing to drain to; leave the
-    // reservation queued so the caller can publish it on the Scheduler itself.
     if (peer_lane < 0) return true;
     const uint64_t peer_worker_id = scheduler->config.worker_ids[static_cast<uint32_t>(peer_lane)];
     for (uint32_t pass = 0; pass < 2 && queue->count != 0; ++pass) {
