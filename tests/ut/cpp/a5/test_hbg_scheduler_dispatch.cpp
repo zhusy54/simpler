@@ -196,7 +196,7 @@ TEST(SchedulerClusterCompletion, SpscGenerationCompletesNormalTask) {
     slot->task_id = 0;
     local_slot->task_id = 0;
     local_slot->subtask_slot = 0;
-    local_slot->sampled_task_timing = 1;
+    local_slot->timing_slot = 0;
     local_slot->state = SchedulerDispatchSlotState::READY;
     scheduler_ssbuf_store_relaxed(&test_ssbuf_control(storage, scheduler, 0, 0)->publication, local_slot->generation);
     auto *executor_trace = test_ssbuf_trace(storage, scheduler, 0, 0);
@@ -232,6 +232,45 @@ TEST(SchedulerClusterCompletion, SpscGenerationCompletesNormalTask) {
     EXPECT_EQ(traces[0].kernel_start_cycles, 100u);
     EXPECT_EQ(traces[0].kernel_end_cycles, 200u);
     EXPECT_EQ(traces[0].valid, 0u);
+}
+
+TEST(SchedulerClusterCompletion, SelfSlotsKeepDistinctSampledTraces) {
+    FixtureStorage storage(2, 3);
+    GraphBuffer graph(2);
+    SchedulerWorkerContext &scheduler = storage.contexts[1];
+    scheduler.is_scheduler = 1;
+    scheduler.scheduler_index = 0;
+    scheduler.scheduler_count = 1;
+    for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane)
+        scheduler.cluster_worker_ids[lane] = lane;
+    auto *local = storage.local_context(&scheduler, &storage.scheduler_local_state);
+    for (uint32_t index = 0; index < SCHEDULER_PENDING_SLOT_COUNT; ++index) {
+        graph.executable(index, 1);
+        auto &slot = local->slots[1][index];
+        scheduler_initialize_free_slot(&slot);
+        slot.task_id = index;
+        slot.subtask_slot = 1;
+        slot.timing_slot = index;
+        slot.state = SchedulerDispatchSlotState::READY;
+        local->executor_traces[index].kernel_start_cycles = 100 + index;
+        local->executor_traces[index].kernel_end_cycles = 200 + index;
+        local->local_completed_generations[index] = slot.generation;
+        auto *control = scheduler_task_control_at(storage.scheduler_state->base(), local, index);
+        control->state = static_cast<int64_t>(SchedulerTaskState::BLOCKED);
+        storage.metadata[index].timing_slot = index;
+    }
+    ASSERT_TRUE(scheduler_service_cluster_completions(
+        graph.graph(), storage.scheduler_state->base(), local, storage.run_control, nullptr, nullptr, nullptr, nullptr,
+        0, nullptr, storage.ssbuf_region
+    ));
+    auto *traces =
+        scheduler_state_at<SchedulerTaskTrace>(storage.scheduler_state->base(), storage.layout.trace_cells_offset);
+    for (uint32_t index = 0; index < SCHEDULER_PENDING_SLOT_COUNT; ++index) {
+        EXPECT_EQ(traces[index].kernel_start_cycles, 100 + index);
+        EXPECT_EQ(traces[index].kernel_end_cycles, 200 + index);
+        EXPECT_FALSE(local->slots[1][index].sampled_task_timing());
+        EXPECT_EQ(storage.ssbuf_region->lanes[1].traces[index].payload.kernel_end_cycles, 0u);
+    }
 }
 
 TEST(SchedulerClusterCompletion, RejectsStaleCompletionGenerationAtNamedSite) {
@@ -1356,8 +1395,8 @@ TEST(SchedulerLocalConfig, RejectsTruncatedOffsetsAndInconsistentPayloadRoutes) 
 
 TEST(SchedulerLocalState, CompactLayoutAndPendingEndpointBoundaries) {
     EXPECT_EQ(sizeof(SchedulerLocalConfig), 96u);
-    EXPECT_EQ(sizeof(SchedulerLocalSlotState), 72u);
-    EXPECT_EQ(sizeof(SchedulerLocalState), 680u);
+    EXPECT_EQ(sizeof(SchedulerLocalSlotState), 24u);
+    EXPECT_EQ(sizeof(SchedulerLocalState), 488u);
     SchedulerLocalState local{};
     for (auto endpoints : local.owner_pending_endpoints)
         EXPECT_EQ(endpoints, UINT64_MAX);

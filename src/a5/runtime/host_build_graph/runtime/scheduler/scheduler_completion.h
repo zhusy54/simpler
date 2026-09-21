@@ -69,11 +69,11 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
         scheduler_record_error(run_control, task_id, SchedulerGraphResult::INVALID_TASK_ID, &graph, scheduler);
         return false;
     }
-    const bool sampled_task_timing_enabled = local_slot->sampled_task_timing != 0;
+    const bool sampled_task_timing_enabled = local_slot->sampled_task_timing();
     SchedulerExecutorTaskTrace executor_trace{};
     if (chip_task_timing_enabled || sampled_task_timing_enabled) {
         if (worker_id == scheduler->worker_id()) {
-            executor_trace = local_slot->executor_trace;
+            executor_trace = scheduler->executor_traces[pending_slot];
         } else {
             if (ssbuf_region == nullptr) return false;
             const SCHEDULER_SSBUF volatile SchedulerExecutorTaskTrace *published_trace =
@@ -201,7 +201,7 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
         local_slot->task_id = SCHEDULER_TASK_ID_INVALID;
         local_slot->state = SchedulerDispatchSlotState::FREE;
         local_slot->subtask_slot = UINT8_MAX;
-        local_slot->sampled_task_timing = 0;
+        local_slot->timing_slot = -1;
     }
     if (chip_task_timing_enabled) {
         if (phase_timing_enabled) {

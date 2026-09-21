@@ -100,13 +100,14 @@ struct SchedulerFreeSlotClaim {
 };
 
 struct SchedulerLocalSlotState {
-    int32_t timing_slot{-1};
     int64_t task_id{SCHEDULER_TASK_ID_INVALID};
     uint32_t generation{0};
+    int32_t timing_slot{-1};
     SchedulerDispatchSlotState state{SchedulerDispatchSlotState::EMPTY};
     uint8_t subtask_slot{UINT8_MAX};
-    uint8_t sampled_task_timing{0};
-    SchedulerExecutorTaskTrace executor_trace{};
+    inline __aicore__ bool sampled_task_timing() const {
+        return timing_slot >= 0 && timing_slot < SCHEDULER_TASK_TIMING_SLOT_COUNT;
+    }
 };
 
 struct SchedulerWorkerTraceCache {
@@ -162,6 +163,7 @@ struct SchedulerLocalState {
     SchedulerLocalSlotState slots[PLATFORM_CORES_PER_BLOCKDIM][SCHEDULER_PENDING_SLOT_COUNT]{};
     uint64_t consumed_completion_generations[PLATFORM_CORES_PER_BLOCKDIM]{};
     uint32_t local_completed_generations[SCHEDULER_PENDING_SLOT_COUNT]{};
+    SchedulerExecutorTaskTrace executor_traces[SCHEDULER_PENDING_SLOT_COUNT]{};
     SchedulerWorkerTraceCache worker_traces[PLATFORM_CORES_PER_BLOCKDIM]{};
     uint64_t owner_pending_endpoints[SCHEDULER_CORE_TYPE_COUNT]{};
     uint32_t loop_iter{0};
@@ -1085,7 +1087,6 @@ inline __aicore__ void scheduler_initialize_free_slot(SchedulerLocalSlotState *l
     local_slot->generation = generation;
     local_slot->state = SchedulerDispatchSlotState::FREE;
     local_slot->subtask_slot = UINT8_MAX;
-    local_slot->sampled_task_timing = 0;
 }
 
 inline __aicore__ bool scheduler_fill_dispatch_slot(
@@ -1183,8 +1184,6 @@ inline __aicore__ bool scheduler_fill_dispatch_slot(
     local_slot->generation = generation;
     local_slot->state = SchedulerDispatchSlotState::READY;
     local_slot->subtask_slot = subtask_slot;
-    local_slot->sampled_task_timing =
-        metadata.timing_slot >= 0 && metadata.timing_slot < SCHEDULER_TASK_TIMING_SLOT_COUNT ? 1 : 0;
     const bool remote = slot_claim.worker_id != scheduler->worker_id();
     SCHEDULER_SSBUF SchedulerSsbufDispatchControl *dispatch_control =
         &ssbuf_region->lanes[slot_claim.cluster_lane].dispatch[slot_claim.slot_index];

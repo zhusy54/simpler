@@ -416,7 +416,9 @@ token is reconstructed from the slot. Completion generation validation still
 prevents stale notifications from freeing or refilling a pending slot.
 
 The local configuration occupies 96 bytes under the 64-bit ABI. Local state also
-contains per-slot timing metadata, completion generations and Executor traces.
+contains six timing slots and completion generations. Only the two self-execution
+slots have local Executor traces; remote traces reside in SSBUF. Sampling is
+derived from the timing-slot range. The complete local state occupies 488 bytes.
 Profiling storage is present even when profiling is disabled.
 
 Before bootstrap, every participating core invalidates its entire data cache.

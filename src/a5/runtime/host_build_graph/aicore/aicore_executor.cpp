@@ -476,7 +476,7 @@ __aicore__ bool run_ready_dispatch_loop(
             uint64_t kernel_end = commit_executor_trace || phase_timing_enabled ? get_sys_cnt_aicore() : 0;
             if (commit_executor_trace) stage_task_trace_before_completion(&execution_trace, kernel_start, kernel_end);
             if (scheduler_worker) {
-                if (commit_executor_trace) local_slot->executor_trace = execution_trace;
+                if (commit_executor_trace) context->executor_traces[slot_index] = execution_trace;
             } else {
                 if (commit_executor_trace) {
                     SCHEDULER_SSBUF volatile SchedulerExecutorTaskTrace *published_trace =
