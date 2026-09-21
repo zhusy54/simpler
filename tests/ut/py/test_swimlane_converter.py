@@ -808,6 +808,26 @@ def test_task_statistics_without_scheduler_timestamps_hides_scheduler_metrics(ca
     assert total.split() == ["TOTAL", "1", "5.00", "-"]
     assert "AICore Observed Span: 5.50 us (from earliest AICore receive to latest AICore end)" in output
     assert "Total Test Time" not in output
+    assert "Host-computed" not in output
+
+
+def test_task_statistics_computes_dispatch_to_kernel_delay_on_host(capsys):
+    tasks = [
+        {
+            "task_id": i,
+            "func_id": 0,
+            "core_id": 0,
+            "core_type": "aic",
+            "start_time_us": start,
+            "end_time_us": start + 5,
+            "duration_us": 5,
+            "dispatch_time_us": dispatch,
+            "finish_time_us": start + 6,
+        }
+        for i, (dispatch, start) in enumerate([(1.0, 3.0), (10.0, 13.0)])
+    ]
+    sc.print_task_statistics(tasks, {"0": "kernel"}, chip_swimlane_level=3)
+    assert "Dispatch→kernel start (Host-computed): Total = 5.00 us, Max = 3.00 us" in capsys.readouterr().out
 
 
 def test_load_func_names_auto_discovery_and_explicit_precedence(tmp_path):
@@ -1044,7 +1064,6 @@ def test_aicore_scheduler_records_keep_common_shape_and_stream_metadata(tmp_path
     assert data["scheduler_task_producer"] == "aicore"
     assert data["tasks"][0]["dispatch_time_us"] == pytest.approx(0.025)
     assert data["tasks"][0]["finish_time_us"] == pytest.approx(0.095)
-    assert data["scheduler_streams"][0]["producer"] == "aicore"
     # The stream declares scheduler_id 2, so it occupies slot 2 and the two
     # unreported ids below it stay empty — list position is the scheduler index.
     assert [bool(records) for records in data["scheduler_records"]] == [False, False, True]

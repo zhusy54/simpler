@@ -15,6 +15,17 @@
 
 #include "scheduler_ready.h"
 
+// The caller publishes only at idle or in the common run epilogue. A barrier
+// keeps trace/error publication ahead of the terminal completion count.
+inline __aicore__ void
+scheduler_flush_completions(__gm__ SchedulerRunControl *run_control, SchedulerLocalState *local) {
+    const uint64_t completed = local->pending_completed;
+    if (completed == 0) return;
+    scheduler_cache_barrier();
+    scheduler_gm_fetch_add(run_control->resolved_task_count, completed);
+    local->pending_completed = 0;
+}
+
 inline __aicore__ void scheduler_account_failed_completion(
     const SchedulerGraphView &graph, SchedulerLocalState *scheduler, __gm__ SchedulerRunControl *run_control,
     int64_t task_id, SchedulerErrorSite error_site
@@ -27,7 +38,7 @@ inline __aicore__ void scheduler_account_failed_completion(
     // AICPU may treat the completion count as the terminal graph token. Publish
     // the error first so this failed completion can never look like success.
     scheduler_cache_barrier();
-    scheduler_gm_fetch_add(run_control->resolved_task_count, UINT64_C(1));
+    ++scheduler->pending_completed;
 }
 
 inline __aicore__ bool scheduler_service_cluster_completion_slot(
@@ -229,7 +240,7 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
     } else if (completed_trace != nullptr) {
         scheduler_publish_cache_line(&completed_trace->kernel_start_cycles);
     }
-    scheduler_gm_fetch_add(run_control->resolved_task_count, UINT64_C(1));
+    ++scheduler->pending_completed;
     if (direct_refilled != nullptr) *direct_refilled = refilled;
     return true;
 }

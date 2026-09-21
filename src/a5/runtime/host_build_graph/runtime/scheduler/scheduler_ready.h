@@ -143,6 +143,7 @@ struct SchedulerLocalConfig {
 
 struct SchedulerLocalState {
     SchedulerLocalConfig config{};
+    uint64_t pending_completed{0};
 
     inline __aicore__ SchedulerLocalState() {
         for (uint32_t type = 0; type < SCHEDULER_CORE_TYPE_COUNT; ++type)
@@ -1190,12 +1191,13 @@ inline __aicore__ bool scheduler_fill_dispatch_slot(
     if (remote) dispatch_control->task_id = ready_claim.task_id;
     scheduler_writeback_dispatch_payload(payload);
     scheduler_cache_barrier();
-    __gm__ SchedulerTaskControl *control =
-        scheduler_task_control_at(scheduler_state_base, scheduler, ready_claim.task_id);
-    if (phase_timing_enabled) {
-        scheduler_observe_cache_line(&control->next_waiter);
-        control->ready_publish_cycles = scheduler_cycles();
-        scheduler_publish_cache_line(&control->next_waiter);
+    const uint64_t ready_publish_cycles = schedule_timing_enabled ? scheduler_cycles() : 0;
+    if (remote) {
+        scheduler_ssbuf_store_relaxed(
+            &dispatch_control->publication, scheduler_ssbuf_pack_ready(generation, metadata.timing_slot)
+        );
+    } else {
+        scheduler_local_ready_publish(scheduler, slot_claim.slot_index);
     }
     if (task_timing_enabled) {
         __gm__ SchedulerTaskTrace *traces =
@@ -1222,15 +1224,8 @@ inline __aicore__ bool scheduler_fill_dispatch_slot(
             trace->dispatch_loop_iter = scheduler->loop_iter;
         }
         scheduler_publish_cache_line(trace);
-        if (schedule_timing_enabled) trace->dispatch_end_cycles = scheduler_cycles();
+        if (schedule_timing_enabled) trace->dispatch_end_cycles = ready_publish_cycles;
         if (schedule_timing_enabled) scheduler_publish_cache_line(&trace->dispatch_start_cycles);
-    }
-    if (remote) {
-        scheduler_ssbuf_store_relaxed(
-            &dispatch_control->publication, scheduler_ssbuf_pack_ready(generation, metadata.timing_slot)
-        );
-    } else {
-        scheduler_local_ready_publish(scheduler, slot_claim.slot_index);
     }
     return true;
 }

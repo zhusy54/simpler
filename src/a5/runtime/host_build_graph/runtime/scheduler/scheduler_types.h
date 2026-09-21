@@ -786,7 +786,7 @@ struct alignas(128) SchedulerTaskControl {
     int32_t waiting_producer;
     uint64_t completion_resolve_start_cycles;
     uint64_t completion_resolve_end_cycles;
-    uint64_t ready_publish_cycles;
+    uint64_t reserved_ready_publish;
     uint64_t scheduler_worker_id;
     uint64_t completion_resolve_loop_iter;
     uint8_t scheduler_line_padding[8];
@@ -1091,8 +1091,8 @@ struct alignas(128) SchedulerWorkerContext {
     uint64_t trace_register_release_cycles;
     uint64_t trace_descriptor_cache_observed_cycles;
     uint64_t completion_stats_reserved[2];
-    uint64_t ready_to_kernel_cycles;
-    uint64_t ready_to_kernel_max_cycles;
+    uint64_t reserved_ready_to_kernel_cycles;
+    uint64_t reserved_ready_to_kernel_max_cycles;
     uint64_t payload_cycles;
     uint64_t kernel_cycles;
 

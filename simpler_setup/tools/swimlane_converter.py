@@ -2042,6 +2042,12 @@ def print_task_statistics(tasks, func_id_to_name=None, chip_swimlane_level=None)
             f"Exec/Latency = {exec_latency_ratio_pct:.2f}%"
         )
         print("  (Latency = dispatch→finish; Exec = AICore kernel time per task)")
+        handoff_delays = [delay for stats in func_stats.values() for delay in stats["head_overheads"]]
+        if handoff_delays:
+            print(
+                f"  Dispatch→kernel start (Host-computed): Total = {sum(handoff_delays):.2f} us, "
+                f"Max = {max(handoff_delays):.2f} us"
+            )
 
     print("=" * 110)
 

@@ -27,7 +27,7 @@ __aicore__ void legacy_aicore_execute(__gm__ Runtime *runtime, int block_idx, Co
 namespace {
 
 constexpr uint32_t kInitialBackoffIterations = 8;
-constexpr uint32_t kMaximumBackoffIterations = 128;
+constexpr uint32_t kMaximumBackoffIterations = 32;
 constexpr uint32_t kSchedulerErrorPollInterval = 64;
 
 static_assert(SCHEDULER_CALLABLE_CAPACITY == RUNTIME_MAX_FUNC_ID, "AICore ready scheduler layout mismatch");
@@ -102,8 +102,6 @@ publish_worker_stats(__gm__ SchedulerWorkerContext *context, const SchedulerWork
     context->wake_close_count = stats.wake.wake_close_count;
     context->completion_enqueue_count = stats.completion.enqueue_count;
     context->completion_resolve_count = stats.completion.resolve_count;
-    context->ready_to_kernel_cycles = stats.completion.ready_to_kernel_cycles;
-    context->ready_to_kernel_max_cycles = stats.completion.ready_to_kernel_max_cycles;
     context->payload_cycles = stats.payload_cycles;
     context->kernel_cycles = stats.kernel_cycles;
     scheduler_publish_cache_line(&context->wake_cas_retry_count);
@@ -461,17 +459,6 @@ __aicore__ bool run_ready_dispatch_loop(
             }
             OUT_OF_ORDER_STORE_BARRIER();
             uint64_t kernel_start = commit_executor_trace || phase_timing_enabled ? get_sys_cnt_aicore() : 0;
-            if (phase_timing_enabled) {
-                __gm__ SchedulerTaskControl *control =
-                    scheduler_task_control_at(scheduler_state_base, context, task_id);
-                scheduler_observe_cache_line(&control->next_waiter);
-                if (control->ready_publish_cycles != 0 && kernel_start >= control->ready_publish_cycles) {
-                    uint64_t lag = kernel_start - control->ready_publish_cycles;
-                    stats->completion.ready_to_kernel_cycles += lag;
-                    if (lag > stats->completion.ready_to_kernel_max_cycles)
-                        stats->completion.ready_to_kernel_max_cycles = lag;
-                }
-            }
             execute_task(payload);
             uint64_t kernel_end = commit_executor_trace || phase_timing_enabled ? get_sys_cnt_aicore() : 0;
             if (commit_executor_trace) stage_task_trace_before_completion(&execution_trace, kernel_start, kernel_end);
@@ -517,6 +504,8 @@ __aicore__ bool run_ready_dispatch_loop(
             backoff_iterations = kInitialBackoffIterations;
             continue;
         }
+        if (scheduler_worker && (deferred_aiv == nullptr || deferred_aiv->count == 0))
+            scheduler_flush_completions(run_control, context);
         if (phase_timing_enabled) ++stats->idle_iteration_count;
         uint64_t backoff_start = get_sys_cnt_aicore();
         local_backoff(backoff_iterations);
@@ -732,6 +721,8 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             }
         }
     }
+
+    scheduler_flush_completions(run_control, &scheduler_local_state);
 
     if (phase_timing_enabled && stats.exit_wait_start_cycles == 0) stats.exit_wait_start_cycles = get_sys_cnt_aicore();
     const uint64_t exit_wait_start = get_sys_cnt_aicore();

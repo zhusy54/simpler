@@ -418,7 +418,7 @@ prevents stale notifications from freeing or refilling a pending slot.
 The local configuration occupies 96 bytes under the 64-bit ABI. Local state also
 contains six timing slots and completion generations. Only the two self-execution
 slots have local Executor traces; remote traces reside in SSBUF. Sampling is
-derived from the timing-slot range. The complete local state occupies 488 bytes.
+derived from the timing-slot range. The complete local state occupies 496 bytes.
 Profiling storage is present even when profiling is disabled.
 
 Before bootstrap, every participating core invalidates its entire data cache.
@@ -442,8 +442,18 @@ Self-execution uses local notifications, completion generations and trace storag
 
 Simulation allocates an aligned 3 KiB backing region per physical cluster,
 shared by its AIC and two AIV lanes and retired with the run. Initialization
-tolerates nonzero previous contents. Completion counts are published after
-each resolved task and after any associated error.
+tolerates nonzero previous contents.
+
+Resolved counts accumulate locally until an idle pass with no local executable
+task or deferred reservation, or the common run epilogue. Trace and error
+publication precedes each count flush. The AICPU watchdog remains 20 seconds
+by default, so continuously busy work without count publication can reach
+that timeout.
+
+Directory queries are skipped when no active, unreserved FREE slot can accept
+work. Idle polling backs off from 8 to at most 32 iterations. Dispatch trace
+GM writes follow ready publication; Host tooling computes ready-to-kernel
+latency from the recorded timestamps.
 
 ## 8. Scalar Access During Construction
 

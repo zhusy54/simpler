@@ -43,6 +43,28 @@ inline __aicore__ bool scheduler_normal_aiv_worker_precedes(
     return candidate_occupied_slots < selected_occupied_slots;
 }
 
+// A directory load is useful only when the corresponding work can be claimed.
+inline __aicore__ bool scheduler_has_usable_slot(
+    __gm__ void *scheduler_state_base, const SchedulerLocalState *local, uint32_t core_type, uint64_t skip_slot_mask,
+    const SchedulerDeferredAivQueue *deferred_aiv
+) {
+    for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
+        const uint64_t worker_id = local->config.worker_ids[lane];
+        if (worker_id >= local->config.runtime_worker_count) continue;
+        auto *target = scheduler_worker_context_at(scheduler_state_base, local, worker_id);
+        if (target->active == 0 || target->core_type != static_cast<int32_t>(core_type)) continue;
+        if (core_type == static_cast<uint32_t>(CoreType::AIV) && lane == local->config.self_lane &&
+            (deferred_aiv == nullptr || deferred_aiv->count >= SCHEDULER_PENDING_SLOT_COUNT))
+            continue;
+        for (uint32_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot) {
+            if ((skip_slot_mask & (UINT64_C(1) << (lane * SCHEDULER_PENDING_SLOT_COUNT + slot))) == 0 &&
+                local->slots[lane][slot].state == SchedulerDispatchSlotState::FREE)
+                return true;
+        }
+    }
+    return false;
+}
+
 // The return value reports whether this pass made progress; failed independently reports an aborted pass.
 inline __aicore__ bool scheduler_fill_cluster_normal_slots(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
@@ -57,7 +79,8 @@ inline __aicore__ bool scheduler_fill_cluster_normal_slots(
     bool progress = false;
 
     // AIC has no peer lane in its Cluster, so preserve the existing slot order.
-    if (scheduler_ready_directory_nonempty(
+    if (scheduler_has_usable_slot(scheduler_state_base, scheduler, aic_core_type, skip_slot_mask, deferred_aiv) &&
+        scheduler_ready_directory_nonempty(
             scheduler_state_base, scheduler, scheduler->config.scheduler_count, aic_core_type
         )) {
         bool aic_ready_available = true;
@@ -119,7 +142,8 @@ inline __aicore__ bool scheduler_fill_cluster_normal_slots(
     };
     const uint32_t aiv_core_type = static_cast<uint32_t>(CoreType::AIV);
     state_probe_start_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
-    if (scheduler_ready_directory_nonempty(
+    if (scheduler_has_usable_slot(scheduler_state_base, scheduler, aiv_core_type, skip_slot_mask, deferred_aiv) &&
+        scheduler_ready_directory_nonempty(
             scheduler_state_base, scheduler, scheduler->config.scheduler_count, aiv_core_type
         )) {
         AivWorkerSlots aiv_workers[PLATFORM_AIV_CORES_PER_BLOCKDIM]{};
