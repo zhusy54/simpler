@@ -1264,13 +1264,14 @@ bool create_scheduler_state(
         context.active = 0;
         context.run_control_offset = layout.run_control_offset;
         context.task_controls_offset = layout.task_controls_offset;
-        context.completion_inboxes_offset = layout.completion_inboxes_offset;
+        context.scheduler_ssbuf_reserved0 = 0;
         context.task_metadata_offset = layout.task_metadata_offset;
         context.aicpu_lifecycle_traces_offset = layout.aicpu_lifecycle_traces_offset;
         context.ready_inboxes_offset = layout.ready_inboxes_offset;
+        context.scheduler_ssbuf_reserved1 = 0;
         context.ready_directory_offset = layout.ready_directory_offset;
         context.worker_contexts_offset = layout.worker_contexts_offset;
-        context.dispatch_slots_offset = layout.dispatch_slots_offset;
+        context.scheduler_ssbuf_reserved2 = 0;
         context.callable_addresses_offset = layout.callable_addresses_offset;
         context.runtime_worker_count = static_cast<uint64_t>(runtime->get_worker_count());
         context.bootstrap_done = 0;

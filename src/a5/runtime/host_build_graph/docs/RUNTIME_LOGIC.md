@@ -415,14 +415,33 @@ READY with the same generation until the local Executor claims it, so the ready
 token is reconstructed from the slot. Completion generation validation still
 prevents stale notifications from freeing or refilling a pending slot.
 
-The local configuration occupies 96 bytes and the complete local state 336 bytes
-under the 64-bit ABI. Profiling storage is present even when profiling is disabled.
-These sizes exclude other function locals and compiler spills.
+The local configuration occupies 96 bytes under the 64-bit ABI. Local state also
+contains per-slot timing metadata, completion generations and Executor traces.
+Profiling storage is present even when profiling is disabled.
 
 Before bootstrap, every participating core invalidates its entire data cache.
 The callable table and task metadata are immutable throughout that run, allowing
 callable lookup and completion resolution to omit repeated invalidation of those
 immutable lines.
+
+Dispatch payloads remain in GM. Remote dispatch and completion generations,
+and Executor trace staging, occupy the last contiguous KiB of each cluster's
+3 KiB SSBUF; the low 2 KiB remain available to user kernels. Each of three
+lanes has two dispatch slots, two 64-byte trace slots, and one completion word.
+Local trace payloads have natural alignment independently of shared slots.
+
+A dispatch word packs generation and signed timing slot; the Executor owns a
+completion-word shadow containing both slot generations. Polling misses need
+no barrier. A hit acquires before consuming payload or trace, while payload
+writeback and ready publication share a release barrier. Tokens are SPSC and
+use no SSBUF read-modify-write atomics. The Scheduler initializes every token
+before publishing the header, and each invocation validates the region.
+Self-execution uses local notifications, completion generations and trace storage.
+
+Simulation allocates an aligned 3 KiB backing region per physical cluster,
+shared by its AIC and two AIV lanes and retired with the run. Initialization
+tolerates nonzero previous contents. Completion counts are published after
+each resolved task and after any associated error.
 
 ## 8. Scalar Access During Construction
 
