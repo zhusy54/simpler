@@ -55,6 +55,10 @@ void FaninPool::reclaim(SharedMemoryRingHeader &ring, int32_t sm_last_task_alive
 
 bool FaninPool::ensure_space(SharedMemoryRingHeader &ring, int32_t needed) {
     if (available() >= needed) return true;
+#if SIMPLER_DFX
+    ChipSwimlaneWaitScope profile_wait;
+    profile_wait.begin(SchedulerWaitReason::FaninSpill);
+#endif
 
     int spin_count = 0;
     int32_t prev_last_alive = ring.fc.last_task_alive.load(std::memory_order_acquire);
@@ -189,6 +193,10 @@ void DepListPool::report_deadlock(SharedMemoryRingHeader &ring, int32_t needed, 
 
 bool DepListPool::ensure_space(SharedMemoryRingHeader &ring, int32_t needed, ChipTaskSlotState *oldest_open_task) {
     if (available() >= needed) return true;
+#if SIMPLER_DFX
+    ChipSwimlaneWaitScope profile_wait;
+    profile_wait.begin(SchedulerWaitReason::DependencyPool);
+#endif
 
     int spin_count = 0;
     int32_t prev_last_alive = ring.fc.last_task_alive.load(std::memory_order_acquire);

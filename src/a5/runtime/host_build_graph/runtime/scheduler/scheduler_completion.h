@@ -134,8 +134,8 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
         // Finish all trace invalidations before any cached trace write.
         scheduler_invalidate_cache_line(completed_trace);
         scheduler_invalidate_cache_line(&completed_trace->kernel_start_cycles);
+        if (schedule_timing_enabled) scheduler_invalidate_cache_line(&completed_trace->ready_transition_cycles);
         if (phase_timing_enabled) {
-            scheduler_invalidate_cache_line(&completed_trace->ready_transition_cycles);
             scheduler_invalidate_cache_line(&completed_trace->dispatch_start_cycles);
             scheduler_invalidate_cache_line(&completed_trace->refill_scheduler_worker_id);
             scheduler_invalidate_cache_line(&completed_trace->descriptor_cache_observed_cycles);
@@ -277,7 +277,7 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
         }
         scheduler_writeback_cache_line(completed_trace);
         scheduler_writeback_cache_line(&completed_trace->kernel_start_cycles);
-        if (phase_timing_enabled) scheduler_writeback_cache_line(&completed_trace->ready_transition_cycles);
+        if (schedule_timing_enabled) scheduler_writeback_cache_line(&completed_trace->ready_transition_cycles);
         if (schedule_timing_enabled) scheduler_writeback_cache_line(&completed_trace->dispatch_start_cycles);
         if (phase_timing_enabled) scheduler_writeback_cache_line(&completed_trace->refill_scheduler_worker_id);
         if (phase_timing_enabled) scheduler_writeback_cache_line(&completed_trace->descriptor_cache_observed_cycles);

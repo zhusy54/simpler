@@ -1230,11 +1230,17 @@ void SchedulerContext::classify_partition(int32_t thread_idx, int32_t nthreads, 
     // [submitted*t/nthreads, submitted*(t+1)/nthreads). int64 math avoids overflow.
     const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(submitted) * thread_idx) / nthreads);
     const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(submitted) * (thread_idx + 1)) / nthreads);
+#if SIMPLER_DFX
+    const uint64_t image_visible = chip_swimlane_level_ >= ChipSwimlaneLevel::SCHEDULE_TIMING ? get_sys_cnt_aicpu() : 0;
+#endif
     for (int32_t id = lo; id < hi; id++) {
         if (tasks.is_completed(id)) {
             continue;  // completed on the host (hidden alloc); nothing to dispatch
         }
         ChipTaskSlotState &slot = tasks.get_slot_state_by_task_id(id);
+#if SIMPLER_DFX
+        if (image_visible != 0) slot.to_payload().transition_timing = {0, image_visible};
+#endif
         if (slot.task_kind == TaskKind::GRAPH) {
             if (graph_execution_localize(slot, image) == nullptr) slot.graph_context = nullptr;
             if (!sched_->push_graph_prepare(&slot, slot.to_descriptor().task_id, thread_idx)) return;

@@ -62,6 +62,7 @@
 #include "common/host_phase_kind.h"
 #include "common/platform_config.h"
 #include "common/scheduler_profiling.h"
+#include "common/task_transition_timing.h"
 // The owning runtime's task handle. Each runtime has its own TaskId in its own
 // namespace, and the include path resolves this bare name to whichever runtime is
 // being built: src/common/<runtime> is on that build's include path, and reaching
@@ -98,9 +99,8 @@ enum class ChipSwimlaneLevel : uint32_t {
  * AICPU Scheduler timing record. The minimal AICPU-only payload after the
  * AICore-as-producer split: identity (task_token, core_type) and
  * AICore-side timing (start/end) all live in ChipSwimlaneAicoreTaskRecord; the
- * AICPU record carries only the two timestamps the AICore side cannot produce
- * (the scheduler's dispatch/finish), plus the host-side join key against the
- * AICore stream.
+ * AICPU record carries dispatch/finish, Ready and registration timing, plus
+ * the per-core join key against the AICore stream.
  *
  *   - dispatch_time : AICPU timestamp when DATA_MAIN_BASE was written.
  *   - finish_time   : AICPU timestamp when AICPU observed FIN.
@@ -119,18 +119,21 @@ enum class ChipSwimlaneLevel : uint32_t {
  * critical fanin tail. `swimlane_converter.py` joins deps.json at
  * post-process time.
  *
- * Layout: 16B timing + 4B reg_task_id → 20B logical; `aligned(32)` rounds
- * the struct size up to 32B (compiler-inserted trailing pad) and forces
- * 32B placement alignment so each record sits in one half of a 64B cache
- * line. Two records per cache line.
+ * The naturally aligned 40B record includes logical-task Ready/registration
+ * timestamps. gate_after_ready_cycles is UINT32_MAX when no gate was observed
+ * or timing was unavailable. UINT32_MAX-1 marks an observed gate whose delta
+ * could not be represented. Control nodes live in the Scheduler phase stream.
  */
 struct ChipSwimlaneAicpuTaskRecord {
     uint64_t dispatch_time;  // AICPU timestamp: when task was dispatched to AICore
     uint64_t finish_time;    // AICPU timestamp: when AICPU observed task completion
     uint32_t reg_task_id;    // Per-core dispatch token; host join key vs AICore record
-} __attribute__((aligned(32)));
+    uint32_t gate_after_ready_cycles{UINT32_MAX};
+    uint64_t ready_time;
+    uint64_t registered_time;
+};
 
-static_assert(sizeof(ChipSwimlaneAicpuTaskRecord) == 32, "ChipSwimlaneAicpuTaskRecord must be 32B");
+static_assert(sizeof(ChipSwimlaneAicpuTaskRecord) == 40, "ChipSwimlaneAicpuTaskRecord must be 40B");
 
 // =============================================================================
 // ChipSwimlaneAicoreTaskRecord - Slim AICore-Only Record (written by AICore, read by Host)
@@ -671,13 +674,14 @@ struct ChipSwimlaneDataHeader {
      * yet initialized.
      */
     uint32_t handoff_schema;
+    ChipSwimlaneRuntimeStats runtime_stats;
 } __attribute__((aligned(64)));
 
 /**
  * Bumped whenever the meaning of a ready-entry field changes, not its size.
- * 1 — `record_count` and `run_epoch` are published by the producer.
+ * 2 — identity-bearing handoffs with 40B Scheduler task records.
  */
-constexpr uint32_t kChipSwimlaneHandoffSchema = 1;
+constexpr uint32_t kChipSwimlaneHandoffSchema = 2;
 
 // ABI lock for the merged header. The phase metadata fields and the
 // core_to_thread[] array are read by both host and AICPU .so's; silent

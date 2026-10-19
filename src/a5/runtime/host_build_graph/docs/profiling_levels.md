@@ -451,7 +451,11 @@ The A5 HBG AICore Scheduler records the same per-task timing contract as the
 AICPU Scheduler: `dispatch_time` is the end of dispatch publication and
 `finish_time` is when the Scheduler starts processing the completion. The raw
 `scheduler_tasks.producer` field identifies which Scheduler produced these
-timestamps. At level 2 and above, A5 HBG also exports AICPU lifecycle timestamps
+timestamps. The optional `task_transitions` section exports logical Ready and
+Executor-acquisition timing at level 2 without increasing `SchedulerTaskTrace`.
+Ready is recorded before queue/batch publication; that publication cost belongs
+to Ready-to-dispatch. Early-dispatch and device-registration timing are exported
+by the legacy AICPU path when available. At level 2 and above, A5 HBG also exports AICPU lifecycle timestamps
 for handshake, topology/configuration, context publication, bootstrap wait,
 register release, and exit. Collection and rendering use one record per AICPU
 thread; topology/configuration is present only on the leader thread. These are

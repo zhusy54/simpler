@@ -85,6 +85,7 @@ enum class SchedPhaseKind : uint8_t {
     Worksteal = 13,          // Remote Inbox claim and dispatch.
     Refill = 14,             // Completed Slot reuse.
     Idle = 15,               // AICore scheduler spin with no progress.
+    ControlTask = 240,       // Ready-to-retire interval of a dependency-only task.
 };
 
 // This phase's name as a report spells it. Returns a string literal, so it is safe on
@@ -93,6 +94,8 @@ enum class SchedPhaseKind : uint8_t {
 // to name.
 constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
     switch (kind) {
+    case SchedPhaseKind::ControlTask:
+        return "control_task";
     case SchedPhaseKind::Complete:
         return "complete";
     case SchedPhaseKind::Dispatch:
@@ -133,7 +136,9 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
 // exporter writes phase_data.task_id or null. GraphPrepare names the outer modular task
 // whose Definition it expanded; every other phase of this runtime acts on a batch rather
 // than one task, and its task_id field holds nothing.
-constexpr bool sched_phase_carries_task_id(SchedPhaseKind kind) { return kind == SchedPhaseKind::GraphPrepare; }
+constexpr bool sched_phase_carries_task_id(SchedPhaseKind kind) {
+    return kind == SchedPhaseKind::GraphPrepare || kind == SchedPhaseKind::ControlTask;
+}
 
 // Whether a record of this phase carries the ready-queue hit/miss deltas, which decides
 // whether the exporter writes them beside it. They are a property of a pop attempt, so

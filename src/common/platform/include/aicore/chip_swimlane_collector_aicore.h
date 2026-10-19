@@ -92,7 +92,8 @@ __aicore__ __attribute__((always_inline)) static inline void chip_swimlane_aicor
     TaskId::assign(record->task_token, task_token);
     record->reg_task_id = reg_task_id;
     // 32-bit delta; receive_time always precedes start_time on the same core.
-    record->receive_to_start_cycles = static_cast<uint32_t>(start_time - receive_time);
+    const uint64_t receive_delta = start_time - receive_time;
+    record->receive_to_start_cycles = receive_delta < UINT32_MAX ? static_cast<uint32_t>(receive_delta) : UINT32_MAX;
 
     dcci(record, SINGLE_CACHE_LINE, CACHELINE_OUT);
     dsb((mem_dsb_t)0);

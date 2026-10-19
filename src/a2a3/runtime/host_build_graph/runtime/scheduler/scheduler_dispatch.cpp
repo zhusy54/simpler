@@ -1117,6 +1117,12 @@ int32_t SchedulerContext::run_resolution_thread(Runtime *runtime, int32_t thread
                 }
 #endif
                 for (int di = 0; di < dummy_got; di++) {
+#if SIMPLER_DFX
+                    chip_swimlane_aicpu_control_task(
+                        thread_idx, dummy_batch[di]->to_descriptor().task_id,
+                        dummy_batch[di]->to_payload().transition_timing
+                    );
+#endif
 #if SIMPLER_SCHED_PROFILING
                     SchedulerState::TaskCompletionOutcome outcome = sched_->complete_task(*dummy_batch[di], thread_idx);
 #else

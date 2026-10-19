@@ -1208,6 +1208,11 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
             for (int di = 0; di < dummy_got; di++) {
                 ChipTaskSlotState &dummy_slot = *dummy_batch[di];
+#if SIMPLER_DFX
+                chip_swimlane_aicpu_control_task(
+                    thread_idx, dummy_slot.task->task_id, dummy_slot.payload->transition_timing
+                );
+#endif
 
                 // ----- Resolve work: walk this dummy's consumer list. ------
                 // Same 1 µs filter as the main-path Resolve emit suppresses

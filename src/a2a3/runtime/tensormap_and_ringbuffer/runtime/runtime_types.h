@@ -31,6 +31,7 @@
 #include <atomic>
 
 #include "profiling_config.h"
+#include "common/task_transition_timing.h"
 #include "constants.h"
 #include "runtime_status.h"
 #include "dispatch_payload.h"
@@ -365,6 +366,7 @@ struct TaskPayload {
     // / scalars offsets only. Resolved at submit; evaluated by the scheduler at
     // dispatch.
     alignas(64) DispatchPredicate predicate;
+    TaskTransitionTiming transition_timing{};
     // === Cache lines 10-73 (4096B) — tensors (alignas(64) forces alignment) ===
     simpler::tmr::Tensor tensors[MAX_TENSOR_ARGS];
     // === Cache lines 74-75 (128B) — scalars ===

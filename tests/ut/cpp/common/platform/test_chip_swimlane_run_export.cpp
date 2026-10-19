@@ -83,6 +83,13 @@ constexpr const char *kGoldenArtifact = R"GOLDEN({
     [0, 2, 901, 1601, 7700]
     ]
   },
+  "task_transitions": {
+    "schema_version": 1, "scheduler_record_bytes": 40, "executor_record_bytes": 32, "capture": {"complete": true, "expected_fragments": 4, "emitted_fragments": 4, "dropped": 0},
+    "fragment_records": [
+      [0, 1, 7700, null, null, null],
+      [0, 2, 7700, null, null, null]
+    ], "early_dispatch": [], "pre_registered": <PRE_REGISTERED>
+  },
   "scheduler_records": {
     "streams": [
       {"platform": "a2a3", "producer": "aicpu", "scheduler_id": 0, "worker_id": 0, "core_type": "aicpu", "physical_core_id": null, "capture": {"committed": 2, "dropped": 5, "truncated": true}, "records": [
@@ -163,6 +170,12 @@ std::string written_artifact(const std::string &prefix) {
  */
 std::string expected_golden() {
     std::string golden(kGoldenArtifact);
+    const std::string marker = "<PRE_REGISTERED>";
+    const auto position = golden.find(marker);
+    if (position != std::string::npos)
+        golden.replace(
+            position, marker.size(), std::string_view(SIMPLER_RUNTIME_NAME) == "host_build_graph" ? "true" : "false"
+        );
     return fixture::host_clock_domain_id_available() ? golden : fixture::without_host_clock_domain_id(golden);
 }
 
@@ -178,7 +191,7 @@ void expect_matches_golden(const std::string &prefix) {
 
 // The artifact is unchanged, field for field, against the writer this change
 // replaced. A dropped column, a renamed key or a reordered section fails here.
-TEST(ChipSwimlaneRunExportTest, SealedArtifactMatchesThePreChangeWriter) {
+TEST(ChipSwimlaneRunExportTest, SealedArtifactMatchesSchemaGolden) {
     ScratchDir scratch("golden");
 
     ChipSwimlaneCollector collector;

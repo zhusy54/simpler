@@ -565,6 +565,35 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
     }
 
     if (need_scheduler_timing) {
+        uint64_t root_release = 0;
+        for (uint64_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker) {
+            const uint64_t cycles = contexts[worker].bootstrap_start_cycles;
+            if (cycles != 0 && (root_release == 0 || cycles < root_release)) root_release = cycles;
+        }
+        std::ostringstream transitions;
+        transitions << "{\"root_release_cycles\": " << root_release
+                    << ", \"schema_version\": 1, \"additional_device_trace_bytes\": 0, "
+                       "\"pre_registered\": true, \"capture\": {\"expected_fragments\": "
+                    << owner.layout.executable_subtask_count << ", \"emitted_fragments\": " << emitted_traces.size()
+                    << ", \"complete\": "
+                    << (emitted_traces.size() == owner.layout.executable_subtask_count ? "true" : "false")
+                    << "}, \"fragment_records\": [";
+        bool first_transition = true;
+        for (uint64_t index : emitted_traces) {
+            const auto &trace = traces[index];
+            if (!first_transition) transitions << ",";
+            transitions << "[" << trace.worker_id << ", " << trace.task_id << ", " << swimlane_run_epoch << ", ";
+            if (trace.ready_transition_cycles != 0) transitions << trace.ready_transition_cycles;
+            else transitions << "null";
+            transitions << ", null, null]";
+            first_transition = false;
+        }
+        transitions << "]}";
+        const auto transitions_payload = transitions.str();
+        if (!api->publish_chip_swimlane_extension(
+                ChipSwimlaneExtensionSection::TaskTransitions, transitions_payload.c_str(), transitions_payload.size()
+            ))
+            return false;
         std::ostringstream scheduler_tasks_json;
         scheduler_tasks_json << "{\n    \"producer\": \"aicore\",\n    \"records\": [";
         bool first_scheduler_task = true;

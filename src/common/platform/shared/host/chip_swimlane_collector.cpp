@@ -2305,6 +2305,8 @@ ChipSwimlaneCollector::RunExport ChipSwimlaneCollector::seal_epoch_store(size_t 
                 get_sched_phase_buffer_state(shm_host_, static_cast<int>(t))->head.dropped_record_count;
         }
         data.num_orch_phase_threads = get_chip_swimlane_header(shm_host_)->num_orch_phase_threads;
+        data.runtime_stats = get_chip_swimlane_header(shm_host_)->runtime_stats;
+        data.runtime_stats_valid = data.runtime_stats.present != 0 && data.runtime_stats.run_epoch == armed_run_epoch_;
     }
 
     data.total_perf_collected = total_perf_collected_;
@@ -2571,6 +2573,22 @@ int ChipSwimlaneCollector::write_swimlane_json(const RunExport &data) {
         }
         outfile << "]";
     }
+    if (data.runtime_stats_valid) {
+        const auto &stats = data.runtime_stats;
+        outfile << ",\n    \"runtime_stats\": {\"run_epoch\": " << stats.run_epoch << ", \"waits\": [";
+        for (int i = 0; i < 4; ++i) {
+            if (i != 0) outfile << ",";
+            outfile << "{\"reason\": " << i << ", \"count\": " << stats.wait_count[i]
+                    << ", \"total_cycles\": " << stats.wait_cycles[i]
+                    << ", \"max_cycles\": " << stats.max_wait_cycles[i] << "}";
+        }
+        outfile << "], \"dependency_peak\": [";
+        for (int ring = 0; ring < 32; ++ring) {
+            if (ring != 0) outfile << ",";
+            outfile << stats.dependency_peak[ring];
+        }
+        outfile << "]}";
+    }
     outfile << "\n  },\n";
 
     // Per-stream raw records. Flat array of tuples — compact at scale (a real
@@ -2635,6 +2653,59 @@ int ChipSwimlaneCollector::write_swimlane_json(const RunExport &data) {
             if (!first) outfile << "\n    ";
             outfile << "]\n  }";
             LOG_INFO("  scheduler_tasks: %zu AICPU records", total);
+        }
+    }
+
+    if (data.level >= ChipSwimlaneLevel::SCHEDULE_TIMING) {
+        outfile << ",\n  \"task_transitions\": ";
+        if (const auto *transitions = extension(ChipSwimlaneExtensionSection::TaskTransitions)) {
+            outfile << *transitions;
+        } else {
+            const auto &accounting = data.aicore_accounting;
+            const bool complete = accounting.known && accounting.identity_ok && accounting.device_dropped == 0 &&
+                                  accounting.host_skipped == 0 && accounting.device_total == accounting.host_collected;
+            outfile << "{\n    \"schema_version\": 1, \"scheduler_record_bytes\": 40, "
+                       "\"executor_record_bytes\": 32, \"capture\": {\"complete\": "
+                    << (complete ? "true" : "false") << ", \"expected_fragments\": " << accounting.device_total
+                    << ", \"emitted_fragments\": " << data.total_aicore_collected
+                    << ", \"dropped\": " << accounting.device_dropped + accounting.host_skipped
+                    << "},\n    \"fragment_records\": [";
+            bool first = true;
+            for (size_t core = 0; core < data.perf_records.size(); ++core) {
+                for (const auto &collected : data.perf_records[core]) {
+                    const auto &r = collected.record;
+                    if (!first) outfile << ",";
+                    outfile << "\n      [" << core << ", " << r.reg_task_id << ", " << collected.run_epoch << ", ";
+                    if (r.ready_time != 0) outfile << r.ready_time;
+                    else outfile << "null";
+                    outfile << ", ";
+                    if (r.registered_time != 0) outfile << r.registered_time;
+                    else outfile << "null";
+                    outfile << ", ";
+                    if (r.ready_time != 0 && r.gate_after_ready_cycles < UINT32_MAX - 1) {
+                        outfile << r.ready_time + r.gate_after_ready_cycles;
+                    } else {
+                        outfile << "null";
+                    }
+                    outfile << "]";
+                    first = false;
+                }
+            }
+            if (!first) outfile << "\n    ";
+            outfile << "], \"early_dispatch\": [";
+            first = true;
+            for (size_t core = 0; core < data.perf_records.size(); ++core) {
+                for (const auto &collected : data.perf_records[core]) {
+                    if (collected.record.ready_time == 0 || collected.record.gate_after_ready_cycles == UINT32_MAX)
+                        continue;
+                    if (!first) outfile << ",";
+                    outfile << "[" << core << ", " << collected.record.reg_task_id << ", " << collected.run_epoch
+                            << "]";
+                    first = false;
+                }
+            }
+            outfile << "], \"pre_registered\": "
+                    << (std::string_view(SIMPLER_RUNTIME_NAME) == "host_build_graph" ? "true" : "false") << "\n  }";
         }
     }
 
@@ -3640,6 +3711,16 @@ void ChipSwimlaneCollector::run_close(
         }
         total_device += head.total_record_count;
         dropped_device += head.dropped_record_count;
+    }
+    ChipSwimlaneRuntimeStats runtime_stats{};
+    uint64_t stats_epoch_after = 0;
+    if (read_shm_field(&get_chip_swimlane_header(shm_host_)->runtime_stats, &runtime_stats, sizeof(runtime_stats)) &&
+        read_shm_field(
+            &get_chip_swimlane_header(shm_host_)->runtime_stats.run_epoch, &stats_epoch_after, sizeof(stats_epoch_after)
+        ) &&
+        runtime_stats.run_epoch == run_epoch && stats_epoch_after == run_epoch && runtime_stats.present != 0) {
+        bucket.pending.runtime_stats = runtime_stats;
+        bucket.pending.runtime_stats_valid = true;
     }
     bucket.live.mirror_ok = reads_ok;
     bucket.live.aicpu_task_total = total_device;

@@ -40,6 +40,15 @@
  */
 uint64_t get_sys_cnt_aicpu();
 
+inline uint64_t get_sys_cnt_aicpu_observed() {
+#if defined(__aarch64__)
+    // CNTVCT is not a memory access; a load-order barrier alone does not
+    // prevent its observation from preceding a completed MMIO read.
+    __asm__ volatile("dsb ld\n\tisb" ::: "memory");
+#endif
+    return get_sys_cnt_aicpu();
+}
+
 inline uint64_t device_time_now_ticks() {
 #if defined(__aarch64__)
     uint64_t value = 0;

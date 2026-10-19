@@ -29,6 +29,23 @@ Repeat the onboard command with `--runtime tensormap_and_ringbuffer` for the sec
 
 Check every selected ID in `case_results`. In `measurement_mode=timing`, `passed` requires the requested number of positive `device_us` rounds. In diagnostic mode, `passed` requires the requested capture files and has no timing rounds. `failed` has a child log or an error; `unsupported_platform` and `not_run` have no measurement. Record the commit, dirty-worktree flag, PTO-ISA pin, CANN version, SoC, runtime, and expanded executor counts with every comparison. Do not combine results from different build environments into a single runtime conclusion.
 
-`device_us` is the full device run wall. TMR may also expose `effective_us`, `orch_us`, and `sched_us`; HBG normally does not. A missing field or `null` is unmeasured, never zero. `scheduler_location` and `kernel_execution_us` remain `null` without independent observation. The skill must not infer Scheduler location from the case ID or use W1 versus W5 device time as an AICore-versus-AICPU comparison.
+`device_us` is the full device run wall. TMR may also expose `effective_us`, `orch_us`, and `sched_us`; HBG normally does not. A missing field or `null` is unmeasured, never zero. `scheduler_location` and `kernel_execution_us` are filled from diagnostic events when available and remain `null` without independent observation. Diagnostic `diagnostic_device_us` is kept separate from timing rounds. The skill must not infer Scheduler location from the case ID or use W1 versus W5 device time as an AICore-versus-AICPU comparison.
 
 Use paired configurations and repeated no-diagnostic rounds to compare runtimes or revisions. Keep correctness/diagnostic evidence, timing evidence, and any later per-task attribution distinct. The current manifest alone does not establish Scheduler bottleneck severity or replay-based improvement potential; for those claims, follow the event and replay requirements in the benchmark design document. Report failures and unsupported cases alongside timing results.
+
+## Event diagnostics and matrix reports
+
+At level 2, `task_transitions` adds actual R, dependency-registration/device-visibility timing and available early-dispatch gate timing. The AICPU record is 40 B and the Executor record remains 32 B. Native A5 HBG reuses existing AICore trace fields. Level 3 supplies dependency-only control markers; level 4 adds individual TMR backpressure intervals. Missing/overflowed events, drops, clock-order failures and incomplete multi-core resource constraints produce unmeasured metrics.
+
+Each diagnostic capture writes `scheduler_metrics.json/.md` and a `scheduler_stages.json` Perfetto trace. Capture deps independently, then merge the manifests to validate the C graph and calculate F-to-R, I_data and critical-path attribution:
+
+```bash
+.venv/bin/python -m tests.st.scheduler_benchmark.report outputs/deps_manifest.json outputs/events_manifest.json \
+  outputs/timing_manifest.json --output outputs/scheduling_report.json
+```
+
+The report keeps all 41 IDs, including not_run entries. It checks source-patch fingerprints, environment, physical device and expanded configuration before combining data. Use `--scale 2` with selected C IDs for extra calibration runs; width and P/C stay fixed while chain length or repeated units grow. Calibration runs retain the same ID with a separate task_scale and do not enlarge the fixed matrix.
+
+Inspect C3 qualification before quoting release costs: current TMR manual scope does not ensure live consumer edges are registered before producer completion. Unqualified units do not contribute to the target fan-in/out summary. W dependency metrics stay unmeasured until the actual DAG association is verified. Treat observed stage contributions and idle-with-ready intervals as diagnostic evidence; end-to-end removable-time estimates require the later replay phase.
+
+Diagnostic commands prebind a persistent `*_host_logs_*/` directory before Worker initialization. Preserve the manifest's `host_log_directory` along with stdout: diagnostic `[STRACE]` records move to the process logs, and the default transient spool is deleted at process exit. Use `--overhead-baseline` on the report CLI with separate old-diagnostic, new-diagnostic and no-diagnostic repeated samples from the same device and configuration; absent device timing stays unmeasured.

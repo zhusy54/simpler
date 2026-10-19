@@ -12,6 +12,7 @@ no repo checkout required.
 - **[scene_test_compile](#scene_test_compile)** — collect and compile selected Scene Test callables without an NPU
 - **[swimlane_converter](#swimlane_converter)** — perf JSON → Chrome Trace Event (Perfetto)
 - **[sched_overhead_analysis](#sched_overhead_analysis)** — scheduler overhead / Tail OH breakdown
+- **[scheduler_metrics](#scheduler_metrics)** — observed E/F/R/D/A/S stages, actual Ready depth, occupancy and validated-DAG attribution
 - **[critical_path](#critical_path)** — chip swimlane critical-path compute/stall analysis
 - **[strace_timing](#strace_timing)** — per-stage `chip.run` breakdown (host + AICPU phases) from `[STRACE]` log markers → TPOT table, per-round table (`--rounds-table`), nested tree (`--tree`), or Perfetto JSON
 - **[hbg_bind_phases](#hbg_bind_phases)** — `host_build_graph` `bind`-stage segments from the `chip.run.bind.*` spans → per-segment min/median/max plus the control-plane total
@@ -57,6 +58,29 @@ parallelism share it, so their worker counts never multiply into additional
 compiler processes in one process. A class that fails to compile is reported
 without aborting the rest of the pass. The warm-up does not inspect or access
 NPU devices.
+
+---
+
+## scheduler_metrics
+
+Read level-2+ task transitions alongside the existing Scheduler and Executor streams:
+
+```bash
+python -m simpler_setup.tools.scheduler_metrics outputs/<case>/chip_swimlane_records.json
+```
+
+Writes `scheduler_metrics.json` and `.md`. Stage distributions, time-weighted actual Ready depth, AIC/AIV occupancy and idle-with-ready intervals use recorded events. Per-core execution intervals determine occupancy. Multiple epochs remain separate. Missing/overflowed timestamps, capture losses and failed ordering checks are reported as unmeasured; E-derived data readiness never substitutes for recorded R. Early-dispatch D/A can precede R and those tasks report gate-release timing separately. The standard swimlane converter adds stage tracks when R is available.
+
+DAG-dependent metrics require a verified graph. In the source checkout, the fixed benchmark reporter validates C1-C3 against their independent DAG oracle and combines separately captured DAG, diagnostics, timing and scale runs:
+
+```bash
+python -m tests.st.scheduler_benchmark.report outputs/deps_manifest.json outputs/events_manifest.json \
+  outputs/timing_manifest.json outputs/scale2_manifest.json --output outputs/scheduling_report.json
+```
+
+The fixed runner accepts `--scale 2` for additional C-graph calibration runs, preserving C2 width and C3 fan-in/out. Each capture also writes a `scheduler_stages.json` Perfetto trace. The matrix report retains all 41 IDs, flags incompatible source/environment fingerprints, and uses no-diagnostic samples for timing. Static/observed critical-path contributions describe the recorded timeline; replay and removable-time estimates are outside this tool.
+
+TMR manual scope retains task lifetimes and does not guarantee that all consumer live edges are wired before producers complete. C3 diagnostics explicitly check registration versus producer completion and exclude unqualified middle units from release summaries. Backpressure totals/peaks are available at level 2; wait distributions require level 4 intervals. MIX/multi-block idle attribution needs complete launch/placement constraints. Dynamic W graphs without a verified capture-to-DAG association retain unmeasured dependency metrics.
 
 ---
 
@@ -1009,3 +1033,5 @@ For batch-run hardware regression, see the dev-only script
 
 - [Perfetto Trace Viewer](https://ui.perfetto.dev/)
 - [Graphviz documentation](https://graphviz.org/documentation/)
+
+Scheduler benchmark diagnostic manifests retain `host_log_directory` for persistent per-process timing logs. Their `diagnostic_device_us` is read from those logs separately from no-diagnostic timing rounds; stdout alone need not contain diagnostic `[STRACE]` spans.

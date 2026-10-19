@@ -2,7 +2,11 @@
  * Copyright (c) PyPTO Contributors.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
  * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
  * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
  */
 
 #include <cstdint>
@@ -13,7 +17,7 @@ namespace {
 
 constexpr int32_t kAicKernel = 0;
 constexpr int32_t kAivKernel = 1;
-constexpr int32_t kMaxTasks = 16384;
+constexpr int32_t kMaxTasks = 32768;
 constexpr int32_t kMaxWidth = 288;      // Four times A5's maximum 72 AIV executors.
 constexpr int32_t kMaxConsumers = 144;  // Four times A5's maximum 36 AIC executors.
 constexpr int32_t kMaxProducers = 64;
@@ -47,7 +51,8 @@ bool valid(const Spec &spec) {
                spec.core_mode >= 0 && spec.core_mode <= 1 && spec.work_mode >= 0 && spec.work_mode <= 4;
     }
     if (spec.family == 3) {
-        return spec.count == 4096 && spec.core_mode >= 0 && spec.core_mode <= 1 && spec.work_mode == 0;
+        return spec.count >= 4096 && spec.count % 4096 == 0 && spec.core_mode >= 0 && spec.core_mode <= 1 &&
+               spec.work_mode == 0;
     }
     if (spec.family == 4) {
         return spec.producers > 0 && spec.producers <= kMaxProducers && spec.consumers > 0 &&

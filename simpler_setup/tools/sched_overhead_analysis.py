@@ -905,6 +905,16 @@ def run_analysis(  # noqa: PLR0912, PLR0915
     print(f"  -> {verdict}")
     print()
 
+    if data.get("task_transition_metadata"):
+        from .scheduler_metrics import analyze, markdown_report  # noqa: PLC0415
+
+        observed = analyze(data, deps=deps_data)
+        metrics_path = chip_swimlane_records_path.with_name("scheduler_metrics.json")
+        metrics_path.write_text(json.dumps(observed, indent=2) + "\n")
+        metrics_path.with_suffix(".md").write_text(markdown_report(observed))
+        print(f"Observed task-stage metrics: {metrics_path}")
+        print("DAG-dependent event metrics require benchmark graph validation; unavailable values are unmeasured.")
+
     # === Part 2: aicore switch (pre-dispatched pickup) — per-core + makespan bound ===
     print("=" * 90)
     print("Part 2: aicore switch  (gap [prev_end, start] when dispatch < prev_end; PER CORE)")

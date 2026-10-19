@@ -49,6 +49,7 @@
 // wrap is observable, so it notifies the scope_stats collector here. Gated:
 // pays nothing (no include, no call) when profiling is compiled out.
 #include "aicpu/scope_stats_collector_aicpu.h"
+#include "aicpu/chip_swimlane_collector_aicpu.h"
 #endif
 
 // Block notification interval (in spin counts)
@@ -138,6 +139,9 @@ public:
         bool waiting = false;
 #endif
 
+#if SIMPLER_DFX
+        ChipSwimlaneWaitScope profile_wait;
+#endif
         while (true) {
             // Check both resources; commit only if both available
             if (local_task_id_ - last_alive + 1 < window_size_) {
@@ -154,6 +158,9 @@ public:
                 blocked_on_heap = false;
             }
 
+#if SIMPLER_DFX
+            profile_wait.begin(blocked_on_heap ? SchedulerWaitReason::Heap : SchedulerWaitReason::TaskWindow);
+#endif
             // Spin: wait for scheduler to advance last_task_alive
             spin_count++;
 #if SIMPLER_ORCH_PROFILING

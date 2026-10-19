@@ -19,6 +19,7 @@
 #pragma once
 
 #include "common/chip_swimlane_profiling.h"
+#include "common/task_transition_timing.h"
 
 // Include platform-specific timestamp implementation
 // Build system selects the correct inner_aicpu.h based on platform:
@@ -142,8 +143,8 @@ void chip_swimlane_aicpu_on_aicore_ack(int core_id, int thread_idx, uint32_t reg
  * (start/end) live in the per-core ChipSwimlaneAicoreTaskRecord stream;
  * core_type is published once by the host into the collector
  * (ChipSwimlaneCollector::set_core_types); func_id is resolved post-process
- * from deps.json. This function therefore only needs to record the two
- * AICPU-only timestamps plus the host-side join key.
+ * from deps.json. Logical-task Ready and registration timestamps accompany
+ * the per-fragment dispatch/finish and host-side join key.
  *
  * Per-core counter accounting:
  *   total_record_count++       — every commit attempt (success or failure)
@@ -159,8 +160,39 @@ void chip_swimlane_aicpu_on_aicore_ack(int core_id, int thread_idx, uint32_t reg
  * @param finish_time           AICPU timestamp when task completion was observed
  */
 int chip_swimlane_aicpu_complete_task(
-    int core_id, int thread_idx, uint32_t reg_task_id, uint64_t dispatch_time, uint64_t finish_time
+    int core_id, int thread_idx, uint32_t reg_task_id, uint64_t dispatch_time, uint64_t finish_time,
+    uint64_t ready_time = 0, uint64_t registered_time = 0
 );
+
+void chip_swimlane_aicpu_gate(int core_id, uint32_t reg_task_id);
+void chip_swimlane_aicpu_control_task(int thread_idx, TaskId task_id, const TaskTransitionTiming &timing);
+void chip_swimlane_aicpu_dependency_peak(uint32_t ring_id, uint64_t peak);
+void chip_swimlane_aicpu_wait(SchedulerWaitReason reason, uint64_t start, uint64_t end);
+
+class ChipSwimlaneWaitScope {
+public:
+    void begin(SchedulerWaitReason reason) {
+        if (get_chip_swimlane_level() < ChipSwimlaneLevel::SCHEDULE_TIMING) return;
+        if (start_ != 0 && reason_ == reason) return;
+        const uint64_t now = get_sys_cnt_aicpu();
+        if (start_ != 0) chip_swimlane_aicpu_wait(reason_, start_, now);
+        start_ = now;
+        reason_ = reason;
+    }
+    ~ChipSwimlaneWaitScope() {
+        if (start_ != 0) chip_swimlane_aicpu_wait(reason_, start_, get_sys_cnt_aicpu());
+    }
+
+private:
+    uint64_t start_{0};
+    SchedulerWaitReason reason_{SchedulerWaitReason::TaskWindow};
+};
+
+inline void chip_swimlane_confirm_ready(TaskTransitionTiming &timing) {
+    if (get_chip_swimlane_level() >= ChipSwimlaneLevel::SCHEDULE_TIMING && timing.ready_cycles == 0) {
+        timing.ready_cycles = get_sys_cnt_aicpu();
+    }
+}
 
 /**
  * Flush remaining performance data

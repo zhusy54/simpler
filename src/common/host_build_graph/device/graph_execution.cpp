@@ -52,6 +52,7 @@ GraphExecution *acquire_execution_storage(
 }
 
 void reset_graph_payload(TaskPayload &payload) {
+    payload.transition_timing = {};
     payload.fanin_count = 0;
     payload.predicate = DispatchPredicate{};
     payload.early_dispatch_state.store(EARLY_DISPATCH_NONE, std::memory_order_relaxed);

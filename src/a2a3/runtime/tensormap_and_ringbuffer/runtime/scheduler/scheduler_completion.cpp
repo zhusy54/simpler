@@ -105,6 +105,9 @@ void SchedulerContext::complete_slot_task(
     // deferred-completion flag on slot_state is the discriminator; it's set
     // (release) before on_subtask_complete and read (acquire) after, so the
     // last subtask sees flag writes from any earlier subtask of the same task.
+#if SIMPLER_DFX
+    const TaskTransitionTiming transition_timing = slot_state.payload->transition_timing;
+#endif
     AICoreCompletionMailbox *mailbox = rt_ != nullptr ? rt_->aicore_mailbox : nullptr;
     bool defer_completion_to_consumer = false;
 
@@ -260,7 +263,8 @@ void SchedulerContext::complete_slot_task(
 #endif
 
         if (chip_swimlane_aicpu_complete_task(
-                core_id, thread_idx, static_cast<uint32_t>(expected_reg_task_id), dispatch_ts, finish_ts
+                core_id, thread_idx, static_cast<uint32_t>(expected_reg_task_id), dispatch_ts, finish_ts,
+                transition_timing.ready_cycles, transition_timing.registered_cycles
             ) != 0) {
             LOG_ERROR(
                 "Core %d: chip_swimlane_aicpu_complete_task failed for task 0x%" PRIx64, core_id,
@@ -392,7 +396,7 @@ void SchedulerContext::check_running_cores_for_completion(
         // span, masking the actual FIN-delivery latency.
         uint64_t finish_ts = 0;
         if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHEDULE_TIMING && (t.pending_done || t.running_done)) {
-            finish_ts = get_sys_cnt_aicpu();
+            finish_ts = get_sys_cnt_aicpu_observed();
         }
 #endif
 

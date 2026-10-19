@@ -39,6 +39,7 @@ PHASES_BY_PRODUCER = {
             "complete",
             "dispatch",
             "dummy",
+            "control_task",
             "early_dispatch",
             "resolve",
             "drain",

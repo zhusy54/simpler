@@ -22,6 +22,7 @@
 
 #include <cinttypes>
 #include <cstring>
+#include <atomic>
 
 #include "aicpu/cache_maintenance.h"
 #include "aicpu/platform_regs.h"
@@ -61,6 +62,12 @@ static ChipSwimlaneAicoreTaskPool *s_aicore_task_pools[PLATFORM_MAX_CORES] = {};
 // AICPU rotates the AICore buffer before the upcoming write_reg(DATA_MAIN_BASE).
 // Single-writer per cell (the scheduler thread that owns the core).
 static uint32_t s_aicore_dispatched_count[PLATFORM_MAX_CORES] = {};
+
+struct GateTiming {
+    std::atomic<uint64_t> cycles{0};
+    std::atomic<uint32_t> token{0};
+};
+static GateTiming s_gate_timing[PLATFORM_MAX_CORES][2];
 
 // Per-core deferred AICore old-buffer enqueue (ACK-gate for the FIN-before-record
 // window). The tensormap_and_ringbuffer AICore executor writes FIN before the
@@ -369,6 +376,10 @@ void chip_swimlane_aicpu_init(int worker_count) {
     for (int i = 0; i < PLATFORM_MAX_CORES; i++) {
         s_aicore_dispatched_count[i] = 0;
         s_aicore_pending_enqueue[i] = AicorePendingEnqueue{};
+        for (auto &gate : s_gate_timing[i]) {
+            gate.cycles.store(0, std::memory_order_relaxed);
+            gate.token.store(0, std::memory_order_relaxed);
+        }
     }
 
     void *chip_swimlane_base = reinterpret_cast<void *>(g_platform_chip_swimlane_base);
@@ -424,6 +435,8 @@ void chip_swimlane_aicpu_init(int worker_count) {
     // producer whose build predates the identity fields leaves it zero and the
     // host refuses to read those bytes as a run id.
     s_chip_swimlane_header->handoff_schema = kChipSwimlaneHandoffSchema;
+    s_chip_swimlane_header->runtime_stats = {};
+    s_chip_swimlane_header->runtime_stats.run_epoch = get_platform_run_result_epoch();
     wmb();
 
     // Read the granular perf_level from the shared-memory header (host wrote
@@ -803,7 +816,8 @@ void chip_swimlane_aicpu_on_aicore_ack(int core_id, int thread_idx, uint32_t reg
 }
 
 int chip_swimlane_aicpu_complete_task(
-    int core_id, int thread_idx, uint32_t reg_task_id, uint64_t dispatch_time, uint64_t finish_time
+    int core_id, int thread_idx, uint32_t reg_task_id, uint64_t dispatch_time, uint64_t finish_time,
+    uint64_t ready_time, uint64_t registered_time
 ) {
     if (core_id < 0 || core_id >= PLATFORM_MAX_CORES) {
         return -1;
@@ -835,13 +849,24 @@ int chip_swimlane_aicpu_complete_task(
         return -1;
     }
 
-    // AICPU-only timing — three fields, two cache half-lines. Identity
+    // Scheduler timing with logical Ready/registration. Identity
     // (task_token, core_type) lives in the AICore record; the host
     // joins by reg_task_id. See ChipSwimlaneAicpuTaskRecord header comment.
     ChipSwimlaneAicpuTaskRecord *record = &chip_swimlane_buf->records[count];
     record->reg_task_id = reg_task_id;
     record->dispatch_time = dispatch_time;
     record->finish_time = finish_time;
+    record->ready_time = ready_time;
+    record->registered_time = registered_time;
+    record->gate_after_ready_cycles = UINT32_MAX;
+    const auto &gate = s_gate_timing[core_id][reg_task_id & 1];
+    if (gate.token.load(std::memory_order_acquire) == reg_task_id && ready_time != 0) {
+        const uint64_t cycles = gate.cycles.load(std::memory_order_acquire);
+        if (cycles != 0) record->gate_after_ready_cycles = UINT32_MAX - 1;
+        if (cycles >= ready_time && cycles - ready_time < UINT32_MAX - 1) {
+            record->gate_after_ready_cycles = static_cast<uint32_t>(cycles - ready_time);
+        }
+    }
 
     uint32_t new_count = count + 1;
     chip_swimlane_buf->count = new_count;
@@ -857,6 +882,14 @@ int chip_swimlane_aicpu_complete_task(
     // dispatch keeps reconcile counts accurate even at level=1 where this
     // function never runs.
     return 0;
+}
+
+void chip_swimlane_aicpu_gate(int core_id, uint32_t reg_task_id) {
+    if (g_chip_swimlane_level < ChipSwimlaneLevel::SCHEDULE_TIMING || core_id < 0 || core_id >= PLATFORM_MAX_CORES)
+        return;
+    auto &gate = s_gate_timing[core_id][reg_task_id & 1];
+    gate.cycles.store(get_sys_cnt_aicpu(), std::memory_order_relaxed);
+    gate.token.store(reg_task_id, std::memory_order_release);
 }
 
 void chip_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int core_num) {
@@ -1245,6 +1278,36 @@ void chip_swimlane_aicpu_record_task_phase(
         /*shared_at_end=*/nullptr
     );
     record->phase_data.task_id = task_id;
+}
+
+void chip_swimlane_aicpu_control_task(int thread_idx, TaskId task_id, const TaskTransitionTiming &timing) {
+    if (g_chip_swimlane_level < ChipSwimlaneLevel::SCHED_PHASES || timing.ready_cycles == 0) return;
+    chip_swimlane_aicpu_record_task_phase(
+        thread_idx, SchedPhaseKind::ControlTask, timing.ready_cycles, get_sys_cnt_aicpu(), 0, task_id
+    );
+}
+
+void chip_swimlane_aicpu_dependency_peak(uint32_t ring_id, uint64_t peak) {
+    if (g_chip_swimlane_level < ChipSwimlaneLevel::SCHEDULE_TIMING || s_chip_swimlane_header == nullptr ||
+        ring_id >= 32)
+        return;
+    auto &stats = s_chip_swimlane_header->runtime_stats;
+    stats.present = 1;
+    if (peak > stats.dependency_peak[ring_id]) stats.dependency_peak[ring_id] = peak;
+}
+
+void chip_swimlane_aicpu_wait(SchedulerWaitReason reason, uint64_t start, uint64_t end) {
+    if (g_chip_swimlane_level < ChipSwimlaneLevel::SCHEDULE_TIMING || s_chip_swimlane_header == nullptr || end < start)
+        return;
+    const uint32_t index = static_cast<uint32_t>(reason);
+    auto &stats = s_chip_swimlane_header->runtime_stats;
+    stats.present = 1;
+    stats.wait_cycles[index] += end - start;
+    stats.wait_count[index]++;
+    if (end - start > stats.max_wait_cycles[index]) stats.max_wait_cycles[index] = end - start;
+    if (g_chip_swimlane_level >= ChipSwimlaneLevel::ORCH_PHASES) {
+        chip_swimlane_aicpu_record_orch_phase(start, end, TaskId::invalid(), UINT32_MAX - index);
+    }
 }
 
 void chip_swimlane_aicpu_set_orch_thread_idx(int thread_idx) { s_orch_thread_idx = thread_idx; }

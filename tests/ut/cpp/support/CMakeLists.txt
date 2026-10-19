@@ -43,6 +43,7 @@ foreach(arch a2a3 a5)
         ${CMAKE_CURRENT_SOURCE_DIR}/weak_link_placeholders.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/assert_stubs.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/platform_regs_stub.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/chip_swimlane_timing_stubs.cpp
     )
     simpler_ut_common_includes(${arch} aicpu _support_includes)
     target_include_directories(${arch}_ut_support PUBLIC ${_support_includes})

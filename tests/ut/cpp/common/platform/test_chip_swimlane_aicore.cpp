@@ -133,3 +133,10 @@ TEST(ChipSwimlaneAicoreTest, RotationGenerationAloneDrivesTheBufferReload) {
     EXPECT_EQ(chip_swimlane_aicore_reserve_task_record(&head, &local), &second.records[0]);
     EXPECT_EQ(local.cached_buf_seq, 5u);
 }
+
+TEST(ChipSwimlaneAicoreTest, AcquisitionDeltaOverflowDoesNotWrap) {
+    ChipSwimlaneAicoreTaskRecord record{};
+    const uint64_t start = static_cast<uint64_t>(UINT32_MAX) + 100;
+    chip_swimlane_aicore_commit_task_record(&record, simpler::ut::test_task_id(7), 1, 1, start, start + 10);
+    EXPECT_EQ(record.receive_to_start_cycles, UINT32_MAX);
+}

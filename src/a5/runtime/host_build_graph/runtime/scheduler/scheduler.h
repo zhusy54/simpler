@@ -33,6 +33,7 @@
 #pragma once
 
 #include <atomic>
+#include "aicpu/chip_swimlane_collector_aicpu.h"
 
 #include "graph_image_view.h"
 #include "common/memory_barrier.h"
@@ -573,6 +574,10 @@ struct SchedulerState {
     }
 
     void push_ready_routed(ChipTaskSlotState *slot_state) {
+#if SIMPLER_DFX
+        chip_swimlane_confirm_ready(slot_state->to_payload().transition_timing);
+#endif
+
         // Early-dispatch release: a pre-staged candidate launches by doorbell
         // right here — the moment its readiness is decided — and skips the
         // queue round-trip. Only a candidate can hold a staging claim, so every
@@ -803,9 +808,12 @@ struct SchedulerState {
     EdPublishListStats ed_publish_stats;
 #endif
 
-    static inline void ring_one_doorbell(uint64_t reg_addr, uint32_t token) {
+    static inline void ring_one_doorbell(int core_id, uint64_t reg_addr, uint32_t token) {
         volatile uint64_t *dmb = reinterpret_cast<volatile uint64_t *>(get_reg_ptr(reg_addr, RegId::DATA_MAIN_BASE));
         uint64_t tk = static_cast<uint64_t>(token);
+#if SIMPLER_DFX
+        chip_swimlane_aicpu_gate(core_id, token);
+#endif
         *dmb = (tk << 32) | tk;  // 64-bit STR: high=low=token releases the gated AICore
     }
 
@@ -814,7 +822,7 @@ struct SchedulerState {
             int core_id = word * 64 + __builtin_ctzll(bits);
             bits &= bits - 1;
             ring_one_doorbell(
-                early_dispatch_doorbell_table[core_id].addr, early_dispatch_doorbell_table[core_id].token
+                core_id, early_dispatch_doorbell_table[core_id].addr, early_dispatch_doorbell_table[core_id].token
             );
         }
     }
@@ -834,7 +842,7 @@ struct SchedulerState {
     static inline bool
     ring_claimed_local_doorbell(uint64_t claimed_word, int core_id, uint64_t reg_addr, uint32_t token) {
         if ((claimed_word & (1ULL << (core_id & 63))) == 0) return false;
-        ring_one_doorbell(reg_addr, token);
+        ring_one_doorbell(core_id, reg_addr, token);
         return true;
     }
 
@@ -1131,7 +1139,7 @@ struct SchedulerState {
                 int core_id = w * 64 + __builtin_ctzll(bits);
                 bits &= bits - 1;
                 ring_one_doorbell(
-                    early_dispatch_doorbell_table[core_id].addr, early_dispatch_doorbell_table[core_id].token
+                    core_id, early_dispatch_doorbell_table[core_id].addr, early_dispatch_doorbell_table[core_id].token
                 );
             }
         }
@@ -1353,6 +1361,14 @@ struct SchedulerState {
     // concurrently, which is what lets a task dispatch before the whole graph is
     // materialized.
     void graph_incremental_publish(GraphExecution &execution, int32_t first, int32_t last) {
+#if SIMPLER_DFX
+        if (get_chip_swimlane_level() >= ChipSwimlaneLevel::SCHEDULE_TIMING) {
+            const uint64_t visible = get_sys_cnt_aicpu();
+            for (int32_t i = first; i < last; ++i) {
+                execution.task_at(i).slot.to_payload().transition_timing.registered_cycles = visible;
+            }
+        }
+#endif
         for (int32_t i = first; i < last; ++i) {
             if (execution.fanin_offsets[i] == execution.fanin_offsets[i + 1]) continue;  // root
             ChipTaskSlotState &task = execution.task_at(i).slot;

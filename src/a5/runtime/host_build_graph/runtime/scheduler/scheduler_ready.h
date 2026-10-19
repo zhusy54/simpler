@@ -736,7 +736,7 @@ inline __aicore__ bool scheduler_bootstrap_ready_batch_append(
         scheduler_writeback_cache_line(&tail->next_waiter);
     }
     batch->tail = task_id;
-    if (scheduler_phase_timing_enabled(profiling_level)) {
+    if (scheduler_schedule_timing_enabled(profiling_level)) {
         __gm__ SchedulerTaskTrace *cells =
             scheduler_state_at<SchedulerTaskTrace>(scheduler_state_base, context->profiling->trace_cells_offset);
         const auto &metadata = *scheduler_task_metadata_at(scheduler_state_base, context, task_id);
@@ -819,7 +819,7 @@ inline __aicore__ bool scheduler_ready_batch_append(
         scheduler_publish_cache_line(&tail->next_waiter);
     }
     batch->tail = task_id;
-    if (scheduler_phase_timing_enabled(profiling_level)) {
+    if (scheduler_schedule_timing_enabled(profiling_level)) {
         __gm__ SchedulerTaskTrace *cells =
             scheduler_state_at<SchedulerTaskTrace>(scheduler_state_base, context->profiling->trace_cells_offset);
         const auto *metadata = scheduler_task_metadata_at(scheduler_state_base, context, task_id);
@@ -1558,7 +1558,7 @@ inline __aicore__ bool scheduler_resolve_completion(
                     direct_claim->task_id = waiter;
                     direct_claim->source = SchedulerReadySource::DIRECT_RESOLVE;
                     direct_claim->publication_mode = SchedulerPublicationMode::REFILL;
-                    if (phase_timing_enabled) {
+                    if (scheduler_schedule_timing_enabled(profiling_level)) {
                         __gm__ SchedulerTaskTrace *cells = scheduler_state_at<SchedulerTaskTrace>(
                             scheduler_state_base, context->profiling->trace_cells_offset
                         );

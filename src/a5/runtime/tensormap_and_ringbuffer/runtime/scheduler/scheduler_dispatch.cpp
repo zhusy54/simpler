@@ -1147,6 +1147,11 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             for (int di = 0; di < dummy_got; di++) {
                 ChipTaskSlotState &dummy_slot = *dummy_batch[di];
 #if SIMPLER_DFX
+                chip_swimlane_aicpu_control_task(
+                    thread_idx, dummy_slot.task->task_id, dummy_slot.payload->transition_timing
+                );
+#endif
+#if SIMPLER_DFX
                 uint64_t dummy_resolve_t0 =
                     (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
 #endif

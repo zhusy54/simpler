@@ -13,7 +13,7 @@ Given a run directory produced by a ``--enable-chip-swimlane`` run, this
 reconstructs the critical path of each device execution and writes a report
 beside each discovered swimlane-records file. The report describes, for every
 task on that path, its wall-clock duration, the compute time it contributes,
-and the runtime-scheduling stall (wait) before it, each as a fraction of the
+and the observed stall (wait) before it, each as a fraction of the
 global makespan.
 
 Inputs consumed per rank (auto-discovered under the given directory):
@@ -402,7 +402,7 @@ def render_report(results: list[RankResult], top: int) -> str:
     w("- **Static CPM path**: dependency-limited latency floor (unlimited cores).")
     w(
         "- **Observed path**: the as-executed critical path; its per-task compute + "
-        "the runtime-scheduling stall before each task tile the makespan exactly."
+        "the observed wait before each task tile the makespan exactly. These waits include resource serialization."
     )
     w(
         "- **stall kinds**: `data-wait` = waiting on an upstream producer; "
@@ -421,7 +421,7 @@ def render_report(results: list[RankResult], top: int) -> str:
         )
         w(f"- **observed critical path**: {len(r.segments)} tasks")
         w(f"  - compute: {_us(r.compute_total, r.freq) / 1e3:.3f} ms ({_pct(r.compute_total, ms):.1f}%)")
-        w(f"  - stall (runtime scheduling): {_us(r.stall_total, r.freq) / 1e3:.3f} ms ({_pct(r.stall_total, ms):.1f}%)")
+        w(f"  - stall (observed waiting): {_us(r.stall_total, r.freq) / 1e3:.3f} ms ({_pct(r.stall_total, ms):.1f}%)")
         for kind, val in sorted(r.stall_by_kind.items(), key=lambda kv: -kv[1]):
             if val:
                 w(f"    - {kind}: {_us(val, r.freq) / 1e3:.3f} ms ({_pct(val, ms):.1f}%)")

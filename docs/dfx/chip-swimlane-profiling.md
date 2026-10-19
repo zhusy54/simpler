@@ -369,6 +369,18 @@ layers to be aware of:**
     "records": [[...], ...]
   },
 
+  // Optional Scheduler transitions, level >= 2. Join each row on
+  // (run_epoch, core_id, reg_task_id), preserving the legacy task tuples.
+  // fragment_records: [core_id, reg_task_id, run_epoch,
+  //                    ready_cycles|null, registered_cycles|null, gate_cycles|null]
+  "task_transitions": {
+    "schema_version": 1,
+    "capture": {"complete": true, "expected_fragments": 1, "emitted_fragments": 1},
+    "fragment_records": [[...]],
+    "early_dispatch": [[/* core_id, reg_task_id, run_epoch */]],
+    "pre_registered": false
+  },
+
   // A5 HBG AICPU control-plane records (level >= 2 only), one per
   // participating AICPU thread. Every phase is an explicit start/end pair.
   "aicpu_lifecycle_records": [{
@@ -411,6 +423,12 @@ layers to be aware of:**
   "aicpu_orchestrator_phases": [ [ {...}, ... ], ... ]   // level >= 4 only
 }
 ```
+
+`ready_cycles` is the Scheduler's successful readiness decision at the routing/batch-append boundary; queue insertion and batch publication follow it. AICPU D/F and transitions are captured in the same counter units as Executor S/E. Completion observation uses an ordered counter read after the MMIO load. A is reconstructed from the Executor's receive-to-start delta; `UINT32_MAX` denotes overflow, and `acquisition_time_us` is then unavailable. An early-dispatch task can have D/A before R. Its gate publication is separate; an unrepresentable gate delta keeps the task's early-dispatch identity and exports a null gate timestamp.
+
+The optional `metadata.runtime_stats` contains run-tagged TMR wait counts, total/max cycles by reason (task window, heap, dependency pool, fanin spill), and per-ring dependency high-water marks. Level 4 adds one orchestrator interval per actual wait; these records use `phase=orch_wait` after decoding. HBG static graph dependencies are pre-registered on the host; its registration field describes device visibility, while TMR records completion of live dependency wiring. `control_task` at level 3 identifies a dependency-only node's Ready-to-retire interval without inventing Executor S/E.
+
+[`scheduler_metrics`](../../simpler_setup/tools/README.md#scheduler_metrics) calculates actual-R stage/depth/occupancy metrics and preserves missing values. The fixed benchmark reporter verifies C DAGs against its oracle before publishing dependency-based metrics. The swimlane converter adds an Observed scheduling stages process with R/D/A/S/E/F spans and an actual Ready-depth counter. These are diagnostic observations, not estimated removable device time.
 
 All timestamps on disk are raw `get_sys_cnt` cycles (uint64). The
 join key between `aicore_tasks` and `scheduler_tasks.records` is
@@ -1210,10 +1228,9 @@ kinds because AICPU's offset stride is fixed at that width; only the first
 
 Task records are identical across architectures:
 
-- `ChipSwimlaneAicpuTaskRecord` — per-task AICPU-owned fields (dispatch_time,
-  finish_time, reg_task_id); 20 B logical, `aligned(32)` so two records share
-  a cache line. `reg_task_id` is the join key against the matching AICore
-  record. `core_type` comes from the static per-core table
+- `ChipSwimlaneAicpuTaskRecord` — naturally aligned 40 B records containing
+  dispatch/finish, Ready/registration, `reg_task_id`, and a bounded 32-bit gate
+  delta. `reg_task_id` is the join key against the matching AICore record. `core_type` comes from the static per-core table
   `ChipSwimlaneCollector::set_core_types` publishes, and `func_id` is resolved
   post-process by `swimlane_converter.py` from deps.json's `kernel_ids[]` —
   neither is carried in the record.
@@ -1541,6 +1558,8 @@ ORCH_PHASE), same shape as a2a3.
 chip swimlane is opt-in and zero-overhead when disabled — without
 `--enable-chip-swimlane` neither host nor device allocates the L2
 perf shared region and the timing-write code paths are skipped.
+
+At level 2 the AICPU Scheduler and Executor streams total 72 B per executed fragment (40 + 32), an 8 B increase over the 64 B layout without transitions. Logical R/registration values repeat for multi-core fragments; no per-edge timing stream is emitted. Both runtime payload layouts retain their sizes and argument offsets by using padding. Per-run resource counters and level-3 control markers are additional. The native A5 HBG AICore Scheduler exports existing trace fields without enlarging its task trace. JSON size and capture wall-time costs must be measured independently of the binary record sizes.
 
 When enabled, the dominant per-task overhead is:
 

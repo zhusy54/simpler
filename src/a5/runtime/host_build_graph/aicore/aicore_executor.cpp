@@ -148,7 +148,7 @@ __aicore__ bool bootstrap_ready_graph(
         scheduler == nullptr)
         return false;
     const bool phase_timing_enabled = scheduler_phase_timing_enabled(profiling_level);
-    if (phase_timing_enabled) stats->bootstrap_start_cycles = scheduler_cycles();
+    if (scheduler_schedule_timing_enabled(profiling_level)) stats->bootstrap_start_cycles = scheduler_cycles();
     SchedulerReadyBatch batches[SCHEDULER_READY_QUEUE_COUNT]{};
     uint64_t tasks_per_scheduler = graph.task_count / scheduler_count;
     uint64_t remainder = graph.task_count % scheduler_count;
@@ -391,11 +391,14 @@ __aicore__ bool run_ready_dispatch_loop(
         int32_t ready_slot = -1;
         uint32_t ready_generation = 0;
         uint64_t ready_publication = 0;
+        uint64_t ready_observe = 0;
         uint64_t ready_scan_start = phase_timing_enabled ? get_sys_cnt_aicore() : 0;
         if (scheduler_worker) {
             uint32_t local_slot = UINT32_MAX;
             uint64_t local_generation = 0;
             if (scheduler_local_ready_pop(context, &local_slot, &local_generation)) {
+                if (task_timing_enabled || phase_timing_enabled || context->timing_slot(cluster_lane, local_slot) >= 0)
+                    ready_observe = get_sys_cnt_aicore();
                 if (scheduler_dispatch_state(local_generation) != SchedulerDispatchSlotState::READY ||
                     scheduler_dispatch_generation(local_generation) == 0 ||
                     scheduler_dispatch_generation(local_generation) != next_dispatch_sequence) {
@@ -417,6 +420,8 @@ __aicore__ bool run_ready_dispatch_loop(
                 const uint32_t generation = static_cast<uint32_t>(publication);
                 if (phase_timing_enabled) ++stats->task_state_poll_count;
                 if (generation == next_dispatch_sequence) {
+                    if (task_timing_enabled || phase_timing_enabled || static_cast<int32_t>(publication >> 32) >= 0)
+                        ready_observe = get_sys_cnt_aicore();
                     ready_slot = static_cast<int32_t>(slot_index);
                     ready_generation = generation;
                     ready_publication = publication;
@@ -437,7 +442,6 @@ __aicore__ bool run_ready_dispatch_loop(
             const bool commit_scheduler_trace = task_timing_enabled;
             const bool commit_task_timing = timing_slot >= 0 && timing_slot < SCHEDULER_TASK_TIMING_SLOT_COUNT;
             const bool commit_executor_trace = commit_scheduler_trace || commit_task_timing;
-            uint64_t ready_observe = commit_executor_trace || phase_timing_enabled ? get_sys_cnt_aicore() : 0;
             if (phase_timing_enabled && scheduler_worker && idle_active) {
                 scheduler_append_idle_activity(scheduler_state_base, context, idle_start_cycles, ready_observe);
                 idle_active = false;

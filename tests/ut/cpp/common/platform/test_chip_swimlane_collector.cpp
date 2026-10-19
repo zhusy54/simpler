@@ -1182,3 +1182,50 @@ TEST(ChipSwimlaneLevelEscalationTest, EscalatingTheLevelAfterInitKeepsTheOrchPoo
 
     collector.finalize(nullptr, swimlane_test_free);
 }
+
+TEST(ChipSwimlaneCollectorTest, ReadyRegistrationAndGateKeepDispatchIdentity) {
+    ChipSwimlaneCollector collector;
+    ASSERT_EQ(
+        collector.initialize(
+            1, 1, 0, ChipSwimlaneLevel::SCHEDULE_TIMING, swimlane_test_alloc, nullptr, swimlane_test_free
+        ),
+        0
+    );
+    void *shm = collector.get_chip_swimlane_setup_device_ptr();
+    collector.begin_run("transitions", ChipSwimlaneLevel::SCHEDULE_TIMING);
+    set_platform_run_result(0, 99);
+    set_chip_swimlane_enabled(true);
+    set_platform_chip_swimlane_base(reinterpret_cast<uint64_t>(shm));
+    set_platform_chip_swimlane_aicore_rotation_table(0);
+    chip_swimlane_aicpu_init(1);
+    TaskTransitionTiming timing{};
+    timing.registered_cycles = get_sys_cnt_aicpu();
+    chip_swimlane_confirm_ready(timing);
+    const uint64_t first_ready = timing.ready_cycles;
+    chip_swimlane_confirm_ready(timing);
+    EXPECT_EQ(timing.ready_cycles, first_ready);
+    chip_swimlane_aicpu_gate(0, 17);
+    ASSERT_EQ(
+        chip_swimlane_aicpu_complete_task(
+            0, 0, 17, first_ready, get_sys_cnt_aicpu(), timing.ready_cycles, timing.registered_cycles
+        ),
+        0
+    );
+    auto *pool = get_perf_buffer_state(shm, 0);
+    auto *buffer = reinterpret_cast<ChipSwimlaneAicpuTaskBuffer *>(pool->head.current_buf_ptr);
+    ASSERT_NE(buffer, nullptr);
+    ASSERT_EQ(buffer->count, 1u);
+    const auto &record = buffer->records[0];
+    EXPECT_EQ(record.reg_task_id, 17u);
+    EXPECT_EQ(record.ready_time, first_ready);
+    EXPECT_EQ(record.registered_time, timing.registered_cycles);
+    EXPECT_NE(record.gate_after_ready_cycles, UINT32_MAX);
+    chip_swimlane_aicpu_dependency_peak(1, 128);
+    chip_swimlane_aicpu_dependency_peak(1, 64);
+    chip_swimlane_aicpu_wait(SchedulerWaitReason::DependencyPool, 100, 150);
+    const auto &stats = get_chip_swimlane_header(shm)->runtime_stats;
+    EXPECT_EQ(stats.run_epoch, 99u);
+    EXPECT_EQ(stats.dependency_peak[1], 128u);
+    EXPECT_EQ(stats.wait_count[2], 1u);
+    EXPECT_EQ(stats.wait_cycles[2], 50u);
+}

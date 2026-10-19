@@ -66,6 +66,15 @@ __attribute__((weak, visibility("hidden"))) void dep_gen_aicpu_record_submit(
     const int32_t[3]
 ) {}
 
+#if SIMPLER_DFX
+__attribute__((weak, visibility("hidden"))) ChipSwimlaneLevel get_chip_swimlane_level() {
+    return ChipSwimlaneLevel::DISABLED;
+}
+__attribute__((weak, visibility("hidden"))) void chip_swimlane_aicpu_dependency_peak(uint32_t, uint64_t) {}
+__attribute__((weak, visibility("hidden"))) void chip_swimlane_aicpu_wait(SchedulerWaitReason, uint64_t, uint64_t) {}
+__attribute__((weak, visibility("hidden"))) void chip_swimlane_aicpu_gate(int, uint32_t) {}
+#endif
+
 // Scope_stats enable gate, queried via the same predicate idiom as
 // is_dep_gen_enabled above. The AICPU collector links the strong definition;
 // host builds fall back to this weak `false`. Gating here still skips the
@@ -545,6 +554,11 @@ void OrchestratorState::mark_dep_pool_position(ChipTaskSlotState &slot_state) {
     auto &rss = sched->ring_sched_states[slot_state.ring_id];
     slot_state.dep_pool_mark = rss.dep_pool.top;
 #if SIMPLER_DFX
+    if (chip_swimlane_level >= ChipSwimlaneLevel::SCHEDULE_TIMING) {
+        chip_swimlane_aicpu_dependency_peak(slot_state.ring_id, static_cast<uint64_t>(rss.dep_pool.high_water));
+    }
+#endif
+#if SIMPLER_DFX
     if (is_scope_stats_enabled()) {
         rss.publish_dep_pool_snapshot();
     }
@@ -614,6 +628,11 @@ void OrchestratorState::wire_fanin_task(ChipTaskSlotState &slot_state, int32_t w
         }
     }
 
+#if SIMPLER_DFX
+    if (chip_swimlane_level >= ChipSwimlaneLevel::SCHEDULE_TIMING) {
+        payload->transition_timing.registered_cycles = get_sys_cnt_aicpu();
+    }
+#endif
     int32_t init_rc = completed_fanin + 1;
     int32_t new_rc = slot_state.fanin_refcount.fetch_add(init_rc, std::memory_order_acq_rel) + init_rc;
     mark_dep_pool_position(slot_state);
@@ -1027,6 +1046,9 @@ static TaskOutputTensors submit_task_common(
     ChipTaskSlotState &cur_slot_state = *prepared.slot_state;
     TaskDescriptor &task = *prepared.task;
     TaskPayload &payload = *prepared.payload;
+#if SIMPLER_DFX
+    if (orch->chip_swimlane_level >= ChipSwimlaneLevel::SCHEDULE_TIMING) payload.transition_timing = {};
+#endif
     result.set_task_id(task_id);
 
     // dep_gen capture point: snapshot the orch submit_task inputs while the
@@ -1239,6 +1261,11 @@ static TaskOutputTensors submit_task_common(
         cur_slot_state.fanin_count = 1;
         cur_slot_state.fanin_refcount.store(1, std::memory_order_release);
         orch->mark_dep_pool_position(cur_slot_state);
+#if SIMPLER_DFX
+        if (orch->chip_swimlane_level >= ChipSwimlaneLevel::SCHEDULE_TIMING) {
+            payload.transition_timing.registered_cycles = get_sys_cnt_aicpu();
+        }
+#endif
         sched->push_ready_routed(&cur_slot_state);
     } else if (all_claimed_fanin_completed(fanin_builder)) {
         int32_t ready_seed = fanin_builder.wait_count + 1;
@@ -1257,6 +1284,11 @@ static TaskOutputTensors submit_task_common(
             }
         });
         orch->mark_dep_pool_position(cur_slot_state);
+#if SIMPLER_DFX
+        if (orch->chip_swimlane_level >= ChipSwimlaneLevel::SCHEDULE_TIMING) {
+            payload.transition_timing.registered_cycles = get_sys_cnt_aicpu();
+        }
+#endif
         sched->push_ready_routed(&cur_slot_state);
     } else {
         if (!orch_wire_live_fanin_task(orch, cur_slot_state, fanin_builder.wait_count)) {

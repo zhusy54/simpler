@@ -1,6 +1,15 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 """Scene-test adapter and independent DAG oracle for the scheduling matrix."""
 
 import ctypes
+import importlib
 import json
 import os
 from functools import lru_cache
@@ -19,6 +28,7 @@ from tests.st.scheduler_benchmark.matrix import (
     expand_case,
     expected_edges,
     is_long,
+    scale_case,
     task_roles,
 )
 
@@ -98,7 +108,7 @@ class SchedulingBenchmarkScene(SceneTestCase):
     }
 
     def _spec(self, params: dict) -> CaseSpec:
-        return expand_case(params["case_id"], *_counts())
+        return scale_case(expand_case(params["case_id"], *_counts()), params.get("task_scale", 1))
 
     def generate_args(self, params):
         spec = self._spec(params)
@@ -152,3 +162,11 @@ class SchedulingBenchmarkScene(SceneTestCase):
             deps_path = fresh.pop() / "deps.json"
             assert deps_path.exists(), f"{case['name']}: dep_gen did not write {deps_path}"
             validate_deps(json.loads(deps_path.read_text()), self._spec(case["params"]))
+
+
+def execute_scaled_scene(module_name: str, scale: int) -> None:
+    module = importlib.import_module(module_name)
+    for value in vars(module).values():
+        if isinstance(value, type) and issubclass(value, SchedulingBenchmarkScene) and value.__module__ == module_name:
+            value.CASES = [{**case, "params": {**case["params"], "task_scale": scale}} for case in value.CASES]
+    SceneTestCase.run_module(module_name)

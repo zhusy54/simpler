@@ -50,6 +50,8 @@ from simpler_setup.tools._runtime_dispatch import (
 )
 from simpler_setup.tools.strace_timing import host_process_lanes, parse_spans, span_family
 
+_COUNTER_DELTA_OVERFLOW = 2**32 - 1
+
 
 def _func_id_to_letter(func_id):
     """Map a non-negative integer func_id to a numeric+letter label.
@@ -620,6 +622,22 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
         # execution and nothing that dispatched it.
         scheduler_task_rows = []
         scheduler_task_producer = None
+    transition_section = data.get("task_transitions") or {}
+    if not isinstance(transition_section, dict):
+        raise ValueError("task_transitions must be an object")
+    transition_rows = transition_section.get("fragment_records", [])
+    transition_lookup = {}
+    early_dispatch_keys = {tuple(int(v) for v in row) for row in transition_section.get("early_dispatch", [])}
+    for row in transition_rows:
+        if not isinstance(row, list) or len(row) != 6:
+            raise ValueError("task_transitions.fragment_records must contain six-column arrays")
+        core, token, epoch, *timestamps = row
+        key = (int(epoch), int(core), int(token))
+        if key in transition_lookup:
+            raise ValueError(f"duplicate task transition join key: {key}")
+        if any(value is not None and (not isinstance(value, int) or value <= 0) for value in timestamps):
+            raise ValueError(f"invalid task transition timestamp: {row}")
+        transition_lookup[key] = timestamps
     lifecycle_raw = data.get("aicpu_lifecycle_records") or []
     if not isinstance(lifecycle_raw, list) or any(not isinstance(record, dict) for record in lifecycle_raw):
         raise ValueError("aicpu_lifecycle_records must be an array of objects")
@@ -817,7 +835,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
         run_epoch = int(run_epoch)
         if not (0 < start_cycles <= end_cycles):
             raise ValueError(f"aicore_tasks[{row_index}] has invalid timing: expected 0 < start_cycles <= end_cycles")
-        if not (0 <= r2s_cycles < start_cycles):
+        if r2s_cycles != _COUNTER_DELTA_OVERFLOW and not (0 <= r2s_cycles < start_cycles):
             raise ValueError(
                 f"aicore_tasks[{row_index}] has invalid receive_to_start_cycles: "
                 "expected 0 <= receive_to_start_cycles < start_cycles"
@@ -870,11 +888,15 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
         start_c = int(row[3])
         end_c = int(row[4])
         r2s_c = int(row[5])
-        _track(start_c - r2s_c)
+        _track(start_c if r2s_c == _COUNTER_DELTA_OVERFLOW else start_c - r2s_c)
         _track(end_c)
     for _, _, d, f, _epoch in scheduler_task_rows:
         _track(int(d))
         _track(int(f))
+    for timestamps in transition_lookup.values():
+        for value in timestamps:
+            if value is not None:
+                _track(value)
     for thread_records in sched_phases_raw:
         for pr in thread_records:
             _track(int(pr.get("start_cycles", 0)))
@@ -958,11 +980,14 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
             start_us = _to_us(start_cycles)
             end_us = _to_us(end_cycles)
             dispatch_us = _to_us(dispatch_cycles)
-            receive_us = _to_us(start_cycles - r2s_cycles)
+            receive_us = _to_us(start_cycles if r2s_cycles == _COUNTER_DELTA_OVERFLOW else start_cycles - r2s_cycles)
             local_setup_us = start_us - receive_us
             tasks.append(
                 {
                     "task_id": task_token,
+                    "reg_task_id": reg_task_id,
+                    "acquisition_time_us": None if r2s_cycles == _COUNTER_DELTA_OVERFLOW else receive_us,
+                    "receive_delta_valid": r2s_cycles != _COUNTER_DELTA_OVERFLOW,
                     "func_id": -1,
                     "core_id": core_id,
                     "core_type": _core_type(core_id),
@@ -987,11 +1012,16 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
             task_token = int(task_token)
             start_us = _to_us(int(start_cycles))
             end_us = _to_us(int(end_cycles))
-            receive_us = _to_us(int(start_cycles) - r2s_cycles)
+            receive_us = _to_us(
+                int(start_cycles) if r2s_cycles == _COUNTER_DELTA_OVERFLOW else int(start_cycles) - r2s_cycles
+            )
             local_setup_us = start_us - receive_us
             tasks.append(
                 {
                     "task_id": task_token,
+                    "reg_task_id": int(_reg_task_id),
+                    "acquisition_time_us": None if r2s_cycles == _COUNTER_DELTA_OVERFLOW else receive_us,
+                    "receive_delta_valid": r2s_cycles != _COUNTER_DELTA_OVERFLOW,
                     "func_id": -1,
                     "core_id": core_id,
                     "core_type": _core_type(core_id),
@@ -1008,6 +1038,23 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
     elif aicore_rows:
         raise ValueError(f"level {level} requires Scheduler task timing records")
 
+    transition_errors = []
+    for task in tasks:
+        key = (task["run_epoch"], task["core_id"], task["reg_task_id"])
+        timestamps = transition_lookup.get(key, (None, None, None))
+        task["dispatch_mode"] = "early" if (key[1], key[2], key[0]) in early_dispatch_keys else "ordinary"
+        for field, value in zip(("ready_time_us", "registered_time_us", "gate_time_us"), timestamps):
+            task[field] = None if value is None else _to_us(value)
+        ready, registered, gate = (task[field] for field in ("ready_time_us", "registered_time_us", "gate_time_us"))
+        if ready is not None and ready > task["start_time_us"]:
+            transition_errors.append({"key": key, "reason": "Ready follows execution start"})
+            task["ready_time_us"] = None
+        if registered is not None and ready is not None and registered > ready:
+            transition_errors.append({"key": key, "reason": "registration follows Ready"})
+            task["registered_time_us"] = None
+        if gate is not None and (ready is None or gate < ready or gate > task["start_time_us"]):
+            transition_errors.append({"key": key, "reason": "gate is outside Ready-to-start"})
+            task["gate_time_us"] = None
     # Sorting by task_id alone would interleave two runs' executions of the same
     # task. Epoch leads so each run's tasks stay contiguous.
     tasks.sort(key=lambda t: (t["run_epoch"], int(t["task_id"])))
@@ -1052,7 +1099,12 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
         converted = []
         for pr in thread_records:
             out = _phase_us(pr)
-            out["phase"] = "orch_submit"
+            submit_index = int(pr.get("submit_idx", 0))
+            if submit_index >= 0xFFFFFFFC and int(pr.get("task_id", 0)) == 0xFFFFFFFFFFFFFFFF:
+                out["phase"] = "orch_wait"
+                out["wait_reason"] = _COUNTER_DELTA_OVERFLOW - submit_index
+            else:
+                out["phase"] = "orch_submit"
             converted.append(out)
         aicpu_orchestrator_phases.append(converted)
 
@@ -1105,6 +1157,17 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
         "chip_swimlane_level": level,
         "tasks": tasks,
     }
+    out["core_types"] = core_types
+    out["capture_metadata"] = metadata
+    out["task_transition_metadata"] = {
+        key: value for key, value in transition_section.items() if key != "fragment_records"
+    }
+    release = transition_section.get("root_release_cycles")
+    if isinstance(release, int) and release > 0:
+        out["task_transition_metadata"]["root_release_time_us"] = _to_us(release)
+    out["task_transition_errors"] = transition_errors
+    out["task_transition_unmatched"] = len(set(transition_lookup) - set(aicore_lookup))
+    out["raw_record_counts"] = {"scheduler": len(scheduler_task_rows), "executor": len(aicore_rows)}
     # Carried through so every downstream stage picks the same TaskId layout this
     # decode did, rather than re-deriving it from something that only correlates.
     # Unconditional: resolve_runtime above already refused a document without it.
@@ -3491,6 +3554,10 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         if verbose:
             print(f"  Overhead Analysis: {sum(1 for e in oh if e.get('ph') == 'C')} counter points (8 tracks)")
 
+    if any(task.get("ready_time_us") is not None for task in tasks):
+        from .scheduler_metrics import stage_events  # noqa: PLC0415
+
+        events.extend(stage_events(tasks))
     trace: dict[str, object] = {"traceEvents": events}
     metadata = dict(timeline_metadata) if timeline_metadata else {}
     # Downstream tools (critical_path) re-format task ids from this trace alone, so it

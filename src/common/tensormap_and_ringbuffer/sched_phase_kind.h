@@ -73,6 +73,7 @@ enum class SchedPhaseKind : uint8_t {
     DummyTask = 10,       // Zero-width dependency-only task identity marker.
     PredicatedSkip = 11,  // Zero-width identity marker for a task retired because its
                           // dispatch predicate was false.
+    ControlTask = 240,    // Ready-to-retire interval of a dependency-only task.
 };
 
 // This phase's name as a report spells it. Returns a string literal, so it is safe on
@@ -81,6 +82,8 @@ enum class SchedPhaseKind : uint8_t {
 // to name.
 constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
     switch (kind) {
+    case SchedPhaseKind::ControlTask:
+        return "control_task";
     case SchedPhaseKind::Complete:
         return "complete";
     case SchedPhaseKind::Dispatch:
@@ -114,7 +117,8 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
 // each; every other phase of this runtime acts on a batch rather than one task, and its
 // task_id field holds nothing.
 constexpr bool sched_phase_carries_task_id(SchedPhaseKind kind) {
-    return kind == SchedPhaseKind::DummyTask || kind == SchedPhaseKind::PredicatedSkip;
+    return kind == SchedPhaseKind::DummyTask || kind == SchedPhaseKind::PredicatedSkip ||
+           kind == SchedPhaseKind::ControlTask;
 }
 
 // Whether a record of this phase carries the ready-queue hit/miss deltas, which decides

@@ -40,6 +40,7 @@
 // condition is not a reference an include-cleaner can see, so this include reads
 // as unused to those tools.
 #include "profiling_config.h"
+#include "common/task_transition_timing.h"
 #include "host_build_graph/constants.h"
 // NOTE (host_build_graph divergence from tensormap_and_ringbuffer): the
 // dispatch_payload.h include is intentionally dropped here. This header is
@@ -421,6 +422,7 @@ struct TaskPayload {
     // === Cache line 2 — dispatch predicate + dump metadata (AICPU-only) ===
     // AICore never reads either — args are materialized from line 0's counts and
     // region deltas. Resolved at submit; evaluated by the scheduler at dispatch.
+    TaskTransitionTiming transition_timing{};
     alignas(64) DispatchPredicate predicate;
     ArgsDumpTaskMetadata dump_metadata;
 
@@ -519,6 +521,7 @@ struct TaskPayload {
         // the only value its predicate ever gets.
         predicate = DispatchPredicate{};
         dump_metadata = {};
+        transition_timing = {};
 #if SIMPLER_DFX
         dump_metadata.dump_arg_mask = args.dump_arg_mask();
         dump_metadata.dump_arg_flags = args.dump_arg_index_ambiguous_mask();

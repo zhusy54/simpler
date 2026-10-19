@@ -1211,6 +1211,8 @@ public:
 
         std::vector<uint32_t> sched_phase_dropped_records;
         uint32_t num_orch_phase_threads{0};
+        ChipSwimlaneRuntimeStats runtime_stats{};
+        bool runtime_stats_valid{false};
 
         uint64_t total_perf_collected{0};
         uint64_t total_sched_phase_collected{0};

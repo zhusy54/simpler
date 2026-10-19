@@ -30,6 +30,7 @@
 #pragma once
 
 #include <atomic>
+#include "aicpu/chip_swimlane_collector_aicpu.h"
 #include "common/core_type.h"
 #include "common/memory_barrier.h"
 #include "utils/device_arena.h"
@@ -546,6 +547,10 @@ struct SchedulerState {
     // the per-shape ready_sync_queues[] (drained as Tier-0); everything else to
     // ready_queues[].
     void push_ready_routed(ChipTaskSlotState *slot_state) {
+#if SIMPLER_DFX
+        chip_swimlane_confirm_ready(slot_state->payload->transition_timing);
+#endif
+
         ResourceShape shape = slot_state->active_mask.to_shape();
         if (shape == ResourceShape::DUMMY ||
             (slot_state->task_attrs.has_predicate() && !slot_state->payload->predicate.pass())) {
@@ -776,9 +781,12 @@ struct SchedulerState {
     // rendezvous makes one queue sufficient.
     ChipReadyQueue early_sync_start_queue;
 
-    static inline void ring_one_doorbell(uint64_t reg_addr, uint32_t token) {
+    static inline void ring_one_doorbell(int core_id, uint64_t reg_addr, uint32_t token) {
         volatile uint64_t *dmb = reinterpret_cast<volatile uint64_t *>(get_reg_ptr(reg_addr, RegId::DATA_MAIN_BASE));
         uint64_t tk = static_cast<uint64_t>(token);
+#if SIMPLER_DFX
+        chip_swimlane_aicpu_gate(core_id, token);
+#endif
         *dmb = (tk << 32) | tk;  // 64-bit STR: high=low=token releases the gated AICore
     }
 
@@ -787,7 +795,7 @@ struct SchedulerState {
             int core_id = word * 64 + __builtin_ctzll(bits);
             bits &= bits - 1;
             ring_one_doorbell(
-                early_dispatch_doorbell_table[core_id].addr, early_dispatch_doorbell_table[core_id].token
+                core_id, early_dispatch_doorbell_table[core_id].addr, early_dispatch_doorbell_table[core_id].token
             );
         }
     }
@@ -807,7 +815,7 @@ struct SchedulerState {
     static inline bool
     ring_claimed_local_doorbell(uint64_t claimed_word, int core_id, uint64_t reg_addr, uint32_t token) {
         if ((claimed_word & (1ULL << (core_id & 63))) == 0) return false;
-        ring_one_doorbell(reg_addr, token);
+        ring_one_doorbell(core_id, reg_addr, token);
         return true;
     }
 
@@ -833,7 +841,7 @@ struct SchedulerState {
                 int core_id = w * 64 + __builtin_ctzll(bits);
                 bits &= bits - 1;
                 ring_one_doorbell(
-                    early_dispatch_doorbell_table[core_id].addr, early_dispatch_doorbell_table[core_id].token
+                    core_id, early_dispatch_doorbell_table[core_id].addr, early_dispatch_doorbell_table[core_id].token
                 );
             }
         }
@@ -1096,6 +1104,9 @@ struct SchedulerState {
 
     bool route_ready_once(ChipTaskSlotState &slot_state, EarlyDispatchReleaseSink *sink = nullptr) {
         if (!try_claim_ready_once(slot_state)) return false;
+#if SIMPLER_DFX
+        chip_swimlane_confirm_ready(slot_state.payload->transition_timing);
+#endif
 
         // Early-dispatch: pre-staged tasks are released by doorbell
         // here, skipping the ready-queue round-trip entirely.
@@ -1140,6 +1151,9 @@ struct SchedulerState {
 
         // Early-dispatch: pre-staged tasks are released by doorbell
         // here, skipping the ready-queue round-trip entirely.
+#if SIMPLER_DFX
+        chip_swimlane_confirm_ready(slot_state.payload->transition_timing);
+#endif
         bool early_handled = try_early_dispatch_release(slot_state, sink);
         if (slot_state.task_attrs.requires_sync_start()) {
             bool drain_owned = publish_ready_to_early_sync_drain(*slot_state.payload);
