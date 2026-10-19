@@ -26,10 +26,10 @@ from tests.st.scheduler_benchmark.matrix import (
     SHORT_ITERS,
     CaseSpec,
     expand_case,
-    expected_edges,
     is_long,
     scale_case,
     task_roles,
+    validate_deps,
 )
 
 _KERNELS = Path(__file__).parent / "kernels"
@@ -62,33 +62,6 @@ def _digest(iterations: int) -> int:
     for _ in range(iterations):
         state = (state * 1664525 + 1013904223) & 0xFFFFFFFF
     return state & 0x7FFFFFFF
-
-
-def validate_deps(deps: dict, spec: CaseSpec) -> None:
-    tasks = deps.get("tasks", [])
-    assert len(tasks) == spec.task_count, (spec.case_id, len(tasks), spec.task_count)
-    roles = task_roles(spec)
-    positions = {int(task["task_id"]): index for index, task in enumerate(tasks)}
-    assert len(positions) == spec.task_count, f"{spec.case_id}: duplicate task IDs"
-    kernel_ids = {"aic": [0, -1, -1], "aiv": [-1, 1, -1], "dummy": [-1, -1, -1]}
-    for index, (task, role) in enumerate(zip(tasks, roles)):
-        assert task["kernel_ids"] == kernel_ids[role], (spec.case_id, index, task["kernel_ids"], role)
-        assert int(task["block_num"]) == 1, (spec.case_id, index, task["block_num"])
-        if spec.family == 4:
-            assert task["scope"] == ("auto" if role == "dummy" else "manual"), (spec.case_id, index, task["scope"])
-
-    actual = []
-    for edge in deps.get("edges", []):
-        pred = positions.get(int(edge["pred"]))
-        succ = positions.get(int(edge["succ"]))
-        assert pred is not None and succ is not None, (spec.case_id, edge)
-        actual.append((pred, succ, edge["source"]))
-    expected = expected_edges(spec)
-    assert len(actual) == len(expected), (spec.case_id, "edge count", len(actual), len(expected))
-    assert set(actual) == {(pred, succ, "explicit") for pred, succ in expected}, (
-        spec.case_id,
-        "DAG differs from the fixed matrix",
-    )
 
 
 class SchedulingBenchmarkScene(SceneTestCase):

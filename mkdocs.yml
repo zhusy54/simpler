@@ -158,6 +158,7 @@ nav:
       - Device phases: dfx/device-phases.md
       - Scheduler-overhead model: dfx/sched-overhead-model.md
       - Chip Swimlane: dfx/chip-swimlane-profiling.md
+      - Zero-overhead scheduler replay: dfx/scheduler-replay.md
       - Core Swimlane: dfx/core-swimlane-profiling.md
       - PMU: dfx/pmu-profiling.md
       - Args dump: dfx/args-dump.md

@@ -25,8 +25,7 @@ from simpler_setup.tools.scheduler_metrics import (
     scale_calibration,
 )
 from simpler_setup.tools.swimlane_converter import generate_chrome_trace_json, read_perf_data
-from tests.st.scheduler_benchmark.matrix import CASE_IDS, CaseSpec, is_long, task_roles
-from tests.st.scheduler_benchmark.scene import validate_deps
+from tests.st.scheduler_benchmark.matrix import CASE_IDS, CaseSpec, is_long, task_roles, validate_deps
 from tests.st.scheduler_benchmark.workloads import WORKLOADS
 
 _ALL_IDS = (*CASE_IDS, *(w.case_id for w in WORKLOADS))
@@ -368,7 +367,7 @@ def build_report(manifests):
         "missing_case_ids": sorted(set(_ALL_IDS) - {r["case_id"] for r in rows if r["sources"]}),
         "results": rows,
         "scale_calibration": calibration,
-        "replay": "not implemented in this phase",
+        "replay": {"status": "not_requested", "tool": "simpler_setup.tools.scheduler_replay"},
     }
 
 
@@ -568,11 +567,16 @@ def main(argv=None):
     parser.add_argument("manifests", type=Path, nargs="+")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--overhead-baseline", type=Path, action="append", default=[])
+    parser.add_argument("--replay-output", type=Path, help="also run the native host scheduler replay")
     args = parser.parse_args(argv)
     manifests = [(path, json.loads(path.read_text())) for path in args.manifests]
     report = build_report(manifests)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     report["paired_swimlanes"] = write_paired_swimlanes(report, args.output.parent)
+    if args.replay_output:
+        from simpler_setup.tools.scheduler_replay_matrix import replay_manifests  # noqa: PLC0415
+
+        report["replay"] = replay_manifests(args.manifests, args.replay_output)
     if args.overhead_baseline:
         baselines = [(path, json.loads(path.read_text())) for path in args.overhead_baseline]
         report["profiling_overhead"] = profiling_overhead_report(baselines, manifests)

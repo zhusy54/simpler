@@ -46,6 +46,7 @@ struct RuntimeContext;
  */
 class SchedulerContext {
     friend class SchedulerRetirementTestPeer;
+    friend class SchedulerReplayAdapter;
 
 public:
     // =========================================================================

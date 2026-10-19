@@ -49,3 +49,24 @@ The report keeps all 41 IDs, including not_run entries. It checks source-patch f
 Inspect C3 qualification before quoting release costs: current TMR manual scope does not ensure live consumer edges are registered before producer completion. Unqualified units do not contribute to the target fan-in/out summary. W dependency metrics stay unmeasured until the actual DAG association is verified. Treat observed stage contributions and idle-with-ready intervals as diagnostic evidence; end-to-end removable-time estimates require the later replay phase.
 
 Diagnostic commands prebind a persistent `*_host_logs_*/` directory before Worker initialization. Preserve the manifest's `host_log_directory` along with stdout: diagnostic `[STRACE]` records move to the process logs, and the default transient spool is deleted at process exit. Use `--overhead-baseline` on the report CLI with separate old-diagnostic, new-diagnostic and no-diagnostic repeated samples from the same device and configuration; absent device timing stays unmeasured.
+
+## Zero-overhead host replay
+
+Use `python -m simpler_setup.tools.scheduler_replay <deps-manifest> <events-manifest> --output outputs/replay`
+to replay compatible C graphs with native runtime scheduling code on a virtual clock.
+Direct capture mode takes `<chip_swimlane_records.json> --deps <deps.json>`.
+See `simpler_setup/tools/README.md#scheduler_replay` for supported scheduler paths,
+configuration, output artifacts and exclusions. No onboard command or NPU is needed.
+
+The tool retains actual AICore S-to-E durations and native queue/core/slot policies,
+but gives all scheduler and submission operations zero virtual cost, including E-to-F.
+TMR uses native finite pools and scope reclamation. Inspect the configuration source:
+absent capture ownership or an explicit setting, thread defaults are labelled assumptions.
+Multi-block/MIX identity gaps, early-dispatch attributes, allocation-dependent W graphs
+and unverified execution-instance associations must stay unsupported.
+
+`comparison.json` contains paired observed and synthetic Perfetto timelines. The
+model's `T_ideal_us` is policy-specific, not an optimum or a predicted measured speedup.
+It holds kernel durations fixed after rescheduling and does not reproduce measured
+scheduler delays. Keep the model gap separate from observed stage attribution and
+from no-diagnostic end-to-end performance conclusions.

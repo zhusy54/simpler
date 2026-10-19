@@ -13,6 +13,7 @@ no repo checkout required.
 - **[swimlane_converter](#swimlane_converter)** — perf JSON → Chrome Trace Event (Perfetto)
 - **[sched_overhead_analysis](#sched_overhead_analysis)** — scheduler overhead / Tail OH breakdown
 - **[scheduler_metrics](#scheduler_metrics)** — observed E/F/R/D/A/S stages, actual Ready depth, occupancy and validated-DAG attribution
+- **[scheduler_replay](#scheduler_replay)** — host-native runtime scheduling with a virtual clock and paired Perfetto timelines
 - **[critical_path](#critical_path)** — chip swimlane critical-path compute/stall analysis
 - **[strace_timing](#strace_timing)** — per-stage `chip.run` breakdown (host + AICPU phases) from `[STRACE]` log markers → TPOT table, per-round table (`--rounds-table`), nested tree (`--tree`), or Perfetto JSON
 - **[hbg_bind_phases](#hbg_bind_phases)** — `host_build_graph` `bind`-stage segments from the `chip.run.bind.*` spans → per-segment min/median/max plus the control-plane total
@@ -81,6 +82,16 @@ python -m tests.st.scheduler_benchmark.report outputs/deps_manifest.json outputs
 The fixed runner accepts `--scale 2` for additional C-graph calibration runs, preserving C2 width and C3 fan-in/out. Each capture also writes a `scheduler_stages.json` Perfetto trace. The matrix report retains all 41 IDs, flags incompatible source/environment fingerprints, and uses no-diagnostic samples for timing. Static/observed critical-path contributions describe the recorded timeline; replay and removable-time estimates are outside this tool.
 
 TMR manual scope retains task lifetimes and does not guarantee that all consumer live edges are wired before producers complete. C3 diagnostics explicitly check registration versus producer completion and exclude unqualified middle units from release summaries. Backpressure totals/peaks are available at level 2; wait distributions require level 4 intervals. MIX/multi-block idle attribution needs complete launch/placement constraints. Dynamic W graphs without a verified capture-to-DAG association retain unmeasured dependency metrics.
+
+---
+
+## scheduler_replay
+
+Run the original runtime scheduling code on the host with a virtual clock,
+using captured AICore S-to-E durations and zero scheduling cost. Produces
+policy-specific completion times and paired Perfetto swimlanes. See
+[the replay guide](../../docs/dfx/scheduler-replay.md) for inputs, commands,
+configuration, validation and supported scheduler paths.
 
 ---
 

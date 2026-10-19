@@ -1701,6 +1701,8 @@ pass both paths to the analysis CLI; see `simpler_setup/tools/README.md`.
 
 ## 9. Related docs
 
+- [scheduler-replay.md](scheduler-replay.md) — host-native zero-overhead replay and paired observed/synthetic Perfetto timelines.
+
 - [l2-timing.md](l2-timing.md) — the everyday L2 numbers: `[STRACE]`
   host_wall / device_wall, plus Total / Orch / Sched straight from the
   `SIMPLER_DFX` device-log markers (no swimlane capture, works with

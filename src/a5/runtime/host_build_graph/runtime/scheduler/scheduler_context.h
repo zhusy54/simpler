@@ -102,6 +102,8 @@ class SchedulerContextTestPeer;
  *   - scheduler_dispatch.cpp    (task dispatch loop and helpers)
  */
 class SchedulerContext {
+    friend class SchedulerReplayAdapter;
+
 public:
     // =========================================================================
     // Lifecycle
