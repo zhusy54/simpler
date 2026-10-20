@@ -54,6 +54,11 @@ inputs to each submit are captured and the graph is reconstructed afterwards.
   the runner. No `submit_trace.bin` lands on disk — the host already
   has the records once the run ends, and going through the filesystem
   would just be extra I/O.
+  The drain and collector threads remain resident between runs. At each run
+  boundary, `quiesce()` drains published buffers; reconciliation reads only
+  the stopped device producer's terminal fields into a private snapshot.
+  It must not refresh the live transport mirror, whose free-queue state is
+  still maintained by the drain thread.
 - **Host replay (dual-pass, self-checking).** After `reconcile_counters()`
   confirms a clean trace (no drops, no leftovers),
   `dep_gen_replay_emit_deps_json` runs every record back through *two*

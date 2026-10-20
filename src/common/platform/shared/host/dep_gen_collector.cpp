@@ -304,20 +304,28 @@ simpler::dfx::dep_gen_runs::ReconcileReport DepGenCollector::reconcile_report() 
     if (shm_host_ == nullptr) return out;
     report_drain_drops();
 
-    // mgmt thread is stopped by the caller; pull the latest BufferState
-    // (current_buf_ptr, total/dropped counters) from device so the
-    // cross-check sees post-stop() values. The result decides the run: a failed
-    // copy leaves the host shadow holding the zeroes begin_run() wrote, and
-    // the identity below would balance over a run that collected nothing.
-    if (manager_.shared_mem_dev() != nullptr && shm_size_ > 0) {
-        const int rc = profiling_copy_from_device(shm_host_, manager_.shared_mem_dev(), shm_size_);
-        if (rc != 0 || fail_region_read_) {
-            LOG_ERROR("dep_gen reconcile: the shared region read failed (%d) — this run's counts are untrusted", rc);
-            out.region_read_failed = true;
-            return out;
-        }
-    } else if (fail_region_read_) {
-        LOG_ERROR("dep_gen reconcile: the shared region read failed — this run's counts are untrusted");
+    // quiesce() drains records but leaves the transport threads running. Read
+    // terminal state into private storage: refreshing the live mirror here
+    // races the drain thread's free-queue publications and can roll back tail.
+    DepGenBufferState terminal_state{};
+    const auto *source_state = manager_.shared_mem_dev() != nullptr ?
+                                   get_dep_gen_buffer_state(manager_.shared_mem_dev(), 0) :
+                                   dep_gen_state(0);
+    // Only the stopped device producer owns this range. Even reading the free
+    // queue from an SVM mirror would race its resident Host writer.
+    constexpr size_t terminal_bytes = offsetof(DepGenBufferState, _pad) - offsetof(DepGenBufferState, current_buf_ptr);
+    int rc = 0;
+    if (profiling_copy_from_device_or_null()) {
+        rc =
+            profiling_copy_from_device(&terminal_state.current_buf_ptr, &source_state->current_buf_ptr, terminal_bytes);
+    } else {
+        std::memcpy(
+            const_cast<uint64_t *>(&terminal_state.current_buf_ptr),
+            const_cast<const uint64_t *>(&source_state->current_buf_ptr), terminal_bytes
+        );
+    }
+    if (rc != 0 || fail_region_read_) {
+        LOG_ERROR("dep_gen reconcile: the shared region read failed (%d) — this run's counts are untrusted", rc);
         out.region_read_failed = true;
         return out;
     }
@@ -325,7 +333,7 @@ simpler::dfx::dep_gen_runs::ReconcileReport DepGenCollector::reconcile_report() 
 
     bool clean = true;
 
-    DepGenBufferState *state = dep_gen_state(0);
+    const DepGenBufferState *state = &terminal_state;
     uint64_t buf_dev = state->current_buf_ptr;
     if (buf_dev != 0) {
         void *host_ptr = manager_.resolve_host_ptr(reinterpret_cast<void *>(buf_dev));

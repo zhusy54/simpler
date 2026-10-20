@@ -29,7 +29,7 @@
  *                                  Calls set_memory_context() on the base.
  *   start(tf)                    — Inherited: launches mgmt + collector threads.
  *   [device execution]
- *   stop()                       — Inherited: drain queues, join threads.
+ *   quiesce()                    — Inherited: drain queues, keep threads resident.
  *   reconcile_counters()         — Sanity-check that no buffer the device still
  *                                  holds has records in it, run the
  *                                  collected+dropped==total cross-check. A
@@ -39,7 +39,7 @@
  *                                  dropped_record_count > 0, the host caller
  *                                  skips deps.json emission (incomplete graph;
  *                                  user gets a warning).
- *   finalize()                   — Free all device memory, unregister.
+ *   stop() / finalize()          — Join threads, free device memory, unregister.
  *
  * Output contract: per run, a contiguous in-memory stream of DepGenRecord
  * values. Host replay consumes one run's stream directly; no submit_trace.bin

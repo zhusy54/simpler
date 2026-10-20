@@ -34,6 +34,7 @@
 #include "common/dep_gen.h"
 #include "common/memory_barrier.h"
 #include "host/dep_gen_collector.h"
+#include "host/profiling_copy.h"
 #include "support/test_task_id.h"
 
 namespace {
@@ -181,6 +182,53 @@ TEST_F(DepGenRunIdentityTest, EachRunsRecordsCarryItsOwnEpoch) {
     ASSERT_NE(records, nullptr);
     EXPECT_EQ(epoch, 12u);
     EXPECT_EQ(records->size(), 1u);
+}
+
+TEST_F(DepGenRunIdentityTest, StreamingAcrossPoolCapacityAndRunBoundariesPreservesEveryRecord) {
+    collector_.start({});
+    constexpr int kSubmits = PLATFORM_DEP_GEN_RECORDS_PER_BUFFER * 12 + 17;
+    for (uint64_t epoch = 101; epoch < 106; ++epoch) {
+        run_once(epoch, kSubmits);
+        collector_.quiesce();
+        const auto report = collector_.reconcile_report();
+        ASSERT_TRUE(report.clean) << "epoch=" << epoch << " collected=" << report.collected_host;
+        const auto *records = collector_.window_records();
+        ASSERT_NE(records, nullptr);
+        ASSERT_EQ(records->size(), static_cast<size_t>(kSubmits));
+        for (int i = 0; i < kSubmits; ++i) {
+            ASSERT_EQ((*records)[i].task_id, simpler::ut::test_task_id(0x1000 + i));
+        }
+    }
+}
+
+TEST(DepGenTransportTest, ReconcileDoesNotOverwriteTheLiveTransportMirror) {
+    if (!profiling_copy_from_device_or_null()) GTEST_SKIP() << "shared-memory platform has no separate mirror";
+
+    struct SharedRegion {
+        DepGenDataHeader header{};
+        DepGenBufferState state{};
+    } device, host;
+    static_assert(sizeof(SharedRegion) == sizeof(DepGenDataHeader) + sizeof(DepGenBufferState));
+    device.header.num_instances = host.header.num_instances = 1;
+    // A drain publication advances the mirror before its H2D tail write.
+    device.state.free_queue.tail = 4;
+    host.state.free_queue.tail = 5;
+    DepGenCollector collector;
+    collector.set_memory_context(
+        dep_gen_test_alloc, nullptr, dep_gen_test_free, profiling_copy_to_device_or_null(),
+        profiling_copy_from_device_or_null(), &device, &host, sizeof(device), 0
+    );
+
+    EXPECT_TRUE(collector.reconcile_report().clean);
+    EXPECT_EQ(host.state.free_queue.tail, 5u)
+        << "a terminal read must not roll back the drain thread's in-flight free-queue publication";
+    device.state.total_record_count = 7;
+    const auto report = collector.reconcile_report();
+    EXPECT_EQ(report.total_device, 7u);
+    EXPECT_TRUE(report.identity_broken);
+    EXPECT_FALSE(report.clean);
+    EXPECT_EQ(host.state.total_record_count, 0u);
+    EXPECT_EQ(host.state.free_queue.tail, 5u);
 }
 
 // Identity survives the buffer going back to the pool and being re-stamped:
