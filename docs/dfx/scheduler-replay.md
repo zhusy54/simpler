@@ -1,5 +1,7 @@
 # Host-side zero-overhead scheduler replay
 
+For interpreting replay alongside measured benchmark results and writing a bottleneck report, use the [runtime benchmark assessment methodology](runtime-benchmark-analysis.md).
+
 Replay a captured DAG on the host using the original runtime's Ready queues,
 dispatch selection, execution slots and completion processing. The C++ backend
 replaces AICore execution with events whose durations are the captured **AICore
@@ -45,6 +47,19 @@ native configuration produces an error rather than an unconstrained schedule.
 The dependency-only TMR adapter does not allocate output tensors; workloads
 with captured OUTPUT allocations are rejected until an allocation event stream
 is available.
+
+Dummy dependency gates retain their task IDs, edges and scopes but take exactly
+zero virtual time and consume no execution-core capacity. The matrix adapter
+identifies them using the validated fixed-C graph; direct captures with an
+inline HBG AICore-produced AIV fragment must explicitly mark the DAG node
+`task_kind: "dummy"`. Only an empty three-kernel shape and a single AIV fragment
+with `func_id=-1` are accepted for that inline form. Graph/async nodes and
+unidentified extra fragments remain unsupported. Original observations retain
+the captured control duration; only the replay model sets it to zero.
+`replay_summary.json` records the dummy count, zero-duration policy and captured
+inline task IDs. Perfetto shows replay dummies as thread-scoped instant events
+on their Worker lanes, retaining the incoming/outgoing dependency anchors;
+no artificial 1 ns is added to the model or display.
 
 Provide explicit configuration when the capture lacks effective settings:
 

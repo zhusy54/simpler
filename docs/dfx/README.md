@@ -26,6 +26,8 @@ Analysis CLIs that consume these outputs are documented in
 | [The host_build_graph bind phases](hbg-bind-phases.md) | What the bind segments are, the switches that expose them, and how to compare two branches on the qwen and dsv4 decode cases |
 | [Device-side phase timing](device-phases.md) | Fixed AICPU phases and the variable-phase plan |
 | [Scheduler-Overhead Model](sched-overhead-model.md) | Is the scheduler the bottleneck, or starved — the model behind `--overhead` |
+| [Scheduler replay](scheduler-replay.md) | Native scheduling policies on a virtual clock with zero scheduling cost |
+| [Runtime benchmark assessment](runtime-benchmark-analysis.md) | Combine measured timing, diagnostic events and replay into performance and bottleneck reports |
 
 ## Per-task traces
 

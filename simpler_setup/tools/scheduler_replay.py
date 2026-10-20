@@ -58,8 +58,10 @@ def _edge_flags(edge):
     return 3
 
 
-def normalize_input(records_path, deps_path, *, run_epoch=None, config=None):  # noqa: PLR0912, PLR0915
-    """Retain exact device ticks and submission identities; never infer durations."""
+def normalize_input(  # noqa: PLR0912, PLR0915
+    records_path, deps_path, *, run_epoch=None, config=None, verified_dummy_task_ids=()
+):
+    """Retain kernel ticks and identities; verified dummy controls take zero time."""
     records_path, deps_path = Path(records_path), Path(deps_path)
     raw, deps = _load(records_path), _load(deps_path)
     data = read_perf_data(records_path)
@@ -124,6 +126,9 @@ def normalize_input(records_path, deps_path, *, run_epoch=None, config=None):  #
     if not ids or None in ids or len(set(ids)) != len(ids):
         raise UnsupportedReplay("DAG has missing or duplicate task identities")
     index = {tid: position for position, tid in enumerate(ids)}
+    verified_dummies = {normalize_task_id_int(tid) for tid in verified_dummy_task_ids}
+    if not verified_dummies.issubset(index):
+        raise UnsupportedReplay("verified dummy identities are absent from the DAG")
     predecessors = defaultdict(dict)
     for edge in deps.get("edges", []):
         pred, succ = (normalize_task_id_int(edge[key]) for key in ("pred", "succ"))
@@ -159,6 +164,9 @@ def normalize_input(records_path, deps_path, *, run_epoch=None, config=None):  #
         if not isinstance(kernels, list) or len(kernels) != 3:
             raise UnsupportedReplay("DAG is missing the three kernel subslots")
         active = [sub for sub, kernel in enumerate(kernels) if int(kernel) >= 0]
+        explicit_dummy = node.get("task_kind") in {"dummy", "DUMMY"}
+        if active and (tid in verified_dummies or explicit_dummy):
+            raise UnsupportedReplay("dummy identity has active kernel subslots")
         observed = fragments[tid]
         durations = [0, 0, 0]
         for sub in active:
@@ -173,10 +181,18 @@ def normalize_input(records_path, deps_path, *, run_epoch=None, config=None):  #
             if duration <= 0:
                 raise UnsupportedReplay("executed fragment has no positive S-to-E duration")
             durations[sub] = duration
-        if len(observed) != len(active):
+        inline_dummy = (
+            not active
+            and (tid in verified_dummies or explicit_dummy)
+            and runtime == "host_build_graph"
+            and producer == "aicore"
+            and len(observed) == 1
+            and observed[0]["core_type"] == "aiv"
+            and observed[0]["func_id"] == -1
+            and ticks[(run_epoch, observed[0]["core_id"], observed[0]["reg_task_id"])] >= 0
+        )
+        if len(observed) != len(active) and not inline_dummy:
             raise UnsupportedReplay("execution fragment count differs from the DAG resource shape")
-        if not active and any(int(kernel) >= 0 for kernel in kernels):
-            raise UnsupportedReplay("invalid control task")
         tasks.append(
             {
                 "task_id": str(tid),
@@ -187,6 +203,15 @@ def normalize_input(records_path, deps_path, *, run_epoch=None, config=None):  #
                 "scope": node.get("scope"),
             }
         )
+        if not active:
+            tasks[-1]["dummy_identity"] = (
+                "fixed_matrix_oracle"
+                if tid in verified_dummies
+                else "explicit_task_kind"
+                if explicit_dummy
+                else "dependency_only_dag"
+            )
+            tasks[-1]["observed_control_fragments"] = len(observed)
     mapping = data.get("core_to_thread", [])
     owners = {int(owner) for owner in mapping if int(owner) >= 0}
     observed_threads = max(owners) + 1 if owners else None
@@ -220,11 +245,12 @@ def normalize_input(records_path, deps_path, *, run_epoch=None, config=None):  #
             "config": config,
             "sources": {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in (records_path, deps_path)},
             "assumptions": [
-                "captured S-to-E durations remain fixed after rescheduling",
+                "captured kernel S-to-E durations remain fixed after rescheduling",
                 "complete semantic DAG is supplied at zero host/device orchestration cost",
                 "logical cores use the native blocked cluster topology",
                 "scheduler transitions are instantaneous even on a computing AIV scheduler core",
                 "TMR input models explicit dependency lifetimes; output-buffer allocations require additional metadata",
+                "dependency-only dummy controls have zero virtual duration, including captured inline AIV controls",
             ],
         },
         data,
@@ -400,22 +426,14 @@ def write_traces(directory, model, data, deps, rows):
                 "scheduler_location": model["scheduler_location"],
                 "assumptions": model["assumptions"],
             }
-            for row in rows:
-                if not row["duration_us"]:
-                    trace["traceEvents"].append(
-                        {
-                            "ph": "i",
-                            "s": "t",
-                            "pid": 7,
-                            "tid": 0,
-                            "ts": row["start_time_us"],
-                            "cat": "control",
-                            "name": f"Control task {row['task_id']}",
-                            "args": {"task_id": row["task_id"], "synthetic": True},
-                        }
-                    )
+            dummy_ids = {int(task["task_id"]) for task in model["tasks"] if not task["mask"]}
             for event in trace["traceEvents"]:
                 event.setdefault("args", {})["synthetic"] = True
+                task_id = event["args"].get("taskId")
+                if event.get("pid") == 4 and event.get("ph") == "X" and task_id in dummy_ids:
+                    event.update(ph="i", s="t", cat="control", name=f"Dummy task {task_id}")
+                    event.pop("dur", None)
+                    event["args"].update(dummy=True, duration_ticks=0)
                 if event.get("name") == "process_name":
                     event["args"]["name"] = event["args"]["name"].replace(
                         "Observed scheduling", "Theoretical scheduling"
@@ -430,7 +448,7 @@ def write_traces(directory, model, data, deps, rows):
                 event["args"]["name"] = ("Observed: " if group == 0 else "Zero overhead: ") + event["args"]["name"]
             for key in ("id", "bind_id"):
                 if key in event:
-                    event[key] = f"{group}:{event[key]}"
+                    event[key] = 2 * int(event[key]) + group
             if group:
                 event.setdefault("args", {})["synthetic"] = True
             events.append(event)
@@ -493,11 +511,13 @@ def _statistics(model, rows, total):
     }
 
 
-def replay(records, deps, output, *, run_epoch=None, config=None, build_directory=None):
+def replay(records, deps, output, *, run_epoch=None, config=None, build_directory=None, verified_dummy_task_ids=()):
     directory = Path(output)
     directory.mkdir(parents=True, exist_ok=True)
     _write(directory / "replay_summary.json", {"status": "running"})
-    model, data, graph = normalize_input(records, deps, run_epoch=run_epoch, config=config)
+    model, data, graph = normalize_input(
+        records, deps, run_epoch=run_epoch, config=config, verified_dummy_task_ids=verified_dummy_task_ids
+    )
     _write(directory / "replay_input.json", model)
     backend = build_backend(model, build_directory)
     total, rows = execute(model, backend)
@@ -527,6 +547,13 @@ def replay(records, deps, output, *, run_epoch=None, config=None, build_director
         "T_exec_observed_us": window,
         "execution_window_gap_us": window - total,
         "task_count": len(model["tasks"]),
+        "dummy_controls": {
+            "duration_ticks": 0,
+            "task_count": sum(not task["mask"] for task in model["tasks"]),
+            "captured_inline_task_ids": [
+                task["task_id"] for task in model["tasks"] if task.get("observed_control_fragments", 0)
+            ],
+        },
         "clock_freq_hz": model["clock_freq_hz"],
         "scheduler_configuration": {
             "threads": model["scheduler_threads"],
@@ -538,7 +565,12 @@ def replay(records, deps, output, *, run_epoch=None, config=None, build_director
         ),
         "policy_source_sha256": _policy_fingerprint(model),
         "native_binary_sha256": hashlib.sha256(backend.read_bytes()).hexdigest(),
-        "validation": {"exact_fragment_durations": True, "dependency_order": True, "core_capacity": True},
+        "validation": {
+            "exact_fragment_durations": True,
+            "duration_scope": "kernel fragments; dummy controls use zero virtual duration",
+            "dependency_order": True,
+            "core_capacity": True,
+        },
         "baseline_reproduction": {"status": "not_modeled", "reason": "ideal model has no measured scheduler delays"},
         **_statistics(model, rows, total),
         "assumptions": model["assumptions"],
@@ -549,7 +581,8 @@ def replay(records, deps, output, *, run_epoch=None, config=None, build_director
     (directory / "replay_summary.md").write_text(
         f"# Scheduler replay\n\nRuntime: `{model['runtime']}` / `{model['scheduler_location']}`.\n\n"
         f"Zero-overhead completion: **{total:.6f} us**. Observed execution window: {window:.6f} us.\n\n"
-        "Durations are captured AICore S-to-E intervals. All scheduling operations take zero virtual time. "
+        "Kernel durations are captured AICore S-to-E intervals. Dummy controls and all scheduling operations "
+        "take zero virtual time. "
         "This is a policy-specific reference, not a global optimum or a measured speedup.\n\n"
         "[Comparison swimlane](comparison.json)\n"
     )

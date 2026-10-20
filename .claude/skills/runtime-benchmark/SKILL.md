@@ -1,11 +1,13 @@
 ---
 name: runtime-benchmark
-description: Run or inspect the fixed 41-case C1–C3 and W1–W5 scheduling benchmark across simpler runtimes, chips, or revisions. Use for the scheduler benchmark matrix and its JSON manifests; use benchmark or perf-runtime-device for ordinary example latency sweeps.
+description: Run or analyze the fixed 41-case scheduling benchmark, including offline replay, performance assessment and bottleneck reports across simpler runtimes, chips or revisions. Use benchmark or perf-runtime-device for ordinary example latency sweeps.
 ---
 
 # Runtime scheduling benchmark
 
 Use `tests/st/scheduler_benchmark/run_cases.py` for the fixed matrix: 33 constructed DAG configurations from `matrix.py` and 8 existing workloads from `workloads.py`. The runner expands `configuration ID × platform × runtime` and executes cases sequentially in one process with one shared L2 Worker per measurement phase. Each case retains its own inputs, log slice and capture directory. The unified runner skips golden generation and numerical output comparison for all C and W configurations in timing, DAG and event phases; input preparation, per-round reset and structural capture validation remain enabled. Standalone scene tests retain their own golden behavior. If the sibling documentation checkout exists, read `../D200_docs/benchmark/README.md` from the `simpler` root for the matrix definitions and evaluation limits.
+
+For benchmark or performance-analysis requests, complete collection/inspection, offline replay and a written performance assessment with bottleneck findings. Preserve the user's selected subset and explicit collection-only or inspection-only scope. Read [the assessment methodology](../../../docs/dfx/runtime-benchmark-analysis.md) before interpreting results; it is the maintained reference for metrics, evidence requirements and report content.
 
 ## Select and run
 
@@ -35,6 +37,8 @@ task-submit --device auto --device-num 1 --max-time 7200 \
 
 The full entry runs one 101-round timing batch (first round separate, 100 main samples), separate one-round DAG and level-3 event phases, offline metrics, paired swimlanes and the fixed 41-ID report. Repeated `--runtime` selects runtimes; omitting it selects both. Repeated `--case` narrows the run. Existing single-phase `run_cases` flags and its 10-round default remain valid. Use a fresh full-workflow output path; existing artifacts are not overwritten.
 
+The collection CLI does not execute replay or write the assessment narrative. Continue with the offline replay and assessment steps below after it exits. Existing compatible captures can be reused without another device run.
+
 Repeating a single-phase manifest path uses a fresh capture directory. Native Host/device epochs must match when present. Without a native Host epoch, only an isolated one-round capture with one device epoch and a bounded one-round Host log can be associated; the native epoch check remains unmeasured. Never equate Host invocation numbers with device epochs.
 
 `workflow.json` (or `--manifest`) records start/end UTC, actual wall duration, phase durations and shared-control/analysis time. Per-runtime spans include waits for the other runtime and final shared processing, so they overlap and must not be summed. Phase manifests include `execution_model`, process/session/Worker identity, callable fingerprints and Host-only phase accounting. Reports refuse mixed execution models, including legacy per-case-process timing combined with persistent timing. Unsupported memory queries remain null.
@@ -62,27 +66,37 @@ Diagnostic collection preserves raw captures. Offline reporting writes `schedule
 
 The report keeps all 41 IDs, including not_run entries. It checks source-patch fingerprints, environment, physical device and expanded configuration before combining data. Use `--scale 2` with selected C IDs for extra calibration runs; width and P/C stay fixed while chain length or repeated units grow. Calibration runs retain the same ID with a separate task_scale and do not enlarge the fixed matrix.
 
-Inspect C3 qualification before quoting release costs: current TMR manual scope does not ensure live consumer edges are registered before producer completion. Unqualified units do not contribute to the target fan-in/out summary. W dependency metrics stay unmeasured until the actual DAG association is verified. Treat observed stage contributions and idle-with-ready intervals as diagnostic evidence; end-to-end removable-time estimates require the later replay phase.
+Inspect C3 qualification before quoting release costs: current TMR manual scope does not ensure live consumer edges are registered before producer completion. Unqualified units do not contribute to the target fan-in/out summary. W dependency metrics stay unmeasured until the actual DAG association is verified. Treat observed stage contributions and idle-with-ready intervals as diagnostic evidence; the available zero-overhead replay is a model reference, not a per-stage causal savings estimate.
 
 Sessions prebind one persistent `host_logs/` directory before Worker initialization. Preserve `host_log_directory`, the per-case `host_log_slice`, run identities and Worker generation along with each case log: diagnostic `[STRACE]` records move to the process logs, and the default transient spool is deleted at process exit. Use `--overhead-baseline` on the report CLI with separate old-diagnostic, new-diagnostic and no-diagnostic repeated samples from the same device and configuration; absent device timing stays unmeasured.
 
-## Zero-overhead host replay
+## Offline replay
 
-Use `python -m simpler_setup.tools.scheduler_replay <deps-manifest> <events-manifest> --output outputs/replay`
-to replay compatible C graphs with native runtime scheduling code on a virtual clock.
-Direct capture mode takes `<chip_swimlane_records.json> --deps <deps.json>`.
-See `simpler_setup/tools/README.md#scheduler_replay` for supported scheduler paths,
-configuration, output artifacts and exclusions. No onboard command or NPU is needed.
+After collection, run replay for the collected configurations using their compatible DAG, event and timing manifests. For the default two-runtime invocation with `--manifest outputs/runtime_benchmark.json`, the phase files are under `outputs/runtime_benchmark/`:
 
-The tool retains actual AICore S-to-E durations and native queue/core/slot policies,
-but gives all scheduler and submission operations zero virtual cost, including E-to-F.
-TMR uses native finite pools and scope reclamation. Inspect the configuration source:
-absent capture ownership or an explicit setting, thread defaults are labelled assumptions.
-Multi-block/MIX identity gaps, early-dispatch attributes, allocation-dependent W graphs
-and unverified execution-instance associations must stay unsupported.
+```bash
+.venv/bin/python -m simpler_setup.tools.scheduler_replay \
+  outputs/runtime_benchmark/host_build_graph/deps.json \
+  outputs/runtime_benchmark/host_build_graph/events.json \
+  outputs/runtime_benchmark/host_build_graph/timing.json \
+  outputs/runtime_benchmark/tensormap_and_ringbuffer/deps.json \
+  outputs/runtime_benchmark/tensormap_and_ringbuffer/events.json \
+  outputs/runtime_benchmark/tensormap_and_ringbuffer/timing.json \
+  --output outputs/runtime_benchmark/replay
+```
 
-`comparison.json` contains paired observed and synthetic Perfetto timelines. The
-model's `T_ideal_us` is policy-specific, not an optimum or a predicted measured speedup.
-It holds kernel durations fixed after rescheduling and does not reproduce measured
-scheduler delays. Keep the model gap separate from observed stage attribution and
-from no-diagnostic end-to-end performance conclusions.
+Use only the selected runtimes' actual manifest paths. A custom manifest path uses its suffix-stripped path as the collection directory. Keep all collected IDs visible, including unsupported W configurations; do not silently omit unsuccessful replay attempts. Use a fresh replay directory to keep derived artifacts separate from earlier assessments. This step needs no NPU or device lock.
+
+When building a new matrix report from separate phase manifests, `tests.st.scheduler_benchmark.report --replay-output <directory>` is an alternative. After the complete collection entry has already analyzed captures, call `scheduler_replay` directly to avoid repeating that analysis. See [the replay guide](../../../docs/dfx/scheduler-replay.md) for direct-capture mode, `--config`, supported resources and output artifacts.
+
+Inspect `replay_matrix.json` row and sample statuses even when the command exits zero. For supported inputs, retain `replay_summary.json`, observed/model `comparison.json`, configuration assumptions and source hashes. Record unsupported inputs and errors with their reasons. A replay error is an incomplete analysis; it is not a successful time estimate. Do not change the runtime scheduler or weaken input checks to obtain a result.
+
+## Performance assessment and bottleneck report
+
+Read [the assessment methodology](../../../docs/dfx/runtime-benchmark-analysis.md), then write `performance_assessment.md` alongside the run's report. Base it on both the benchmark/diagnostic report and replay outputs, not on command success or aggregate timing alone. Link the exact source manifests, JSON reports and relevant comparison swimlanes.
+
+Include scope and coverage; no-diagnostic timing distributions and valid comparisons; per-configuration replay status, reference completion time, observed-window gap in microseconds, actual/replay time ratio (`T_exec_observed_us / T_ideal_us`, expressed as a multiple), and scheduling-overhead share estimated by replay (`(T_exec_observed_us - T_ideal_us) / T_exec_observed_us`, expressed as a percentage). Keep the ratio and overhead share as separate columns, label the latter as a model estimate, and omit the model lower bound from the assessment. Include evidence-backed bottleneck findings, prioritized follow-up measurements, and missing-data/model limitations. Keep unrun IDs and unsupported cases visible. If only a subset was requested, label the assessment as a subset rather than a complete matrix result.
+
+Use kernel durations, critical-path stages, actual Ready depth, idle-with-ready intervals, utilization, submission/backpressure and C3 qualification together to identify limiting mechanisms. The replay model retains native scheduling/resource policies while assigning submission and scheduling zero virtual cost; its `T_ideal_us` and gap are references, not measured speedups or proof that the whole gap is removable Scheduler overhead. Distinguish observations, supported interpretations and hypotheses. If the inputs cannot establish a bottleneck or speedup, state what remains unknown and which evidence would resolve it.
+
+Finish with the assessment link, timing/capture/replay coverage, principal findings and material limits. Do not present a passing collection or a replay table alone as the completed performance evaluation.

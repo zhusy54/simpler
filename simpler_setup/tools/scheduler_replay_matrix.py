@@ -14,7 +14,7 @@ import json
 from collections import defaultdict
 from pathlib import Path
 
-from tests.st.scheduler_benchmark.matrix import CASE_IDS, CaseSpec, validate_deps
+from tests.st.scheduler_benchmark.matrix import CASE_IDS, CaseSpec, task_roles, validate_deps
 from tests.st.scheduler_benchmark.workloads import WORKLOAD_BY_ID
 
 from .scheduler_replay import UnsupportedReplay, replay
@@ -91,10 +91,20 @@ def replay_manifests(paths, output, *, cases=(), config=None, build_directory=No
             try:
                 if spec is None:
                     raise UnsupportedReplay("expanded benchmark configuration is absent")
-                validate_deps(json.loads(Path(deps[-1]).read_text()), CaseSpec(**spec))
+                graph = json.loads(Path(deps[-1]).read_text())
+                case_spec = CaseSpec(**spec)
+                validate_deps(graph, case_spec)
+                dummy_ids = [
+                    task["task_id"] for task, role in zip(graph["tasks"], task_roles(case_spec)) if role == "dummy"
+                ]
                 replay_config = {"arch": "a5" if platform.startswith("a5") else "a2a3", **(config or {})}
                 sample = replay(
-                    records, deps[-1], sample_directory, config=replay_config, build_directory=build_directory
+                    records,
+                    deps[-1],
+                    sample_directory,
+                    config=replay_config,
+                    build_directory=build_directory,
+                    verified_dummy_task_ids=dummy_ids,
                 )
                 sample["T_device_diagnostic_us"] = result.get("diagnostic_device_us")
                 sample["capture_environment"] = {field: manifest.get(field) for field in _IDENTITY}
