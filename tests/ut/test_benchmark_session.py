@@ -118,6 +118,7 @@ def test_same_callable_cases_share_worker_without_mixing_rounds(session, tmp_pat
     assert workers[0].registrations == 1
     assert workers[0].runs == ["W1-01"] * 3 + ["W2-01"] * 3
     a, b = result["case_results"].values()
+    assert a["golden_validation"] == b["golden_validation"] == "skipped"
     assert [r["run_identity"]["inv"] for r in a["rounds"]] == [2, 3]
     assert [r["run_identity"]["inv"] for r in b["rounds"]] == [5, 6]
     assert a["first_round"]["run_identity"]["inv"] == 1
@@ -135,6 +136,44 @@ def test_phase_change_rebuilds_worker_and_clears_class_handles(session, tmp_path
     assert all(r["rounds"] == [] and r["diagnostic_device_us"] == 2 for r in result["case_results"].values())
     cls = instance.adapters["W1-01"]["class"]
     assert "_st_l2_handle" not in cls.__dict__
+
+
+@pytest.mark.parametrize("case_id", ["C1-01", "C2-13", "C3-10"])
+@pytest.mark.parametrize("deps,swimlane", [(False, 0), (True, 0), (False, 3)])
+def test_c_benchmark_never_generates_or_compares_golden(session, monkeypatch, tmp_path, case_id, deps, swimlane):
+    import importlib  # noqa: PLC0415
+
+    import torch  # noqa: PLC0415
+    from simpler.task_interface import ArgDirection  # noqa: PLC0415
+
+    from simpler_setup import TaskArgsBuilder, TensorArg  # noqa: PLC0415
+
+    scene_module = importlib.import_module("simpler_setup.scene_test")
+
+    class NoGoldenScene(scene_module.SceneTestCase):
+        CALLABLE = {"orchestration": {"signature": [ArgDirection.INOUT]}}
+
+        def generate_args(self, params):
+            return TaskArgsBuilder(TensorArg("state", torch.zeros(8, dtype=torch.int64)))
+
+        def compute_golden(self, args, params):
+            pytest.fail("benchmark generated golden")
+
+        def compare_outputs(self, *args):
+            pytest.fail("benchmark compared outputs")
+
+        def _build_config(self, *args, **kwargs):
+            return object()
+
+        def _resolve_env(self):
+            return {}
+
+    monkeypatch.setattr(scene_module, "_build_l2_ref_args", lambda *args, **kwargs: (case_id, ["state"]))
+    instance, workers, _ = session
+    adapter = {"class": NoGoldenScene, "chip": object(), "case": {"name": case_id}}
+    instance._start_worker()
+    instance._execute(case_id, adapter, 2, deps, swimlane, tmp_path, {})
+    assert workers[0].runs == [case_id, case_id]
 
 
 def test_device_error_stops_remaining_cases_and_later_phases(session, tmp_path):

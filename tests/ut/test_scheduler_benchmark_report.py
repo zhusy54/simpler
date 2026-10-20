@@ -58,6 +58,18 @@ def test_different_source_builds_are_not_merged():
     assert row["timing"]["status"] == "unmeasured"
 
 
+def test_report_does_not_infer_golden_validation_for_legacy_results():
+    from tests.st.scheduler_benchmark.report import report_markdown  # noqa: PLC0415
+
+    legacy = _manifest()
+    current = _manifest()
+    current["case_results"]["C1-01"]["golden_validation"] = "skipped"
+    report = build_report([(Path("legacy"), legacy), (Path("current"), current)])
+    row = next(row for row in report["results"] if row["case_id"] == "C1-01")
+    assert row["golden_validation"] == ["skipped", "unrecorded"]
+    assert "skipped, unrecorded" in report_markdown(report)
+
+
 def test_scale_fit_does_not_mix_builds_between_scales():
     report = build_report([(Path("a"), _manifest()), (Path("b"), _manifest(scale=2, source_hash="different"))])
     assert all(row["status"] == "unmeasured" for row in report["scale_calibration"])

@@ -311,6 +311,7 @@ def build_report(manifests):
             "spec": inputs[0][2],
             "sources": [str(source) for source, _, _, _ in inputs],
             "statuses": [r["status"] for _, _, _, r in inputs],
+            "golden_validation": sorted({r.get("golden_validation", "unrecorded") for _, _, _, r in inputs}),
             "comparison_compatible": compatible,
         }
         timings = [
@@ -542,15 +543,18 @@ def report_markdown(report):
     lines = [
         "# Runtime scheduling benchmark",
         "",
-        "| Platform | Runtime | Case | Scale | Timing samples | Median us | p95 us | Diagnostics |",
-        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |",
+        "Golden validation is recorded separately; passed execution/capture does not imply output correctness.",
+        "",
+        "| Platform | Runtime | Case | Scale | Timing samples | Median us | p95 us | Diagnostics | Golden validation |",
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
     for row in report["results"]:
         timing = row["timing"].get("device_us", {})
         lines.append(
             f"| {row['platform']} | {row['runtime']} | {row['case_id']} | {row['task_scale']} "
             f"| {timing.get('count', 0)} | {timing.get('median', 'unmeasured')} "
-            f"| {timing.get('p95', 'unmeasured')} | {len(row['diagnostic_reports'])} |"
+            f"| {timing.get('p95', 'unmeasured')} | {len(row['diagnostic_reports'])} "
+            f"| {', '.join(row.get('golden_validation', ['not_run']))} |"
         )
     lines.extend(
         [
