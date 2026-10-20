@@ -11,6 +11,8 @@
 
 #include "host_build_graph/host/ready_queue_sizing.h"
 
+#include <algorithm>
+
 #include "host_build_graph/runtime_status.h"
 
 namespace {
@@ -42,6 +44,7 @@ void ReadyQueuePopulations::add(const ReadyQueuePopulations &other) {
     }
     add_population(&dummy, other.dummy);
     add_population(&graph_prepare, other.graph_prepare);
+    max_graph_body_task_count = std::max(max_graph_body_task_count, other.max_graph_body_task_count);
 }
 
 bool ReadyQueuePopulations::derive_capacities(ReadyQueueCapacities *capacities) const {
@@ -49,7 +52,8 @@ bool ReadyQueuePopulations::derive_capacities(ReadyQueueCapacities *capacities) 
     for (int i = 0; i < NUM_RESOURCE_SHAPES; ++i) {
         if (ready[i] > READY_QUEUE_CAPACITY_LIMIT || ready_sync[i] > READY_QUEUE_CAPACITY_LIMIT) return false;
     }
-    if (dummy > READY_QUEUE_CAPACITY_LIMIT || graph_prepare > READY_QUEUE_CAPACITY_LIMIT) {
+    const uint64_t graph_prepare_requirement = std::max(graph_prepare, max_graph_body_task_count);
+    if (dummy > READY_QUEUE_CAPACITY_LIMIT || graph_prepare_requirement > READY_QUEUE_CAPACITY_LIMIT) {
         return false;
     }
 
@@ -59,7 +63,7 @@ bool ReadyQueuePopulations::derive_capacities(ReadyQueueCapacities *capacities) 
         capacities->ready_sync[i] = capacity_for_population(ready_sync[i]);
     }
     capacities->dummy = capacity_for_population(dummy);
-    capacities->graph_prepare = capacity_for_population(graph_prepare);
+    capacities->graph_prepare = capacity_for_population(graph_prepare_requirement);
     return true;
 }
 

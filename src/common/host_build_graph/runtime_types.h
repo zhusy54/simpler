@@ -145,7 +145,9 @@ inline constexpr uint64_t GRAPH_RECORD_BASE = PACKED_OUTPUT_ALIGN;
 #define CHIP_MAX_SCOPE_DEPTH 64  // Maximum nesting depth
 
 // Per-queue arena reservation ceiling. Bind configures each queue to the next
-// power of two covering the tasks that can reach it and rejects a larger graph.
+// power of two covering the tasks that can reach it. Graph preparation also
+// covers the largest Graph body's task count. Requirements above the ceiling
+// are rejected during bind.
 inline constexpr uint64_t READY_QUEUE_CAPACITY_LIMIT = 32768;
 
 // Cross-thread early-dispatch work queue (power of two)

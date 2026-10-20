@@ -119,10 +119,12 @@ layer to go looking in, which is what these columns are for.
 
 Code 104 can be reported before or after device execution starts:
 
-- **Host bind:** one ready queue has more than 32768 reachable tasks. This is
-  the supported single-queue population ceiling; larger graphs are rejected
-  during bind and never reach the device. Split the graph or reduce the number
-  of tasks routed to that queue.
+- **Host bind:** a queue's capacity requirement exceeds 32768 slots. Ready
+  queues use their reachable task populations; Graph preparation uses the
+  larger of the Graph instance count and the largest Graph body's task count.
+  Each requirement is rounded up to a power of two, with a minimum of two.
+  Larger requirements are rejected during bind and never reach the device.
+  Split the graph or reduce the number of tasks routed to the affected queue.
 - **Device scheduler:** a queue push found no free slot after bind accepted the
   graph. Use the reported queue and occupancy details to investigate a runtime
   accounting error or an incompatible configuration.

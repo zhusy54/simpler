@@ -310,6 +310,33 @@ void recording_orch_entry(const ChipTaskArgs &) {
     orch.graph_commit();
 }
 
+void graph_prepare_sizing_orch_entry(const ChipTaskArgs &) {
+    auto &orch = *g_orch_runtime->orchestrator;
+    uint32_t data[16]{};
+    uint32_t shape[] = {16};
+    GraphTaskArgs boundary;
+    auto boundary_input = simpler::hbg::make_tensor_external(data, shape, 1);
+    boundary.add_input(boundary_input);
+    for (const int task_count : {9, 3, 9}) {
+        const auto graph = orch.graph_begin(0x530 + task_count, boundary);
+        ASSERT_TRUE(graph.task_id.is_valid());
+        if (!graph.recording) continue;
+        ASSERT_TRUE(orch.graph_prepare(graph.recording_handle, boundary));
+        auto input = graph.params->tensor(0).ref();
+        for (int i = 0; i < task_count; ++i) {
+            CoreTaskArgs task;
+            task.add_input(input);
+            TensorCreateInfo output(shape, 1, DataType::UINT32);
+            task.add_output(output);
+            const auto outputs = orch.submit_dummy_task(task);
+            ASSERT_TRUE(outputs.task_id().is_valid());
+            input = outputs.get_ref(0);
+        }
+        ASSERT_TRUE(orch.graph_end());
+    }
+    orch.graph_commit();
+}
+
 void ordinary_orch_entry(const ChipTaskArgs &) {
     CoreTaskArgs args;
     MixedKernels kernels{};
@@ -983,6 +1010,21 @@ TEST_F(HbgBindLedgerTest, ValidateAfterARebindLeavesTheEarlierRunsBufferAlone) {
     ASSERT_EQ(finish_run(runtime, 0), 0);
     EXPECT_EQ(second, std::vector<uint8_t>(64, 0x5a));
     EXPECT_EQ(first, first_before) << "the earlier run's host buffer was overwritten by this run's bytes";
+}
+
+TEST_F(HbgBindLedgerTest, GraphPrepareCapacityUsesTheLargestBodyAcrossReplayedDefinitions) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto cleanup = cleanup_runtime(runtime);
+    eps_ = {graph_prepare_sizing_orch_entry, capture_orch_bind};
+    ChipStorageTaskArgs args;
+    ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+    ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
+    const auto *context = reinterpret_cast<const RuntimeContext *>(
+        static_cast<const uint8_t *>(runtime.get_prebuilt_arena_base()) + runtime.get_prebuilt_runtime_offset()
+    );
+    EXPECT_EQ(context->prebuilt_layout.sched.capacities.graph_prepare, 16u);
+    EXPECT_EQ(context->prebuilt_layout.sched.capacities.dummy, 32u);
 }
 
 TEST_F(HbgBindLedgerTest, AllMetadataSourcesSurviveBindAndPublishInOrder) {

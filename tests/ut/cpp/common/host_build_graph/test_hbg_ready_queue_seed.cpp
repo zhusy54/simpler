@@ -166,6 +166,57 @@ TEST(HbgReadyQueueSizing, DerivesCapacityForEachReachablePopulation) {
     EXPECT_EQ(capacities.graph_prepare, 8);
 }
 
+TEST(HbgReadyQueueSizing, GraphPreparationCoversInstanceCountAndLargestBody) {
+    struct Case {
+        uint64_t instances;
+        uint64_t body_tasks;
+        uint64_t capacity;
+    };
+    for (const Case &test :
+         {Case{0, 0, 2}, Case{40, 280, 512}, Case{130, 40, 256}, Case{8, 8, 8},
+          Case{READY_QUEUE_CAPACITY_LIMIT, READY_QUEUE_CAPACITY_LIMIT, READY_QUEUE_CAPACITY_LIMIT}}) {
+        SCOPED_TRACE(::testing::Message() << "instances=" << test.instances << " body_tasks=" << test.body_tasks);
+        ReadyQueuePopulations populations{};
+        populations.add_task(ActiveMask{}, TaskAttrs{}, TaskKind::GRAPH, test.instances);
+        populations.max_graph_body_task_count = test.body_tasks;
+        ReadyQueueCapacities capacities{};
+        ASSERT_TRUE(populations.derive_capacities(&capacities));
+        EXPECT_EQ(capacities.graph_prepare, test.capacity);
+        EXPECT_EQ(capacities.dummy, 2u);
+        for (int i = 0; i < NUM_RESOURCE_SHAPES; ++i) {
+            EXPECT_EQ(capacities.ready[i], 2u);
+            EXPECT_EQ(capacities.ready_sync[i], 2u);
+        }
+    }
+}
+
+TEST(HbgReadyQueueSizing, MergingReplayedBodiesKeepsTheirMaximumInsteadOfTheirSum) {
+    ReadyQueuePopulations first{};
+    ReadyQueuePopulations second{};
+    first.add_task(ActiveMask{}, TaskAttrs{}, TaskKind::GRAPH, 2);
+    first.max_graph_body_task_count = 280;
+    second.add_task(ActiveMask{}, TaskAttrs{}, TaskKind::GRAPH, 3);
+    second.max_graph_body_task_count = 40;
+    first.add(second);
+    second.max_graph_body_task_count = 280;
+    first.add(second);
+
+    EXPECT_EQ(first.graph_prepare, 8u);
+    EXPECT_EQ(first.max_graph_body_task_count, 280u);
+    ReadyQueueCapacities capacities{};
+    ASSERT_TRUE(first.derive_capacities(&capacities));
+    EXPECT_EQ(capacities.graph_prepare, 512u);
+}
+
+TEST(HbgReadyQueueSizing, RejectsLargestGraphBodyPastReservationLimit) {
+    ReadyQueuePopulations populations{};
+    populations.add_task(ActiveMask{}, TaskAttrs{}, TaskKind::GRAPH);
+    populations.max_graph_body_task_count = READY_QUEUE_CAPACITY_LIMIT + 1;
+    ReadyQueueCapacities capacities{};
+
+    EXPECT_EQ(derive_ready_queue_capacities(populations, &capacities), -SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
+}
+
 TEST(HbgReadyQueueSizing, RejectsPopulationPastReservationLimit) {
     ReadyQueuePopulations populations{};
     populations.add_task(ActiveMask(SUBTASK_MASK_AIC), TaskAttrs{}, TaskKind::KERNEL, READY_QUEUE_CAPACITY_LIMIT + 1);
