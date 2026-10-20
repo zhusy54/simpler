@@ -37,6 +37,7 @@ from functools import cache
 from pathlib import Path
 from typing import Any, NamedTuple
 
+from .case_timing import measure_phase
 from .compile_pool import compile_slot, current_compile_workers
 from .log_config import DEFAULT_LOG_LEVEL, LOG_LEVEL_CHOICES, TIMING, configure_logging
 from .pto_isa import ensure_pto_isa_root
@@ -691,8 +692,9 @@ class ChildMemoryTaskArgs:
             if name in self.buffers:
                 self.worker.copy_from(getattr(test_args, name), self.buffers[name])
 
-    def release(self):
+    def release(self, *, strict=False):
         """Release in LIFO order, even when an individual free fails."""
+        failure = None
         self.tensors.clear()
         self.directions.clear()
         while self.buffers:
@@ -700,7 +702,10 @@ class ChildMemoryTaskArgs:
             try:
                 self.worker.free(buf)
             except Exception as exc:  # noqa: BLE001 -- attempt all frees, preserve the test result
+                failure = failure or exc
                 logger.warning("Child-memory tensor cleanup failed: %s", exc)
+        if strict and failure is not None:
+            raise RuntimeError("Child-memory tensor cleanup failed") from failure
 
     def __enter__(self):
         return self
@@ -2214,6 +2219,7 @@ class SceneTestCase:
         enable_dep_gen=False,
         enable_scope_stats=False,
         output_prefix="",
+        phase_timings=None,
     ):
         params = case.get("params", {})
         config_dict = case.get("config", {})
@@ -2227,30 +2233,33 @@ class SceneTestCase:
             handle = worker.register(callable_obj)
             type(self)._st_l2_handle = handle
 
-        test_args = self.generate_args(params)
+        with measure_phase(phase_timings, "fixture"):
+            test_args = self.generate_args(params)
         with _child_memory_args(worker, test_args, orch_sig) as child_args:
             chip_args, output_names = _build_l2_ref_args(test_args, orch_sig, worker, child_args=child_args)
             host_memory_outputs = [name for name in output_names if name not in child_args.tensors]
             child_memory_outputs = [name for name in output_names if name in child_args.tensors]
 
-            golden_args = None
-            if not skip_golden:
-                golden_args = test_args.clone()
-                with _golden_thread_cap():
-                    initial_golden = {name: getattr(golden_args, name).clone() for name in host_memory_outputs}
-                    for golden_round in range(rounds if child_memory_outputs else 1):
-                        if golden_round:
-                            for name, initial in initial_golden.items():
-                                getattr(golden_args, name).copy_(initial)
-                        self.compute_golden(golden_args, params)
+            with measure_phase(phase_timings, "golden"):
+                golden_args = None
+                if not skip_golden:
+                    golden_args = test_args.clone()
+                    with _golden_thread_cap():
+                        initial_golden = {name: getattr(golden_args, name).clone() for name in host_memory_outputs}
+                        for golden_round in range(rounds if child_memory_outputs else 1):
+                            if golden_round:
+                                for name, initial in initial_golden.items():
+                                    getattr(golden_args, name).copy_(initial)
+                            self.compute_golden(golden_args, params)
 
             _log_torch_backend_autoload_once()
 
             # Save initial output tensor values for reset between rounds
-            initial_outputs = {}
-            if rounds > 1:
-                for name in host_memory_outputs:
-                    initial_outputs[name] = getattr(test_args, name).clone()
+            with measure_phase(phase_timings, "snapshot"):
+                initial_outputs = {}
+                if rounds > 1:
+                    for name in host_memory_outputs:
+                        initial_outputs[name] = getattr(test_args, name).clone()
 
             # Execute rounds. The platform emits `[STRACE]` host/device markers to
             # stderr on every run; multi-round timing is obtained by teeing stderr
@@ -2259,31 +2268,36 @@ class SceneTestCase:
             # (the scene test no longer captures/parses inline). See
             # docs/dfx/l2-timing.md.
             for round_idx in range(rounds):
-                if round_idx > 0:
-                    for name, initial in initial_outputs.items():
-                        getattr(test_args, name).copy_(initial)
+                with measure_phase(phase_timings, "reset"):
+                    if round_idx > 0:
+                        for name, initial in initial_outputs.items():
+                            getattr(test_args, name).copy_(initial)
 
                 # Every diagnostic reaching this loop is already multi-round-safe:
                 # effective_diagnostic_options zeroes all of them when rounds > 1,
                 # so no per-round masking belongs here.
-                config = self._build_config(
-                    config_dict,
-                    enable_chip_swimlane=enable_chip_swimlane,
-                    enable_dump_args=enable_dump_args,
-                    enable_pmu=enable_pmu,
-                    enable_dep_gen=enable_dep_gen,
-                    enable_scope_stats=enable_scope_stats,
-                    output_prefix=output_prefix,
-                )
+                with measure_phase(phase_timings, "config"):
+                    config = self._build_config(
+                        config_dict,
+                        enable_chip_swimlane=enable_chip_swimlane,
+                        enable_dump_args=enable_dump_args,
+                        enable_pmu=enable_pmu,
+                        enable_dep_gen=enable_dep_gen,
+                        enable_scope_stats=enable_scope_stats,
+                        output_prefix=output_prefix,
+                    )
 
-                with _temporary_env(self._resolve_env()):
-                    worker.run(handle, chip_args, config=config)
+                with measure_phase(phase_timings, "worker_call"):
+                    with _temporary_env(self._resolve_env()):
+                        worker.run(handle, chip_args, config=config)
 
-                if not skip_golden and not child_memory_outputs:
+                with measure_phase(phase_timings, "compare"):
+                    if not skip_golden and not child_memory_outputs:
+                        self.compare_outputs(test_args, golden_args, output_names, params)
+            with measure_phase(phase_timings, "compare"):
+                if not skip_golden and child_memory_outputs:
+                    child_args.copy_back(test_args, child_memory_outputs)
                     self.compare_outputs(test_args, golden_args, output_names, params)
-            if not skip_golden and child_memory_outputs:
-                child_args.copy_back(test_args, child_memory_outputs)
-                self.compare_outputs(test_args, golden_args, output_names, params)
 
     def _run_and_validate_l3(  # noqa: PLR0913 -- threads CLI diagnostic flags + L3 ns context
         self,

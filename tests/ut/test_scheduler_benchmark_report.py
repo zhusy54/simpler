@@ -12,6 +12,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from tests.st.scheduler_benchmark.matrix import expand_case, scale_case
 from tests.st.scheduler_benchmark.report import build_report
 from tests.st.scheduler_benchmark.run_cases import _round_timings, _with_host_log_directory
@@ -126,3 +128,42 @@ def test_overhead_comparison_rejects_mixed_candidate_builds():
     row = profiling_overhead_report(baseline, candidate)[0]
     assert row["status"] == "unmeasured"
     assert "increment_us" not in row
+
+
+def test_report_rejects_mixed_execution_models():
+    legacy = _manifest()
+    persistent = _manifest()
+    persistent["execution_model"] = "persistent_process_worker_per_phase_v1"
+    row = build_report([(Path("legacy"), legacy), (Path("persistent"), persistent)])["results"][0]
+    assert row["comparison_compatible"] is False
+    assert row["timing"]["status"] == "unmeasured"
+
+
+@pytest.mark.parametrize("identities", [[], [{}, {}], [{"run_epoch": 8}], [{"run_epoch": 9}] * 2])
+def test_capture_identity_rejects_missing_mismatched_or_duplicate_epochs(identities):
+    from tests.st.scheduler_benchmark.report import _validate_capture_identity  # noqa: PLC0415
+
+    data = {"tasks": [{"run_epoch": 9}], "runtime": "host_build_graph"}
+    with pytest.raises(ValueError, match="identity|mismatch"):
+        _validate_capture_identity(data, identities, "host_build_graph")
+
+
+def test_capture_identity_checks_runtime_and_accepts_matching_fragments():
+    from tests.st.scheduler_benchmark.report import _validate_capture_identity  # noqa: PLC0415
+
+    data = {"tasks": [{"run_epoch": 9}] * 4, "runtime": "host_build_graph"}
+    _validate_capture_identity(data, [{"run_epoch": 9}], "host_build_graph")
+    with pytest.raises(ValueError, match="Runtime mismatch"):
+        _validate_capture_identity(data, [{"run_epoch": 9}], "tensormap_and_ringbuffer")
+
+
+def test_single_capture_without_host_epoch_does_not_guess_inv_mapping():
+    from tests.st.scheduler_benchmark.report import _validate_capture_identity  # noqa: PLC0415
+
+    data = {"tasks": [{"run_epoch": 9}] * 4, "runtime": "host_build_graph"}
+    identity = _validate_capture_identity(data, [{"pid": 77, "inv": 1}], "host_build_graph")
+    check = identity["host_epoch_check"]
+    assert isinstance(check, dict) and check["status"] == "unmeasured"
+    assert identity["device_run_epoch"] == 9
+    with pytest.raises(ValueError, match="ambiguous"):
+        _validate_capture_identity({**data, "tasks": [{"run_epoch": 8}, {"run_epoch": 9}]}, [{}], "host_build_graph")

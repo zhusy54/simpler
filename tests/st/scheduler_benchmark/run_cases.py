@@ -10,22 +10,36 @@
 
 import argparse
 import hashlib
-import json
 import os
 import re
 import subprocess
 import sys
-import tempfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 from tests.st.scheduler_benchmark.matrix import CASE_IDS, LONG_ITERS, SHORT_ITERS, expand_case, scale_case
-from tests.st.scheduler_benchmark.workloads import WORKLOAD_BY_ID, WORKLOADS, supported_platforms, workload_case
+from tests.st.scheduler_benchmark.workloads import WORKLOAD_BY_ID, WORKLOADS, workload_case
 
 _REPO = Path(__file__).resolve().parents[3]
 _QUERY = _REPO / "tools/cann-examples/query/build/query"
 _CAP = {"a2a3": 24, "a5": 36}
 ALL_CASE_IDS = (*CASE_IDS, *(spec.case_id for spec in WORKLOADS))
+
+
+def prepare_sim_environment(platform):
+    """Make spawned interpreters resolve the compiler's C++ runtime first."""
+    if not platform.endswith("sim"):
+        return False
+    library = subprocess.run(
+        ["g++-15", "-print-file-name=libstdc++.so.6"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    directory = str(Path(library).parent)
+    previous = os.environ.get("LD_LIBRARY_PATH", "")
+    if previous.split(":")[0] == directory:
+        return False
+    os.environ["LD_LIBRARY_PATH"] = directory + (":" + previous if previous else "")
+    return True
 
 
 def _metadata() -> dict:
@@ -42,6 +56,7 @@ def _metadata() -> dict:
         "simpler_setup",
         "python",
         "tests",
+        "examples",
         "cmake",
         "CMakeLists.txt",
         "pyproject.toml",
@@ -71,31 +86,33 @@ def _metadata() -> dict:
     }
 
 
-def _round_timings(log: Path, expected_rounds: int) -> list[dict]:
+def _timings_from_lines(lines, expected_rounds):
     from simpler_setup.tools.strace_timing import (  # noqa: PLC0415
         _round_metrics,
-        bucket_by_hid,
         group_invocations,
         invocation_spans,
         parse_spans,
     )
 
-    def lines():
-        for path in sorted(log.glob("host.*.log")) if log.is_dir() else [log]:
-            with path.open(encoding="utf-8", errors="replace") as stream:
-                yield from stream
-
-    buckets = bucket_by_hid(group_invocations(invocation_spans(parse_spans(lines()))))
-    if not buckets:
-        raise ValueError("no [STRACE] invocations")
-    invocations = max(buckets.values(), key=len)
+    invocations = group_invocations(invocation_spans(parse_spans(lines)))
+    invocations = [inv for inv in invocations if inv.root() is not None]
     if len(invocations) != expected_rounds:
         raise ValueError(f"expected {expected_rounds} rounds, found {len(invocations)}")
+    identities = set()
     rows = []
     for index, inv in enumerate(invocations):
         host, device, effective, orch, sched = _round_metrics(inv)
-        if device <= 0:
-            raise ValueError(f"round {index} has no device-wall marker")
+        if host <= 0 or device <= 0:
+            raise ValueError(f"round {index} has no positive host/device-wall marker")
+        identity = {"pid": inv.pid, "inv": inv.inv}
+        attrs = dict(re.findall(r"(\w+)=(\S+)", inv.root().attrs))
+        for key in ("run_id", "dispatch_id", "run_epoch", "slot_id", "generation"):
+            if key in attrs:
+                identity[key] = int(attrs[key])
+        key = (inv.pid, inv.inv)
+        if key in identities:
+            raise ValueError(f"duplicate run identity: {key}")
+        identities.add(key)
         rows.append(
             {
                 "round": index,
@@ -104,66 +121,19 @@ def _round_timings(log: Path, expected_rounds: int) -> list[dict]:
                 "effective_us": effective or None,
                 "orch_us": orch or None,
                 "sched_us": sched or None,
+                "run_identity": identity,
             }
         )
     return rows
 
 
-def _case_command(case_id: str, args: argparse.Namespace, arch: str) -> tuple[list[str], bool]:
-    if case_id in CASE_IDS:
-        scene = _REPO / "tests/st" / arch / args.runtime / "scheduler_benchmark/test_scheduler_benchmark.py"
-        cmd = [
-            sys.executable,
-            str(scene),
-            "--platform",
-            args.platform,
-            "--device",
-            str(args.device),
-            "--manual",
-            "include",
-            "--case",
-            case_id,
-        ]
-    else:
-        spec = WORKLOAD_BY_ID[case_id]
-        test_file = spec.test_file(_REPO, arch, args.runtime)
-        case_name = workload_case(spec, args.runtime)
-        cmd = [
-            sys.executable,
-            str(test_file),
-            "--platform",
-            args.platform,
-            "--device",
-            str(args.device),
-            "--manual",
-            "include",
-            "--case",
-            case_name,
-            "--skip-golden",
-        ]
-    if case_id in CASE_IDS and getattr(args, "scale", 1) != 1:
-        module_name = f"tests.st.{arch}.{args.runtime}.scheduler_benchmark.test_scheduler_benchmark"
-        expression = (
-            "from tests.st.scheduler_benchmark.scene import execute_scaled_scene; "
-            f"execute_scaled_scene({module_name!r}, {args.scale})"
-        )
-        cmd = [sys.executable, "-c", expression, *cmd[2:]]
-    cmd.extend(("--rounds", str(args.rounds)))
-    if args.capture_deps:
-        cmd.append("--enable-dep-gen")
-    if args.chip_swimlane:
-        cmd.extend(("--enable-chip-swimlane", str(args.chip_swimlane)))
-    supported = case_id in CASE_IDS or args.platform in supported_platforms(test_file, case_name)
-    return cmd, supported
+def _round_timings(log: Path, expected_rounds: int) -> list[dict]:
+    def lines():
+        for path in sorted(log.glob("host.*.log")) if log.is_dir() else [log]:
+            with path.open(encoding="utf-8", errors="replace") as stream:
+                yield from stream
 
-
-def _diagnostic_paths(case_id: str, runtime: str, before: set[Path]) -> list[str]:
-    token = case_id if case_id in CASE_IDS else workload_case(WORKLOAD_BY_ID[case_id], runtime)
-    if case_id == "W5-01":
-        token = "Qwen314BDecode"
-    roots = set((_REPO / "outputs").glob(f"*{token}*")) - before
-    names = ("deps.json", "chip_swimlane_records.json")
-    return sorted(str(path) for root in roots for name in names for path in root.rglob(name))
+    return _timings_from_lines(lines(), expected_rounds)
 
 
 def _hardware_counts(device: int, arch: str) -> tuple[int, int, str]:
@@ -198,91 +168,40 @@ def _with_host_log_directory(command: list[str], directory: Path) -> list[str]:
     return [command[0], "-c", expression]
 
 
-def _run_case(case_id: str, args: argparse.Namespace, arch: str, env: dict, output: Path) -> dict:
-    diagnostic = bool(args.capture_deps or args.chip_swimlane)
-    result_record = {
-        "status": "pending",
-        "exit_code": None,
-        "measurement_mode": "diagnostic" if diagnostic else "timing",
-        "scheduler_location": None,
-        "kernel_execution_us": None,
-        "rounds": [],
-        "diagnostic_device_us": None,
-        "diagnostic_paths": [],
-    }
-    log = output.with_name(f"{output.stem}_{case_id}.log")
-    try:
-        cmd, supported = _case_command(case_id, args, arch)
-        if not supported:
-            result_record["status"] = "unsupported_platform"
-            return result_record
-        timing_log = log
-        if diagnostic:
-            timing_log = Path(tempfile.mkdtemp(prefix=f"{output.stem}_{case_id}_host_logs_", dir=output.parent))
-            cmd = _with_host_log_directory(cmd, timing_log)
-            result_record["host_log_directory"] = str(timing_log)
-        result_record["command"] = cmd
-        result_record["log_path"] = str(log)
-        before = set((_REPO / "outputs").iterdir()) if diagnostic else set()
-        with log.open("w", encoding="utf-8") as stream:
-            process = subprocess.run(cmd, cwd=_REPO, env=env, stdout=stream, stderr=subprocess.STDOUT, check=False)
-        result_record["exit_code"] = process.returncode
-        if diagnostic:
-            result_record["diagnostic_paths"] = _diagnostic_paths(case_id, args.runtime, before)
-        if process.returncode:
-            result_record["status"] = "failed"
-        elif diagnostic:
-            expected = ({"deps.json"} if args.capture_deps else set()) | (
-                {"chip_swimlane_records.json"} if args.chip_swimlane else set()
-            )
-            found = {Path(path).name for path in result_record["diagnostic_paths"]}
-            if missing := expected - found:
-                result_record["status"] = "failed"
-                result_record["error"] = f"missing diagnostic files: {sorted(missing)}"
-            else:
-                result_record["status"] = "passed"
-                try:
-                    result_record["diagnostic_device_us"] = _round_timings(timing_log, 1)[0]["device_us"]
-                except ValueError as exc:
-                    result_record["diagnostic_timing_error"] = str(exc)
-                if args.chip_swimlane:
-                    from tests.st.scheduler_benchmark.report import analyze_capture  # noqa: PLC0415
+def make_manifest(args, *, counts=None, metadata=None):
+    from tests.st.scheduler_benchmark.session import EXECUTION_MODEL  # noqa: PLC0415
 
-                    records = [
-                        Path(path)
-                        for path in result_record["diagnostic_paths"]
-                        if Path(path).name == "chip_swimlane_records.json"
-                    ]
-                    summaries = [
-                        analyze_capture(
-                            path,
-                            case_id=case_id,
-                            device_us=result_record["diagnostic_device_us"],
-                            spec=scale_case(
-                                expand_case(
-                                    case_id, int(env["SIMPLER_SCHED_BENCH_K_C"]), int(env["SIMPLER_SCHED_BENCH_K_V"])
-                                ),
-                                getattr(args, "scale", 1),
-                            ).manifest()
-                            if case_id in CASE_IDS
-                            else None,
-                        )
-                        for path in records
-                    ]
-                    result_record["analysis_paths"] = [str(path) for path in summaries]
-                    if len(summaries) == 1:
-                        summary = json.loads(summaries[0].read_text())
-                        producers = {run.get("scheduler_location") for run in summary["runs"]}
-                        result_record["scheduler_location"] = producers.pop() if len(producers) == 1 else None
-                        if len(summary["runs"]) == 1:
-                            result_record["kernel_execution_us"] = summary["runs"][0].get("kernel_execution_us")
-        else:
-            result_record["rounds"] = _round_timings(log, args.rounds)
-            result_record["status"] = "passed"
-    except (FileNotFoundError, ValueError) as exc:
-        result_record["status"] = "failed"
-        result_record["error"] = str(exc)
-    return result_record
+    arch = "a5" if args.platform.startswith("a5") else "a2a3"
+    k_c, k_v, soc = counts or (
+        (8, 16, "simulated") if args.platform.endswith("sim") else _hardware_counts(args.device, arch)
+    )
+    cases = args.case or list(ALL_CASE_IDS)
+    return {
+        "schema_version": 4,
+        "execution_model": EXECUTION_MODEL,
+        "task_scale": args.scale,
+        "capture_deps": args.capture_deps,
+        "swimlane_level": args.chip_swimlane,
+        "platform": args.platform,
+        "runtime": args.runtime,
+        "device": args.device,
+        "soc": soc,
+        **(_metadata() if metadata is None else metadata),
+        "k_c": k_c,
+        "k_v": k_v,
+        "rounds_requested": args.rounds,
+        "scheduler_policy": "runtime_default",
+        "short_iterations": SHORT_ITERS,
+        "long_iterations": LONG_ITERS,
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "cases": [
+            scale_case(expand_case(cid, k_c, k_v), args.scale).manifest()
+            if cid in CASE_IDS
+            else {**WORKLOAD_BY_ID[cid].manifest(), "case": workload_case(WORKLOAD_BY_ID[cid], args.runtime)}
+            for cid in cases
+        ],
+        "case_results": {cid: {"status": "not_run"} for cid in cases},
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -304,70 +223,42 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("capture the DAG and scheduling events in separate runs")
     if args.rounds > 1 and (args.capture_deps or args.chip_swimlane):
         parser.error("diagnostic capture requires --rounds 1; run timing separately")
-    arch = "a5" if args.platform.startswith("a5") else "a2a3"
-    if args.platform.endswith("sim"):
-        k_c, k_v, soc = 8, 16, "simulated"
-    else:
-        k_c, k_v, soc = _hardware_counts(args.device, arch)
     cases = args.case or list(ALL_CASE_IDS)
-    if args.scale < 1 or (args.scale != 1 and any(case_id not in CASE_IDS for case_id in cases)):
+    if args.scale < 1 or (args.scale != 1 and any(cid not in CASE_IDS for cid in cases)):
         parser.error("--scale must be positive and applies only to C configurations")
     if len(set(cases)) != len(cases):
         parser.error("duplicate --case ID")
-    manifest = {
-        "schema_version": 3,
-        "task_scale": args.scale,
-        "capture_deps": args.capture_deps,
-        "swimlane_level": args.chip_swimlane,
-        "platform": args.platform,
-        "runtime": args.runtime,
-        "device": args.device,
-        "soc": soc,
-        **_metadata(),
-        "k_c": k_c,
-        "k_v": k_v,
-        "rounds_requested": args.rounds,
-        "scheduler_policy": "runtime_default",
-        "short_iterations": SHORT_ITERS,
-        "long_iterations": LONG_ITERS,
-        "created_utc": datetime.now(timezone.utc).isoformat(),
-        "cases": [
-            scale_case(expand_case(case_id, k_c, k_v), args.scale).manifest()
-            if case_id in CASE_IDS
-            else {**WORKLOAD_BY_ID[case_id].manifest(), "case": workload_case(WORKLOAD_BY_ID[case_id], args.runtime)}
-            for case_id in cases
-        ],
-        "case_results": {case_id: {"status": "not_run"} for case_id in cases},
-    }
+    if not args.list_only and prepare_sim_environment(args.platform):
+        os.execvpe(
+            sys.executable,
+            [sys.executable, "-m", "tests.st.scheduler_benchmark.run_cases", *(sys.argv[1:] if argv is None else argv)],
+            os.environ,
+        )
+    manifest = make_manifest(args)
     output = args.manifest or (
         _REPO / "outputs" / f"scheduler_benchmark_{args.platform}_{args.runtime}_"
-        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.json"
     )
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(manifest, indent=2) + "\n")
-    print(f"matrix: {output}; K_C={k_c}, K_V={k_v}; cases={len(cases)}", flush=True)
+    from tests.st.scheduler_benchmark.session import BenchmarkSession, write_json  # noqa: PLC0415
+
+    write_json(output, manifest)
+    print(f"matrix: {output}; K_C={manifest['k_c']}, K_V={manifest['k_v']}; cases={len(cases)}", flush=True)
     if args.list_only:
         return 0
-
-    env = os.environ.copy()
-    env["SIMPLER_SCHED_BENCH_K_C"] = str(k_c)
-    env["SIMPLER_SCHED_BENCH_K_V"] = str(k_v)
-    if args.platform.endswith("sim"):
-        library = subprocess.run(
-            ["g++-15", "-print-file-name=libstdc++.so.6"], check=True, capture_output=True, text=True
-        ).stdout.strip()
-        env["LD_LIBRARY_PATH"] = f"{Path(library).parent}:{env.get('LD_LIBRARY_PATH', '')}"
-    failed = False
-    for case_id in cases:
-        print(f"running {case_id}", flush=True)
-        case_result = _run_case(case_id, args, arch, env, output)
-        manifest["case_results"][case_id] = case_result
-        failed |= case_result["status"] == "failed"
-        print(f"{case_id}: {case_result['status']}", flush=True)
-        output.write_text(json.dumps(manifest, indent=2) + "\n")
-    manifest["exit_code"] = int(failed)
-    output.write_text(json.dumps(manifest, indent=2) + "\n")
-    return int(failed)
+    session = BenchmarkSession(
+        args.platform,
+        args.runtime,
+        args.device,
+        manifest["k_c"],
+        manifest["k_v"],
+        output.with_name(f"{output.stem}_{uuid.uuid4().hex[:12]}"),
+        task_scale=args.scale,
+    )
+    try:
+        result = session.run_phase(manifest, output)
+    finally:
+        session.close()
+    return result["exit_code"]
 
 
 if __name__ == "__main__":

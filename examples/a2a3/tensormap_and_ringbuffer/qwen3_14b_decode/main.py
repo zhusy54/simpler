@@ -48,6 +48,7 @@ from simpler.task_interface import CallConfig
 from simpler.worker import Worker
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, scene_test
+from simpler_setup.case_timing import measure_phase
 from simpler_setup.compile_pool import compile_worker_budget
 from simpler_setup.goldens.qwen3_14b_decode import (
     N_LAYERS,
@@ -551,6 +552,55 @@ def _copy_and_compare(worker: Worker, buffers: dict[str, Buffer], golden) -> Non
         del actual
 
 
+def build_callable(
+    platform,
+    *,
+    runtime="tensormap_and_ringbuffer",
+    orchestration_source=None,
+    orchestration_function="aicpu_orchestration_entry",
+    compile_workers=None,
+):
+    spec = _chip_spec(orchestration_source, orchestration_function)
+    cache_key = l3_compile_cache_key(
+        "examples.qwen3_14b_decode",
+        f"{platform}:{runtime}:{orchestration_function}",
+        spec["name"],
+        platform,
+        runtime,
+    )
+    print(f"[qwen] compiling 37 incores + orchestration for {platform}/{runtime}...", flush=True)
+    if compile_workers:
+        with compile_worker_budget(compile_workers):
+            chip = compile_chip_callable_spec(spec, platform, runtime, cache_key)
+    else:
+        chip = compile_chip_callable_spec(spec, platform, runtime, cache_key)
+    return chip, spec
+
+
+def _resolve_worker(worker, platform, runtime, device_id):
+    if worker is None:
+        return Worker(level=2, platform=platform, runtime=runtime, device_id=device_id)
+    if worker.level != 2 or any(
+        worker._config.get(key) != value
+        for key, value in (("platform", platform), ("runtime", runtime), ("device_id", device_id))
+    ):
+        raise ValueError("borrowed Qwen Worker must match the platform, runtime and device")
+    return worker
+
+
+def _release_case(worker, child_args, chip_handle, owns_worker, timings):
+    try:
+        with measure_phase(timings, "release"):
+            child_args.release(strict=not owns_worker)
+    finally:
+        if owns_worker:
+            with measure_phase(timings, "worker_close"):
+                worker.close()
+        elif chip_handle is not None:
+            with measure_phase(timings, "unregister"):
+                worker.unregister(chip_handle)
+
+
 def run(  # noqa: PLR0913 -- one knob per standalone CLI option
     device_ids,
     platform: str,
@@ -571,6 +621,10 @@ def run(  # noqa: PLR0913 -- one knob per standalone CLI option
     enable_swimlane_overhead: bool = False,
     compile_only: bool = False,
     compile_workers: int | None = None,
+    worker: Worker | None = None,
+    output_prefix: str | None = None,
+    finalize_outputs: bool = True,
+    phase_timings: dict | None = None,
 ) -> int:
     """Compile and run Qwen decode with one persistent set of device buffers."""
     device_ids = [int(device) for device in device_ids]
@@ -579,20 +633,14 @@ def run(  # noqa: PLR0913 -- one knob per standalone CLI option
     if rounds <= 0:
         raise ValueError(f"rounds must be positive, got {rounds}")
 
-    spec = _chip_spec(orchestration_source, orchestration_function)
-    cache_key = l3_compile_cache_key(
-        "examples.qwen3_14b_decode",
-        f"{platform}:{runtime}:{orchestration_function}",
-        spec["name"],
-        platform,
-        runtime,
-    )
-    print(f"[qwen] compiling 37 incores + orchestration for {platform}/{runtime}...", flush=True)
-    if compile_workers:
-        with compile_worker_budget(compile_workers):
-            chip = compile_chip_callable_spec(spec, platform, runtime, cache_key)
-    else:
-        chip = compile_chip_callable_spec(spec, platform, runtime, cache_key)
+    with measure_phase(phase_timings, "compile_cache"):
+        chip, spec = build_callable(
+            platform,
+            runtime=runtime,
+            orchestration_source=orchestration_source,
+            orchestration_function=orchestration_function,
+            compile_workers=compile_workers,
+        )
     if compile_only:
         print("[qwen] compile-only: done", flush=True)
         return 0
@@ -615,7 +663,8 @@ def run(  # noqa: PLR0913 -- one knob per standalone CLI option
         or diagnostics.swimlane_overhead
     )
     diagnostic_label = f"{CASE_LABEL}_{runtime}"
-    output_prefix = str(build_output_prefix(diagnostic_label)) if diagnostics_on else ""
+    if output_prefix is None:
+        output_prefix = str(build_output_prefix(diagnostic_label)) if diagnostics_on else ""
     if runtime_env is None:
         runtime_env = TestQwen314BDecode.CASES[0].get("config", {}).get("runtime_env", {})
     assert runtime_env is not None
@@ -625,58 +674,68 @@ def run(  # noqa: PLR0913 -- one knob per standalone CLI option
         f"[qwen] device={device_id} rounds={rounds} skip_golden={skip_golden}; one fixture upload",
         flush=True,
     )
-    worker = Worker(level=2, platform=platform, runtime=runtime, device_id=device_id)
-    chip_handle = worker.register(chip)
-    worker.init()
+    owns_worker = worker is None
+    worker = _resolve_worker(worker, platform, runtime, device_id)
+    chip_handle = None
     child_args = ChildMemoryTaskArgs(worker)
     try:
-        golden = None
-        if skip_golden:
-            _upload_fixture(
-                child_args, spec["orchestration"]["signature"], seed=seed, seq_len=seq_len, n_layers=N_LAYERS
+        with measure_phase(phase_timings, "register"):
+            chip_handle = worker.register(chip)
+        if owns_worker:
+            with measure_phase(phase_timings, "worker_init"):
+                worker.init()
+        with measure_phase(phase_timings, "fixture"):
+            golden = None
+            if skip_golden:
+                _upload_fixture(
+                    child_args, spec["orchestration"]["signature"], seed=seed, seq_len=seq_len, n_layers=N_LAYERS
+                )
+            else:
+                print("[qwen] materializing one fixture for upload and torch golden...", flush=True)
+                golden = _decode_generate_inputs(seed=seed, seq_len=seq_len, n_layers=N_LAYERS)
+                _upload_fixture(
+                    child_args,
+                    spec["orchestration"]["signature"],
+                    seed=seed,
+                    seq_len=seq_len,
+                    n_layers=N_LAYERS,
+                    fixture=golden,
+                )
+            task_args = child_args.build_args(expected_count=len(param_specs(N_LAYERS)))
+        if golden is not None:
+            with measure_phase(phase_timings, "golden"):
+                _decode_golden(golden, n_layers=N_LAYERS)
+        with measure_phase(phase_timings, "config"):
+            config = _build_config(
+                runtime_env,
+                enable_chip_swimlane=diagnostics.chip_swimlane,
+                dump_args=diagnostics.dump_args,
+                enable_pmu=diagnostics.pmu,
+                enable_dep_gen=diagnostics.dep_gen,
+                enable_scope_stats=diagnostics.scope_stats,
+                output_prefix=output_prefix,
             )
-        else:
-            print("[qwen] materializing one fixture for upload and torch golden...", flush=True)
-            golden = _decode_generate_inputs(seed=seed, seq_len=seq_len, n_layers=N_LAYERS)
-            _upload_fixture(
-                child_args,
-                spec["orchestration"]["signature"],
-                seed=seed,
-                seq_len=seq_len,
-                n_layers=N_LAYERS,
-                fixture=golden,
-            )
-            _decode_golden(golden, n_layers=N_LAYERS)
-        task_args = child_args.build_args(expected_count=len(param_specs(N_LAYERS)))
-        config = _build_config(
-            runtime_env,
-            enable_chip_swimlane=diagnostics.chip_swimlane,
-            dump_args=diagnostics.dump_args,
-            enable_pmu=diagnostics.pmu,
-            enable_dep_gen=diagnostics.dep_gen,
-            enable_scope_stats=diagnostics.scope_stats,
-            output_prefix=output_prefix,
-        )
         log_torch_backend_autoload_once()
-        # KV writes are intentionally not reset between rounds. Fixed inputs and
-        # slot_mapping make them idempotent, so the one-round golden remains valid.
+        # Fixed inputs and slot_mapping make KV writes idempotent between rounds.
         for round_idx in range(rounds):
             print(f"[qwen] round {round_idx + 1}/{rounds}", flush=True)
-            worker.run(chip_handle, task_args, config)
+            with measure_phase(phase_timings, "worker_call"):
+                worker.run(chip_handle, task_args, config)
         if golden is not None:
-            _copy_and_compare(worker, child_args.buffers, golden)
+            with measure_phase(phase_timings, "compare"):
+                _copy_and_compare(worker, child_args.buffers, golden)
     finally:
-        child_args.release()
-        worker.close()
-        finalize_diagnostic_outputs(
-            diagnostic_label,
-            output_prefix,
-            callable_spec=spec,
-            chip_swimlane=diagnostics.chip_swimlane,
-            dep_gen=diagnostics.dep_gen,
-            scope_stats=diagnostics.scope_stats,
-            swimlane_overhead=diagnostics.swimlane_overhead,
-        )
+        _release_case(worker, child_args, chip_handle, owns_worker, phase_timings)
+        if finalize_outputs:
+            finalize_diagnostic_outputs(
+                diagnostic_label,
+                output_prefix,
+                callable_spec=spec,
+                chip_swimlane=diagnostics.chip_swimlane,
+                dep_gen=diagnostics.dep_gen,
+                scope_stats=diagnostics.scope_stats,
+                swimlane_overhead=diagnostics.swimlane_overhead,
+            )
     print("[qwen] PASSED", flush=True)
     return 0
 

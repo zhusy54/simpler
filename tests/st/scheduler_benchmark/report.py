@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import shutil
 from collections import defaultdict
 from pathlib import Path
 
@@ -31,6 +32,7 @@ from tests.st.scheduler_benchmark.workloads import WORKLOADS
 _ALL_IDS = (*CASE_IDS, *(w.case_id for w in WORKLOADS))
 _ENV_KEYS = (
     "commit",
+    "execution_model",
     "source_patch_sha256",
     "platform",
     "runtime",
@@ -175,9 +177,36 @@ def _middle_metrics(data, deps, spec, run, labels):
     return result
 
 
-def analyze_capture(records, *, case_id=None, spec=None, deps_path=None, device_us=None):
+def _validate_capture_identity(data, identities, runtime):
+    """Associate a session capture without equating Host inv and device epoch."""
+    if identities is None:
+        return _unmeasured("legacy capture has no Host identity")
+    if runtime is not None and data["runtime"] != runtime:
+        raise ValueError(f"capture Runtime mismatch: Host={runtime}, device={data['runtime']}")
+    observed = {task.get("run_epoch") for task in data["tasks"]}
+    if not identities or not observed or None in observed:
+        raise ValueError("capture has no complete run identity")
+    if any(identity.get("run_epoch") is None for identity in identities):
+        if len(identities) != 1 or len(observed) != 1:
+            raise ValueError("capture has ambiguous Host/device run identity")
+        return {
+            "status": "associated",
+            "method": "isolated_single_run_capture_and_bounded_host_log",
+            "host_epoch_check": _unmeasured("Host marker has no run_epoch"),
+            "device_run_epoch": next(iter(observed)),
+        }
+    expected = {identity["run_epoch"] for identity in identities}
+    if expected != observed or len(identities) != len(expected):
+        raise ValueError(f"capture run_epoch mismatch: Host={sorted(expected)}, device={observed}")
+    return {"status": "associated", "method": "matching_native_run_epoch"}
+
+
+def analyze_capture(
+    records, *, case_id=None, spec=None, deps_path=None, device_us=None, run_identities=None, runtime=None
+):
     records = Path(records)
     data = read_perf_data(records)
+    identity = _validate_capture_identity(data, run_identities, runtime)
     deps_path = Path(deps_path) if deps_path else records.with_name("deps.json")
     deps = json.loads(deps_path.read_text()) if deps_path.exists() else None
     verified = False
@@ -193,6 +222,7 @@ def analyze_capture(records, *, case_id=None, spec=None, deps_path=None, device_
             if roles[index] != "dummy"
         }
     report = analyze(data, deps=deps, dag_verified=verified, device_us=device_us, labels=labels)
+    report["capture_identity"] = identity
     report.update({"case_id": case_id, "records_path": str(records), "deps_path": str(deps_path) if deps else None})
     counts = data.get("raw_record_counts", {})
     report["record_volume"] = {"artifact_bytes": records.stat().st_size, "raw_record_counts": counts}
@@ -233,12 +263,24 @@ def analyze_capture(records, *, case_id=None, spec=None, deps_path=None, device_
                     stats = phase.get("distribution_us")
                     phase["median_over_kernel_median"] = stats["median"] / reference["median"] if stats else None
     trace_path = records.with_name("scheduler_stages.json")
+    name_path = records.with_name("name_map_benchmark.json")
+    names = json.loads(name_path.read_text()) if name_path.is_file() else {}
     generate_chrome_trace_json(
         data["tasks"],
         trace_path,
+        func_id_to_name=names.get("callable_id_to_name"),
+        orchestrator_name=names.get("orchestrator_name"),
         runtime_name=data["runtime"],
         scheduler_phases=data.get("scheduler_records"),
+        scheduler_streams=data.get("scheduler_streams"),
+        orchestrator_phases=data.get("aicpu_orchestrator_phases"),
+        orchestrator_source=data.get("orchestrator_source"),
+        timeline_metadata=data.get("timeline_metadata"),
+        core_to_thread=data.get("core_to_thread"),
+        host_device_uploads=data.get("host_device_uploads"),
+        aicpu_lifecycle_records=data.get("aicpu_lifecycle_records"),
     )
+    shutil.copyfile(trace_path, records.with_name("merged_swimlane.json"))
     report["swimlane_path"] = str(trace_path)
     output = records.with_name("scheduler_metrics.json")
     output.write_text(json.dumps(report, indent=2) + "\n")
@@ -292,7 +334,7 @@ def build_report(manifests):
         deps = [p for _, _, _, r in inputs if r["status"] == "passed" for p in _paths(r, "deps.json")]
         analyses = []
         diagnostic_summary = []
-        for _, _, spec, result in inputs:
+        for _, manifest, spec, result in inputs:
             if result["status"] != "passed":
                 continue
             for records in _paths(result, "chip_swimlane_records.json"):
@@ -303,6 +345,8 @@ def build_report(manifests):
                         spec=spec if compatible else None,
                         deps_path=deps[-1] if deps and compatible else None,
                         device_us=result.get("diagnostic_device_us"),
+                        run_identities=result.get("run_identities"),
+                        runtime=manifest["runtime"],
                     )
                     analyses.append(str(output))
                     artifact = json.loads(output.read_text())
@@ -318,6 +362,7 @@ def build_report(manifests):
                         }
                         diagnostic_summary[-1]["record_volume"] = artifact.get("record_volume")
                         diagnostic_summary[-1]["swimlane_path"] = artifact.get("swimlane_path")
+                        diagnostic_summary[-1]["capture_identity"] = artifact.get("capture_identity")
                 except (ValueError, OSError, AssertionError) as exc:
                     analyses.append({"status": "unmeasured", "reason": str(exc), "records": str(records)})
         row["diagnostic_reports"] = analyses

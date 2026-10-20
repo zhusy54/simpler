@@ -72,6 +72,8 @@ class _FakeWorker:
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
+        self._config = kwargs
+        self.level = kwargs.get("level", 2)
         self.events = []
         self.allocations = []
         self.uploads = []
@@ -83,6 +85,9 @@ class _FakeWorker:
     def register(self, chip):
         self.events.append("register")
         return ("handle", chip)
+
+    def unregister(self, handle) -> None:
+        self.events.append("unregister")
 
     def init(self) -> None:
         self.events.append("init")
@@ -144,8 +149,9 @@ def _fixture_stream(driver, *, n_layers: int):
     ],
 )
 @pytest.mark.parametrize("runtime", ["host_build_graph", "tensormap_and_ringbuffer"])
+@pytest.mark.parametrize("borrowed", [False, True])
 def test_standalone_driver_keeps_one_device_fixture_across_rounds(
-    monkeypatch, relative_path: str, platform: str, expected_dep_pool: int, runtime: str
+    monkeypatch, relative_path: str, platform: str, expected_dep_pool: int, runtime: str, borrowed: bool
 ):
     driver = _load_driver(relative_path)
     _FakeWorker.instances.clear()
@@ -185,7 +191,10 @@ def test_standalone_driver_keeps_one_device_fixture_across_rounds(
     monkeypatch.setattr(driver, "_decode_generate_inputs", unexpected_golden)
     monkeypatch.setattr(driver, "_decode_golden", unexpected_golden)
 
-    assert driver.run([7], platform, runtime=runtime, rounds=3, skip_golden=True) == 0
+    external = _FakeWorker(level=2, platform=platform, runtime=runtime, device_id=7) if borrowed else None
+    if external is not None:
+        external.init()
+    assert driver.run([7], platform, runtime=runtime, rounds=3, skip_golden=True, worker=external) == 0
 
     [worker] = _FakeWorker.instances
     names = [param.name for param in driver.param_specs(driver.N_LAYERS)]
@@ -210,7 +219,9 @@ def test_standalone_driver_keeps_one_device_fixture_across_rounds(
     assert worker.events.index("autoload") > max(i for i, event in enumerate(worker.events) if event == "copy_to")
     assert worker.events.index("autoload") < worker.events.index("run")
     assert [event for event in worker.events if event.startswith("free:")] == [f"free:{i}" for i in reversed(range(20))]
-    assert worker.closed
+    assert worker.closed is not borrowed
+    assert worker.events.count("init") == 1
+    assert worker.events.count("unregister") == int(borrowed)
 
 
 @pytest.mark.parametrize(
