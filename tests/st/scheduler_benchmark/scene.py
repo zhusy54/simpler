@@ -22,14 +22,12 @@ from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, TensorArg
 from simpler_setup.scene_test import _outputs_dir, _sanitize_for_filename
 from tests.st.scheduler_benchmark.matrix import (
     CASE_IDS,
-    LONG_ITERS,
-    SHORT_ITERS,
     CaseSpec,
     expand_case,
-    is_long,
     scale_case,
     task_roles,
     validate_deps,
+    work_iterations,
 )
 
 _KERNELS = Path(__file__).parent / "kernels"
@@ -56,7 +54,7 @@ def _counts() -> tuple[int, int]:
     return k_c, k_v
 
 
-@lru_cache(maxsize=2)
+@lru_cache(maxsize=3)
 def _digest(iterations: int) -> int:
     state = 0x13579BDF
     for _ in range(iterations):
@@ -108,15 +106,12 @@ class SchedulingBenchmarkScene(SceneTestCase):
     def compute_golden(self, args, params):
         spec = self._spec(params)
         roles = task_roles(spec)
-        for long_work, iterations in ((False, SHORT_ITERS), (True, LONG_ITERS)):
-            indexes = [
-                index for index, role in enumerate(roles) if role != "dummy" and is_long(spec, index) == long_work
-            ]
-            if not indexes:
-                continue
-            positions = torch.tensor([(index + 1) * 8 for index in indexes], dtype=torch.long)
-            tokens = torch.tensor([(_digest(iterations) << 32) | (index + 1) for index in indexes], dtype=torch.int64)
-            args.state[positions] = tokens
+        indexes = [index for index, role in enumerate(roles) if role != "dummy"]
+        positions = torch.tensor([(index + 1) * 8 for index in indexes], dtype=torch.long)
+        tokens = torch.tensor(
+            [(_digest(work_iterations(spec, index)) << 32) | (index + 1) for index in indexes], dtype=torch.int64
+        )
+        args.state[positions] = tokens
 
     def test_run(self, st_platform, st_worker, request):
         selected = self._matching_cases(st_platform, request)

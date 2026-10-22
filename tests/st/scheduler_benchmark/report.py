@@ -42,6 +42,7 @@ _ENV_KEYS = (
     "k_v",
     "short_iterations",
     "long_iterations",
+    "task_iterations",
     "cann_version",
     "pto_isa_pin",
 )
@@ -49,6 +50,51 @@ _ENV_KEYS = (
 
 def _unmeasured(reason):
     return {"status": "unmeasured", "reason": reason}
+
+
+def limiting_factors(sample):
+    critical = sample.get("critical_path", {})
+    if critical.get("status") != "measured":
+        return _unmeasured(critical.get("reason", "verified critical-path attribution is unavailable"))
+    interpretations = {
+        "execution": "Execution/resource contribution; inspect graph width, placement and load.",
+        "E_F": "Completion observation; verify notification/polling and clock ordering.",
+        "F_R": "Dependency/Ready confirmation; separate already-registered tasks from upstream submission waits.",
+        "R_D": "Ready-to-dispatch wait; correlate with compatible idle cores and exclude normal resource queueing.",
+        "D_A": "Dispatch-to-acquisition wait; inspect executor handoff and resource requirements.",
+        "A_S": "Acquisition-to-start wait; inspect executor startup, gates and resource requirements.",
+        "control": "Control/gate contribution; inspect scope and dependency-control events.",
+        "unclassified": "Unclassified critical-path interval; no mechanism can be established.",
+    }
+    contributions = critical.get("observed_contribution_us", {})
+    fractions = critical.get("observed_contribution_fraction", {})
+    ranked = sorted(((k, v) for k, v in contributions.items() if v > 0), key=lambda item: (-item[1], item[0]))
+    factors = []
+    for stage, duration in ranked[:2]:
+        interpretation = interpretations.get(stage, "Inspect the corresponding observed stage intervals.")
+        if stage == "F_R" and sample.get("late_registration_tasks", 0):
+            interpretation += f" Late registration observed for {sample['late_registration_tasks']} tasks."
+        release = sample.get("case_metrics", {})
+        if stage == "F_R" and release.get("family") == "C3":
+            if release.get("qualified_middle_units") != release.get("middle_units"):
+                interpretation += " C3 release qualification failed; target release-cost attribution is unavailable."
+        factors.append(
+            {
+                "stage": stage,
+                "duration_us": duration,
+                "fraction_of_T_exec": fractions.get(stage),
+                "strength": "observed_stage; root_cause_unconfirmed",
+                "interpretation_and_next_check": interpretation,
+            }
+        )
+    return {
+        "status": "measured" if factors else "unmeasured",
+        "ranking_basis": "observed mutually exclusive critical-path contributions; not causal savings",
+        "factors": factors,
+        "I_sched": sample.get("I_sched"),
+        "utilization": sample.get("utilization"),
+        "late_registration_tasks": sample.get("late_registration_tasks"),
+    }
 
 
 def _per_task(data, epoch):
@@ -364,6 +410,7 @@ def build_report(manifests):
                         diagnostic_summary[-1]["record_volume"] = artifact.get("record_volume")
                         diagnostic_summary[-1]["swimlane_path"] = artifact.get("swimlane_path")
                         diagnostic_summary[-1]["capture_identity"] = artifact.get("capture_identity")
+                        diagnostic_summary[-1]["limiting_factors"] = limiting_factors(diagnostic_summary[-1])
                 except (ValueError, OSError, AssertionError) as exc:
                     analyses.append({"status": "unmeasured", "reason": str(exc), "records": str(records)})
         row["diagnostic_reports"] = analyses
@@ -483,6 +530,7 @@ def profiling_overhead_report(baselines, candidates):
                     json.dumps(spec, sort_keys=True),
                     manifest.get("short_iterations"),
                     manifest.get("long_iterations"),
+                    manifest.get("task_iterations"),
                 )
                 key = (key_fields, case_id, workload)
                 builds[(key, kind)].add((manifest.get("commit"), manifest.get("source_patch_sha256")))
@@ -543,6 +591,25 @@ def report_markdown(report):
     lines = [
         "# Runtime scheduling benchmark",
         "",
+        "Each Runtime is assessed independently; cross-Runtime comparison is deferred.",
+        "",
+    ]
+    for runtime in sorted({row["runtime"] for row in report["results"]}):
+        section = {
+            **report,
+            "results": [row for row in report["results"] if row["runtime"] == runtime],
+            "paired_swimlanes": [],
+            "profiling_overhead": [r for r in report.get("profiling_overhead", []) if r["runtime"] == runtime],
+        }
+        section["missing_case_ids"] = [
+            cid for cid in _ALL_IDS if not any(r["case_id"] == cid and r.get("sources") for r in section["results"])
+        ]
+        lines.extend([f"## {runtime}", "", _runtime_report_markdown(section)])
+    return "\n".join(lines)
+
+
+def _runtime_report_markdown(report):
+    lines = [
         "Golden validation is recorded separately; passed execution/capture does not imply output correctness.",
         "",
         "| Platform | Runtime | Case | Scale | Timing samples | Median us | p95 us | Diagnostics | Golden validation |",
@@ -561,8 +628,8 @@ def report_markdown(report):
             "",
             "Diagnostic reference (first captured run per configuration; timing above uses no diagnostics):",
             "",
-            "| Platform | Runtime | Case | Scheduler | U_AIC | U_AIV | I_sched | Ready p95 | C3 qualified |",
-            "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | --- |",
+            "| Platform | Runtime | Case | Scheduler | U_AIC | U_AIV | I_sched | Ready p95 |",
+            "| --- | --- | --- | --- | ---: | ---: | ---: | ---: |",
         ]
     )
     for row in report["results"]:
@@ -572,23 +639,63 @@ def report_markdown(report):
         sample = samples[0]
         utilization = sample.get("utilization", {})
         idle = sample.get("I_sched", {})
-        c3 = sample.get("case_metrics", {})
-        qualified = (
-            f"{c3.get('qualified_middle_units')}/{c3.get('middle_units')}" if c3.get("family") == "C3" else "n/a"
-        )
         lines.append(
             f"| {row['platform']} | {row['runtime']} | {row['case_id']} | {sample.get('scheduler_location')} "
             f"| {utilization.get('aic', {}).get('fraction', 'unmeasured')} "
             f"| {utilization.get('aiv', {}).get('fraction', 'unmeasured')} "
             f"| {idle.get('any_idle_ready_fraction', 'unmeasured')} "
-            f"| {idle.get('ready_depth', {}).get('p95', 'unmeasured')} | {qualified} |"
+            f"| {idle.get('ready_depth', {}).get('p95', 'unmeasured')} |"
         )
-    if report.get("paired_swimlanes"):
-        lines.extend(["", "Paired Perfetto swimlanes:", ""])
+    lines.extend(
+        [
+            "",
+            "First/second limiting-factor evidence (stage ranking; root causes and removable time are unconfirmed):",
+            "",
+            "| Case | First factor | Second factor | Interpretation and next check |",
+            "| --- | --- | --- | --- |",
+        ]
+    )
+    for row in report["results"]:
+        samples = row.get("diagnostic_summary", [])
+        evidence = limiting_factors(samples[0]) if samples else _unmeasured("no diagnostic sample")
+        factors = evidence.get("factors", [])
+        cells = [
+            f"{factor['stage']}: {factor['duration_us']:.3f} us"
+            + (f" ({factor['fraction_of_T_exec']:.2%})" if factor["fraction_of_T_exec"] is not None else "")
+            for factor in factors
+        ]
+        cells += ["unmeasured"] * (2 - len(cells))
+        interpretation = " ".join(factor["interpretation_and_next_check"] for factor in factors)
+        lines.append(
+            f"| {row['case_id']} | {cells[0]} | {cells[1]} | {interpretation or evidence.get('reason', 'unmeasured')} |"
+        )
+    c3_rows = [row for row in report["results"] if row["case_id"].startswith("C3-")]
+    if c3_rows:
         lines.extend(
-            f"- {item['case_id']} scale {item['task_scale']}: [{Path(item['path']).name}]({Path(item['path']).name})"
-            for item in report["paired_swimlanes"]
+            [
+                "",
+                "C3 batch release (other families do not construct these producer/consumer release units):",
+                "",
+                "F is observed predecessor completion, R is consumer Ready, S is first execution start. "
+                "All consumer dependencies must be registered before the first producer ends, with R after last F. "
+                "Release medians require all middle units to qualify; replay success alone is insufficient.",
+                "",
+                "| Case | Qualified / middle units | Last F to first R us | Ready spread us | Last F to first S us |",
+                "| --- | --- | --- | --- | --- |",
+            ]
         )
+        for row in c3_rows:
+            samples = row.get("diagnostic_summary", [])
+            release = samples[0].get("case_metrics", {}) if samples else {}
+            qualified = (
+                f"{release.get('qualified_middle_units', 'unmeasured')}/{release.get('middle_units', 'unmeasured')}"
+            )
+            summary = release.get("release_summary", {})
+            cells = [
+                str((summary.get(key) or {}).get("median", "unmeasured"))
+                for key in ("last_F_to_first_R_us", "ready_spread_us", "last_F_to_first_S_us")
+            ]
+            lines.append(f"| {row['case_id']} | {qualified} | {' | '.join(cells)} |")
     if report.get("profiling_overhead"):
         lines.extend(
             [

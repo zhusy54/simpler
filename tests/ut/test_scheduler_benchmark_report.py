@@ -58,6 +58,52 @@ def test_different_source_builds_are_not_merged():
     assert row["timing"]["status"] == "unmeasured"
 
 
+def test_different_compute_granularities_are_not_merged():
+    original = _manifest()
+    updated = _manifest()
+    updated["task_iterations"] = 704
+    report = build_report([(Path("original"), original), (Path("updated"), updated)])
+    row = next(row for row in report["results"] if row["case_id"] == "C1-01")
+    assert row["comparison_compatible"] is False
+    assert row["timing"]["status"] == "unmeasured"
+
+
+def test_limiting_factors_distinguish_stage_ranking_from_late_registration():
+    from tests.st.scheduler_benchmark.report import limiting_factors  # noqa: PLC0415
+
+    sample = {
+        "critical_path": {
+            "status": "measured",
+            "observed_contribution_us": {"execution": 5, "F_R": 80, "R_D": 15},
+            "observed_contribution_fraction": {"execution": 0.05, "F_R": 0.8, "R_D": 0.15},
+        },
+        "late_registration_tasks": 3968,
+        "case_metrics": {"family": "C3", "qualified_middle_units": 0, "middle_units": 26},
+    }
+    factors = limiting_factors(sample)["factors"]
+    assert [factor["stage"] for factor in factors] == ["F_R", "R_D"]
+    assert "3968" in factors[0]["interpretation_and_next_check"]
+    assert "qualification failed" in factors[0]["interpretation_and_next_check"]
+    assert all("root_cause_unconfirmed" in factor["strength"] for factor in factors)
+    assert limiting_factors({"critical_path": {"status": "unmeasured"}})["status"] == "unmeasured"
+
+
+def test_markdown_keeps_each_runtime_in_its_own_section():
+    from tests.st.scheduler_benchmark.report import report_markdown  # noqa: PLC0415
+
+    hbg = _manifest()
+    tmr = {**_manifest(), "runtime": "tensormap_and_ringbuffer"}
+    report = build_report([(Path("hbg"), hbg), (Path("tmr"), tmr)])
+    report["paired_swimlanes"] = [{"case_id": "C1-01", "task_scale": 1, "path": "paired.json"}]
+    text = report_markdown(report)
+    hbg_section, tmr_section = text.split("## host_build_graph\n", 1)[1].split("## tensormap_and_ringbuffer\n")
+    assert "tensormap_and_ringbuffer" not in hbg_section
+    assert "host_build_graph" not in tmr_section
+    assert "paired.json" not in text
+    assert "First/second limiting-factor" in hbg_section
+    assert "First/second limiting-factor" in tmr_section
+
+
 def test_report_does_not_infer_golden_validation_for_legacy_results():
     from tests.st.scheduler_benchmark.report import report_markdown  # noqa: PLC0415
 

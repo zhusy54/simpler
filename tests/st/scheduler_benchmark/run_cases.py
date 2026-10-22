@@ -18,7 +18,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from tests.st.scheduler_benchmark.matrix import CASE_IDS, LONG_ITERS, SHORT_ITERS, expand_case, scale_case
+from tests.st.scheduler_benchmark.matrix import CASE_IDS, LONG_ITERS, SHORT_ITERS, TASK_ITERS, expand_case, scale_case
 from tests.st.scheduler_benchmark.workloads import WORKLOAD_BY_ID, WORKLOADS, workload_case
 
 _REPO = Path(__file__).resolve().parents[3]
@@ -193,6 +193,7 @@ def make_manifest(args, *, counts=None, metadata=None):
         "scheduler_policy": "runtime_default",
         "short_iterations": SHORT_ITERS,
         "long_iterations": LONG_ITERS,
+        "task_iterations": TASK_ITERS,
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "cases": [
             scale_case(expand_case(cid, k_c, k_v), args.scale).manifest()

@@ -19,6 +19,7 @@ CASE_IDS = tuple(
 # are fixed across chip generations and runtimes.
 SHORT_ITERS = 1
 LONG_ITERS = 2048
+TASK_ITERS = 704
 
 
 @dataclass(frozen=True)
@@ -70,11 +71,11 @@ def expand_case(case_id: str, k_c: int, k_v: int) -> CaseSpec:
         length = max(32, ceil(4096 / width))
         return CaseSpec(case_id, 2, width * length, width=width, length=length, core_mode=core_mode)
 
-    fanout = (ceil(k_c / 2), k_c, 2 * k_c, 4 * k_c)
+    fanout = (1, 4, 8, 32)
     producers, consumers = (
         (1, fanout[index - 1])
         if index <= 4
-        else (1 << (index - 2), k_c)
+        else (1 << (index - 2), 1)
         if index <= 8
         else (32 if index == 9 else 64, 64)
     )
@@ -93,6 +94,12 @@ def is_long(spec: CaseSpec, index: int) -> bool:
     if spec.work_mode == 4:
         return index % 5 != 0
     return False
+
+
+def work_iterations(spec: CaseSpec, index: int) -> int:
+    if spec.work_mode == 0:
+        return TASK_ITERS
+    return LONG_ITERS if is_long(spec, index) else SHORT_ITERS
 
 
 def scale_case(spec: CaseSpec, factor: int) -> CaseSpec:

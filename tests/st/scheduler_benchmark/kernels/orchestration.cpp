@@ -23,6 +23,7 @@ constexpr int32_t kMaxConsumers = 144;  // Four times A5's maximum 36 AIC execut
 constexpr int32_t kMaxProducers = 64;
 constexpr int64_t kShortIters = 1;
 constexpr int64_t kLongIters = 2048;
+constexpr int64_t kTaskIters = 704;
 
 struct Spec {
     int64_t family;
@@ -84,7 +85,8 @@ submit_kernel(const TensorT &state, const Spec &spec, int64_t logical_index, con
     CoreTaskArgs args;
     args.add_no_dep(state);
     args.add_scalar(logical_index);
-    args.add_scalar(uses_long_work(spec, logical_index) ? kLongIters : kShortIters);
+    const int64_t short_iters = spec.work_mode == 0 ? kTaskIters : kShortIters;
+    args.add_scalar(uses_long_work(spec, logical_index) ? kLongIters : short_iters);
     args.set_dependencies(deps, dep_count);
     return uses_aiv(spec, logical_index) ? rt_submit_aiv_task(kAivKernel, args).task_id() :
                                            rt_submit_aic_task(kAicKernel, args).task_id();
@@ -124,8 +126,8 @@ void build_fanin_units(const TensorT &state, const Spec &spec) {
     TaskId previous_gate;
     int64_t index = 0;
     for (int64_t unit = 0; unit < spec.repeats; ++unit) {
-        // A TMR producer cannot finish until every consumer dependency in this
-        // unit has been registered. HBG builds the same logical scope.
+        // Manual scope retains task lifetimes; release qualification is checked
+        // from consumer registration and producer completion events.
         rt_scope_begin(ScopeMode::MANUAL);
         for (int64_t producer = 0; producer < spec.producers; ++producer) {
             producers[producer] =

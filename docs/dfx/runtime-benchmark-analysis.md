@@ -16,6 +16,8 @@ Analyze each configuration ID, physical device, Runtime, code/environment versio
 
 Count passed, failed, not_run and unsupported_platform by collection phase. Separately count replay supported, unsupported, incomplete and error states, retaining their reasons. A zero replay CLI exit code does not mean every sample is supported. A full report retains all 41 IDs; subset acceptance makes conclusions only about selected configurations and marks the rest not_run. Report timing, DAG, event, attributable-metric and replay coverage separately rather than using one pass rate.
 
+Reconcile the expected ID set with the actual entries for each selected Runtime and each collection phase. Check requested main sample counts and first-round handling per case. An aggregate count of 41 cannot detect duplicate or substituted IDs. Keep original failed diagnostic samples visible when a compatible recollection supplies a usable replacement, and identify the capture used for each derived metric. Reuse existing valid inputs rather than repeating completed device measurements to repair report presentation.
+
 The unified runner skips golden generation and output comparison for all C/W cases. golden_validation=skipped records that policy; passed does not establish numerical correctness. Treat absent metadata in older results as unrecorded. Simulation validates execution and analysis workflows, not hardware latency or cross-chip performance.
 
 Use only metrics with sufficient inputs when events are missing, overflowed or out of clock order, or when control-node or multi-core resource descriptions are incomplete. W/Graph inputs without verified DAG association do not support dependency-stage or critical-path attribution, or current fixed-matrix replay.
@@ -35,6 +37,8 @@ For a matching configuration, identify the reference and candidate:
 
 Hold the device, equivalent graph, kernels, core counts and integer task parameters fixed when comparing HBG/TMR. Interleave reference/candidate runs on the same device when assessing an implementation change. Existing sequential captures describe the observed difference but cannot rule out batch drift. When variation is comparable to the revision difference, report that the alternatives cannot yet be distinguished reliably. For different chips, report absolute work and pressure normalized by available cores separately; do not combine them into one scheduling score.
 
+C1-01 through 08, C2-01 through 10 and C3-01 through 10 use the common `task_iterations` workload, calibrated to approximately 5 us per computation task on A5. Increase work inside each kernel while retaining task counts, graph edges, widths and fan-in/out. C2-11 through 15 retain their original 1/2048 short/long iteration counts, including short tasks inside mixed cases; W workloads are unchanged. Record measured AIC/AIV task durations and integer iteration counts rather than promising the same duration on every chip. Legacy captures without `task_iterations` predate this calibration and must not be merged with calibrated captures.
+
 ### 2.2 Diagnostic timelines
 
 T_device spans device-run entry through completion. T_exec spans the first Executor task start through the last task end; occupancy and current critical-path attribution use T_exec. Host bind, input preparation, golden/comparison, offline processing and queueing are outside T_device.
@@ -46,6 +50,16 @@ R-to-A or R-to-S includes normal resource queueing while compatible execution co
 I_sched is the fraction of wall time with both a Ready task and a compatible idle core, not the fraction of total core time spent idle. High I_sched can coexist with high overall occupancy. Combine it with per-core occupancy, specific queues and path stages. F-to-R can also include waiting for a successor to be submitted or registered. Use late_registration_tasks and registration timestamps to distinguish upstream supply from dependency handling for already registered tasks; large F-to-R alone does not establish a slow dependency algorithm.
 
 Diagnostics and no-diagnostic timing come from independent runs. Diagnostic T_device / no-diagnostic median may describe their observed difference, but it mixes variation with collection effects. Without repeated controls, do not report net collection overhead or extrapolate the diagnostic ratio into measured gains. Subtract T_exec from T_device only within one diagnostic run; the difference does not represent all fill and drain costs.
+
+#### Mean task execution time
+
+Include the arithmetic mean execution duration for every selected case/Runtime in the measured-performance chapter. Derive it from the corresponding valid diagnostic events, with their capture origin and sample counts. A stored median/p95/min/max distribution cannot recover the arithmetic mean; use the underlying execution events.
+
+Group fragments by the verified run identity and logical task ID. For a computation task, its execution span is the last fragment end minus the first fragment start. Average these spans over observed computation tasks, counting a multi-core or MIX task once. This span includes start skew between that task's fragments, while excluding its wait before the first execution start. Exclude identified dummy/dependency controls and other tasks without computation. Preserve their observed costs in graph time; the replay's zero-time dummy policy does not supply measured kernel durations.
+
+Also report AIC and AIV execution-fragment means separately: sum of observed S-to-E durations of that type divided by the number of its computation fragments. A multi-fragment task can contribute multiple fragment samples but only one logical-task sample. Give both denominators and label the granularity. With mixed short/long kernels, retain the configured mix and avoid interpreting the combined mean as the duration of either class.
+
+Graph device time divided by task count is an amortized graph-time/throughput measure, not mean task execution time: parallel tasks overlap, and graph time includes scheduling. Keep it separately labeled if reported. Diagnostic task means are not 100 independent no-diagnostic timing samples and must not be presented as such. Missing execution events or ambiguous task identity prevent a complete logical-task mean; report the available fragment statistics and the limitation. A W input can have usable observed task execution spans without verified cross-phase DAG association, but those means do not establish complete DAG coverage, dependency attribution or supported replay.
 
 ### 2.3 Zero-scheduling-cost model
 
@@ -69,6 +83,14 @@ Keep negative gaps rather than clipping them to zero. Investigate clocks, task a
 
 Check every row and sample status before quoting time. unsupported has no valid estimate. For incomplete/error rows, list failed samples rather than treating the successful subset as a passing row. Supported whole-graph C3 replay does not replace validation of actual producer/consumer release conditions. The current model does not reproduce measured scheduling delays or causally estimate savings from optimizing individual stages.
 
+#### Diagnosing unsupported inputs
+
+Trace the recorded reason to the matrix-entry guard and then inspect the actual captured inputs. Separate a class-wide adapter exclusion, invalid/missing captures, execution-instance/DAG mismatch, and unsupported execution/resource semantics. A guard that rejects all W IDs before invoking the replay adapter does not establish which W inputs would otherwise pass. Likewise, collecting both DAG and events does not by itself prove that repeated Graph instances, control tasks and resource requirements are represented completely.
+
+For each affected case/Runtime, retain the initial status and inspect DAG node/edge counts, observed logical tasks and fragments, task-ID coverage, event quality, early dispatch, allocations, multi-block/MIX shapes and available launch/placement metadata. Distinguish the first actual adapter rejection from other attributes found in the input; do not assert that removing one check resolves later checks. An input-only normalization probe can identify a more specific obstacle, but it executes no native replay and cannot validate cross-phase association or produce a supported time estimate. Never bypass checks or mutate the input to obtain a passing assessment.
+
+State which remedy is required: an adapter/backend change, added capture metadata, or recollection of an invalid sample. Repeating a valid capture cannot by itself implement missing replay semantics. Keep run-specific counts and evidence in the assessment, with source links, rather than hard-coding them into this methodology.
+
 ## 3. Analysis by configuration
 
 | Question | Configuration comparison | Method |
@@ -79,8 +101,8 @@ Check every row and sample status before quoting time. unsupported has no valid 
 | Can independent tasks supply enough work? | C2-09/10 | Analyze publication, startup, steady execution and drain. Independent tasks need not be published or Ready simultaneously; comparing them with parallel chains does not hold everything except dependency edges fixed. |
 | Does scheduling matter less for larger compute granularity? | C2-03/11 and 07/12 | Hold graph shape fixed and compare short/long kernels, stage latency relative to kernel duration, occupancy and replay gaps. |
 | Do long tasks delay short tasks or the tail? | C2-13 through 15 | Compare short-task Ready-to-first-start median/p95, per-core load and drain. Changing the mix also changes compute work; slower graph completion alone does not establish unfair scheduling. |
-| Does fan-out cause batch release cost? | C3-01 through 04 | Fix one producer and compare last predecessor F to first/last consumer R, Ready spread and post-release fill. |
-| Does fan-in increase dependency-processing cost? | C3-02 and 05 through 08 | Hold consumer count fixed while varying producers. Last F-to-R does not represent all earlier dependency updates. |
+| Does fan-out cause batch release cost? | C3-01 through 04 | Fix one producer and consumer counts of 1, 4, 8 and 32 across chips; compare last predecessor F to first/last consumer R, Ready spread and post-release fill. |
+| Does fan-in increase dependency-processing cost? | C3-01 and 05 through 08 | Fix one consumer across chips and vary producer counts of 1, 8, 16, 32 and 64. Last F-to-R does not represent all earlier dependency updates. |
 | Does high fan-in/fan-out scale well? | C3-07/09, 08/10 and 09/10 | The first two pairs fix producer count; the last fixes consumer count. Compare release/start per unit, dummy gates, peak live dependencies and reclamation backpressure. |
 | Do microbenchmark effects matter for real workloads? | Matching configurations/implementations within W1 through W5 | Validate actual differences with no-diagnostic device time and sufficiently supported event metrics. PA automatic/manual variants use different kernels, so their time difference is not directly attributable to scope. |
 
@@ -111,9 +133,13 @@ Distinguish three levels in each finding:
 
 Prioritize by affected workloads, critical-path impact, repeatability and evidence completeness. Do not use fixed severity percentages without calibration or promise speedup. A single diagnostic sample supports interpretation of that timeline; measured gains require no-diagnostic comparisons between revisions on the same device.
 
+For every case within each Runtime, explicitly identify the first and second limiting factors. Start from the largest mutually exclusive observed critical-path contributions in microseconds and as a fraction of T_exec, then interpret them using Ready supply, registration, compatible-core availability, utilization, placement and qualified release evidence. Include graph/compute/resource limits as well as control-path waits. A stage ranking is an observation, not a proven root-cause ranking or a per-stage speedup estimate. In particular, distinguish late registration from dependency processing, and normal resource queueing from dispatch stalls. Record each factor's evidence, interpretation strength, alternatives and next verification. If a first or second factor cannot be established, say so rather than filling the rank with a small residual or an unsupported hypothesis. Missing W DAG association prevents path-based ranking even when timing and utilization are measured.
+
 ## 5. Assessment report and delivery checks
 
 Write performance_assessment.md beside the run's report and link the source manifests, report.json, replay matrix, sample summaries and swimlanes. Keep run-specific findings in that report rather than this methodology document. Save reports separately and preserve raw captures.
+
+Organize the assessment into complete, independent Runtime sections: first host_build_graph, then tensormap_and_ringbuffer when both are selected. Each section contains its own scope/coverage, measured performance, replay, diagnostics, first/second limiting factors and follow-up priorities. Do not use paired Runtime columns, winner counts, cross-Runtime ratios or comparative conclusions in this assessment. Cross-Runtime comparison is a separate later task. Observed-versus-replay comparisons within one Runtime remain part of its analysis.
 
 Include at least:
 
@@ -124,5 +150,20 @@ Include at least:
 5. Bottleneck findings: observations, path/resource/model evidence, interpretation strength, alternative explanations and affected scope; not just stage p95 values.
 6. Follow-up priorities: concrete comparisons or collection needs that resolve the main uncertainties. Do not infer model-level gains when relevant real workloads are missing.
 7. Limits and artifact index: collection effects, variation, non-interleaved runs, missing DAGs, C3 qualification, resource/clock/model assumptions and links to all evidence.
+
+### Complete per-case tables
+
+Each Runtime section's coverage, measured-performance, replay and diagnostic/bottleneck chapters need an exhaustive case table. A full run means all 41 unique IDs in each chapter of each selected Runtime section. For an explicitly requested subset, cover the selected IDs and label the subset. Representative examples, plots and appendix links supplement these tables rather than replacing them.
+
+- Coverage: identify timing sample counts, DAG/event collection status, diagnostic usability and replay status for each case/Runtime. Distinguish collection success, input quality and supported analysis.
+- Timing: include main sample count, median, p95 and min/max for the current Runtime, plus diagnostic mean task execution time with counts, granularity and capture origin as defined above. Preserve cases without measurements with their status and reason.
+- Replay: include every case/Runtime with status, capture origin, observed execution window, ideal time, absolute gap, ratio and overhead share. Unsupported cases retain their reasons and have no model estimate; show neither zero nor a fabricated ratio. Keep original failure states visible when using supplementary captures.
+- Diagnostics and bottlenecks: provide each case's objective, first and second limiting factors with available path/resource evidence, evidence-supported interpretation or explicit assessment limit, and needed follow-up. Complete coverage does not require inventing a bottleneck. Explain why an unavailable metric cannot support attribution.
+
+Family-specific tables can use their applicable cases when explicitly labeled, but the chapter still needs the exhaustive inventory. When a family-specific metric appears in a full-matrix table, mark other families not_applicable and explain why. This differs from unmeasured, unsupported, failed and not_run. For example, C3 release qualification is not applicable to a serial C1 graph; an unqualified C3 capture still has a measured qualification count but no valid target-release estimate.
+
+Present C3 qualification/release in a C3-only detail table, with an explanation of last predecessor F, first/last consumer R, first S and the registration-before-producer-completion condition. C1 measures serial handoffs, C2 measures sustained supply/throughput, and unverified W graphs do not establish C3 release units. Keep those families in the complete diagnostic inventory without repeating rows of inapplicable C3 metrics.
+
+Before delivery, verify each exhaustive table against the expected ID/Runtime set, including duplicates and missing pairs, and reconcile numeric cells with their source samples. Report collection and analysis gaps separately: a case may have valid device timing while its replay remains unsupported. A full measurement run with analysis gaps must not be described as fully supported analysis.
 
 Before delivery, check that counts and times come from the corresponding inputs, denominators are consistent, unsupported/unmeasured values are not treated as zero, and model gaps are not described as measured gains. Every bottleneck conclusion must trace to actual evidence; explicitly identify conclusions that cannot yet be established. Report workflow wall time separately as workflow cost.

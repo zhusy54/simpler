@@ -32,6 +32,7 @@ _IDENTITY = (
     "k_v",
     "short_iterations",
     "long_iterations",
+    "task_iterations",
     "task_scale",
 )
 
