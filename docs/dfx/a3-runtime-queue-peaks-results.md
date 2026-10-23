@@ -4,8 +4,11 @@ Baseline: upstream main `b24bfc1875ae04248edea14824239f4ac39de66d`.
 Hardware: Ascend 910_9392 (A3). PTO-ISA pin:
 `b1d460ee8c001585ede36b68ba3678dc5a226bbf`.
 
-The [CSV](a3-runtime-queue-peaks-results.csv) contains independent observed
-maxima and the invocation that produced each value. Units are queue entries.
+The [global-maxima CSV](a3-runtime-queue-peaks-results.csv) contains independent
+observed maxima and the invocation that produced each value.
+The [per-case detail index](a3-runtime-queue-peaks-cases/README.md) provides
+7,759 records for 302 cases, split by runtime and queue, with total, SPMD and
+normal peaks where applicable. Units are queue entries.
 See the [measurement contract](a3-runtime-queue-peaks.md) before interpreting
 the numbers as capacity guidance.
 
@@ -38,20 +41,20 @@ These are independent maxima across the completed runs, so the class maxima
 must not be added. HBG logical capacity varies with the graph; consult each
 CSV row for the capacity of the invocation that produced that maximum.
 
-| Runtime | Queue          | Shape | Total peak | SPMD peak | Normal peak |
-| ------- | -------------- | ----- | ---------: | --------: | ----------: |
-| HBG     | Ready          | AIC   | 16384      | 7         | 16384       |
-| HBG     | Ready          | AIV   | 512        | 3         | 512         |
-| HBG     | Ready          | MIX   | 1          | 1         | 0           |
-| HBG     | Early dispatch | AIC   | 8          | 8         | 0           |
-| HBG     | Early dispatch | AIV   | 3          | 1         | 3           |
-| HBG     | Early dispatch | MIX   | 1          | 1         | 0           |
-| TMR     | Ready          | AIC   | 94         | 12        | 88          |
-| TMR     | Ready          | AIV   | 46         | 3         | 46          |
-| TMR     | Ready          | MIX   | 12         | 1         | 12          |
-| TMR     | Early dispatch | AIC   | 8          | 8         | 0           |
-| TMR     | Early dispatch | AIV   | 5          | 2         | 5           |
-| TMR     | Early dispatch | MIX   | 1          | 1         | 0           |
+| Runtime | Queue | Shape | Total peak | SPMD peak | Normal peak |
+| ------- | ----- | ----- | ---------: | --------: | ----------: |
+| HBG | Ready | AIC | 16384 | 7 | 16384 |
+| HBG | Ready | AIV | 512 | 3 | 512 |
+| HBG | Ready | MIX | 1 | 1 | 0 |
+| HBG | Early dispatch | AIC | 8 | 8 | 0 |
+| HBG | Early dispatch | AIV | 3 | 1 | 3 |
+| HBG | Early dispatch | MIX | 1 | 1 | 0 |
+| TMR | Ready | AIC | 94 | 12 | 88 |
+| TMR | Ready | AIV | 46 | 3 | 46 |
+| TMR | Ready | MIX | 12 | 1 | 12 |
+| TMR | Early dispatch | AIC | 8 | 8 | 0 |
+| TMR | Early dispatch | AIV | 5 | 2 | 5 |
+| TMR | Early dispatch | MIX | 1 | 1 | 0 |
 
 ## Initial overhead comparison
 
