@@ -15,6 +15,8 @@
 #include <atomic>
 #include <cstdint>
 
+#include "utils/queue_peaks.h"
+
 #include "aicore_completion_mailbox_types.h"
 #include "constants.h"
 #include "tensormap_and_ringbuffer/task_id.h"
@@ -91,7 +93,8 @@ struct AICoreCompletionMailbox {
     // head and tail live on their own cache lines so producer CAS contention
     // on head can't false-share with the consumer's tail updates.
     alignas(CHIP_ALIGN_SIZE) std::atomic<uint64_t> head;
-    uint8_t _head_pad[CHIP_ALIGN_SIZE - sizeof(uint64_t)];
+    simpler::queue_peaks::Counters *queue_peaks{nullptr};
+    uint8_t _head_pad[CHIP_ALIGN_SIZE - sizeof(uint64_t) - sizeof(simpler::queue_peaks::Counters *)];
     alignas(CHIP_ALIGN_SIZE) std::atomic<uint64_t> tail;
     uint8_t _tail_pad[CHIP_ALIGN_SIZE - sizeof(uint64_t)];
     alignas(CHIP_ALIGN_SIZE) AICoreCompletionMailboxMessage entries[AICORE_COMPLETION_MAILBOX_CAPACITY];
@@ -139,6 +142,7 @@ struct AICoreCompletionMailbox {
                 slot->engine = engine;
                 slot->completion_type = completion_type;
                 slot->kind = MSG_KIND_CONDITION;
+                if (queue_peaks != nullptr) queue_peaks->push(1);
                 slot->seq.store(new_head, std::memory_order_release);
                 return true;
             }
@@ -164,6 +168,7 @@ struct AICoreCompletionMailbox {
                 slot->engine = 0;
                 slot->completion_type = 0;
                 slot->kind = MSG_KIND_TASK_NORMAL_DONE;
+                if (queue_peaks != nullptr) queue_peaks->push(1);
                 slot->seq.store(new_head, std::memory_order_release);
                 return true;
             }
@@ -189,6 +194,7 @@ struct AICoreCompletionMailbox {
         out.engine = slot->engine;
         out.completion_type = slot->completion_type;
         out.kind = slot->kind;
+        if (queue_peaks != nullptr) queue_peaks->pop(1);
         tail.store(t + 1, std::memory_order_release);
         return true;
     }

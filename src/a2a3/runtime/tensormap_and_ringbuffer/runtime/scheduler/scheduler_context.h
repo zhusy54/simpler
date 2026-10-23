@@ -158,6 +158,7 @@ private:
     struct EarlyStagingScratch {
         ChipTaskSlotState *batch[CoreTracker::MAX_CLUSTERS * 3];
         TaskId task_id_snapshots[CoreTracker::MAX_CLUSTERS * 3];
+        uint8_t entry_classes[CoreTracker::MAX_CLUSTERS * 3];
     };
     EarlyStagingScratch early_staging_[MAX_AICPU_THREADS];
 

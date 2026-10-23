@@ -50,10 +50,12 @@ struct CompletedTaskQueue {
     ChipTaskSlotState **buf{nullptr};
     uint64_t cap{0};
     uint64_t mask{0};
+    simpler::queue_peaks::Counters *queue_peaks{nullptr};
     alignas(64) std::atomic<uint64_t> head{0};  // consumer (P) cursor
     alignas(64) std::atomic<uint64_t> tail{0};  // producer (S) cursor
 
     void init(uint64_t capacity_pow2) {
+        queue_peaks = nullptr;
         debug_assert(capacity_pow2 != 0 && (capacity_pow2 & (capacity_pow2 - 1)) == 0);
         cap = capacity_pow2;
         mask = capacity_pow2 - 1;
@@ -72,6 +74,7 @@ struct CompletedTaskQueue {
             SPIN_WAIT_HINT();
         }
         buf[t & mask] = s;
+        if (queue_peaks != nullptr) queue_peaks->push(1);
         tail.store(t + 1, std::memory_order_release);
     }
     // Consumer (P). Returns nullptr when empty.
@@ -81,6 +84,7 @@ struct CompletedTaskQueue {
             return nullptr;
         }
         ChipTaskSlotState *s = buf[h & mask];
+        if (queue_peaks != nullptr) queue_peaks->pop(1);
         head.store(h + 1, std::memory_order_release);
         return s;
     }
@@ -103,6 +107,12 @@ class SchedulerContextTestPeer;
  */
 class SchedulerContext {
 public:
+    void bind_completion_peaks(simpler::queue_peaks::Workspace &workspace) {
+        for (int32_t t = 0; t < active_sched_threads_; ++t) {
+            sp_queues_[t].queue_peaks = workspace.add(simpler::queue_peaks::Kind::Completion, t, sp_queues_[t].cap);
+        }
+    }
+
     // =========================================================================
     // Lifecycle
     // =========================================================================
@@ -206,6 +216,7 @@ private:
     struct EarlyStagingScratch {
         ChipTaskSlotState *batch[CoreTracker::MAX_CLUSTERS * 3];
         TaskId task_id_snapshots[CoreTracker::MAX_CLUSTERS * 3];
+        uint8_t entry_classes[CoreTracker::MAX_CLUSTERS * 3];
     };
     EarlyStagingScratch early_staging_[MAX_AICPU_THREADS];
 

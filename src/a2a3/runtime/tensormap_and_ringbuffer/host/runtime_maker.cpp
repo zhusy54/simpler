@@ -67,6 +67,7 @@
 #include "common/host_api.h"
 #include "utils/device_arena.h"
 #include "utils/retained_temp_bump.h"
+#include "utils/queue_peaks_host.h"
 #include "utils/temp_buffer_plan.h"
 #include "utils/program_tensor_args.h"
 #include "utils/tensor_lease_copy_in.h"
@@ -914,8 +915,15 @@ extern "C" int bind_callable_to_runtime_impl(
     // the runner across runs; here we grow it to this run's packed size and
     // bump-slice from it.
     RetainedTempBump bump;
-    const size_t required_temp_bytes = packed_temp_bytes(orch_args);
+    const size_t required_temp_bytes =
+        packed_temp_bytes(orch_args) + RetainedTempBump::align_up(sizeof(simpler::queue_peaks::Report));
     if (const int rc = bump.begin_status(api, required_temp_bytes); rc != 0) {
+        return rc;
+    }
+    if (const int rc = simpler::queue_peaks::prepare_output(
+            api, bump, runtime->dev.queue_peak_output, runtime->dev.queue_peak_epoch
+        );
+        rc != 0) {
         return rc;
     }
 
@@ -1064,6 +1072,12 @@ extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi 
     if (api == nullptr) {
         LOG_ERROR("HostApi pointer is null");
         return PTO_RUNTIME_ERR_INTERNAL;
+    }
+
+    if (launched != 0) {
+        simpler::queue_peaks::read_output(
+            api, runtime->dev.queue_peak_output, runtime->dev.queue_peak_epoch, "tensormap_and_ringbuffer", execution_rc
+        );
     }
 
     int rc = 0;

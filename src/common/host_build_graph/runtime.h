@@ -336,6 +336,9 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // names its argument regions by delta.
     uint64_t sm_image_bytes;
 
+    uint64_t queue_peak_output{0};
+    uint64_t queue_peak_epoch{0};
+
     void *gm_sm_ptr_;  // GM pointer to shared memory (device)
 
     // Prebuilt-arena fast path. Set by the host before rtMemcpy'ing Runtime to

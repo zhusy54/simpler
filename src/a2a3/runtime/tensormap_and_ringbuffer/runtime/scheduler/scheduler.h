@@ -30,6 +30,8 @@
 #pragma once
 
 #include <atomic>
+
+#include "utils/queue_peaks.h"
 #include "common/core_type.h"
 #include "common/memory_barrier.h"
 #include "utils/device_arena.h"
@@ -76,8 +78,10 @@ struct ChipReadyQueueSlot {
 struct alignas(64) ChipReadyQueue {
     ChipReadyQueueSlot *slots;
     uint64_t capacity;
-    uint64_t mask;        // capacity - 1
-    char _pad0[64 - 24];  // Pad to own cache line
+    uint64_t mask;  // capacity - 1
+    simpler::queue_peaks::Counters *queue_peaks{nullptr};
+    uint8_t *entry_classes{nullptr};
+    char _pad0[64 - 40];  // Pad to own cache line
 
     std::atomic<uint64_t> enqueue_pos;
     char _pad1[64 - sizeof(std::atomic<uint64_t>)];  // Own cache line
@@ -97,9 +101,43 @@ struct alignas(64) ChipReadyQueue {
     // with a tag ever read this field, and all of them push with one, so an
     // untagged entry's tag is never compared. The sentinel says so, where a zero
     // would have been a legitimate handle.
+    uint8_t classify_entry(ChipTaskSlotState *state, const uint8_t *saved) const {
+        return entry_classes == nullptr ? 0 : (saved != nullptr ? *saved : state->logical_block_num > 1);
+    }
+    void note_push(uint64_t pos, ChipTaskSlotState *state, const uint8_t *saved = nullptr) {
+        if (queue_peaks == nullptr) return;
+        const uint8_t cls = classify_entry(state, saved);
+        if (entry_classes != nullptr) entry_classes[pos & mask] = cls;
+        queue_peaks->push(1, cls, entry_classes != nullptr);
+    }
+    void note_push_batch(uint64_t pos, ChipTaskSlotState **items, int count, const uint8_t *saved = nullptr) {
+        if (queue_peaks == nullptr) return;
+        uint32_t spmd = 0;
+        if (entry_classes != nullptr) {
+            for (int i = 0; i < count; ++i) {
+                const uint8_t cls = classify_entry(items[i], saved == nullptr ? nullptr : saved + i);
+                entry_classes[(pos + i) & mask] = cls;
+                spmd += cls;
+            }
+        }
+        queue_peaks->push(count, spmd, entry_classes != nullptr);
+    }
+    void note_pop(uint64_t pos, int count, uint8_t *saved = nullptr) {
+        if (queue_peaks == nullptr) return;
+        uint32_t spmd = 0;
+        if (entry_classes != nullptr) {
+            for (int i = 0; i < count; ++i) {
+                const uint8_t cls = entry_classes[(pos + i) & mask];
+                if (saved != nullptr) saved[i] = cls;
+                spmd += cls;
+            }
+        }
+        queue_peaks->pop(count, spmd);
+    }
+
     bool push(ChipTaskSlotState *slot_state) { return push_tagged(slot_state, TaskId::invalid()); }
 
-    bool push_tagged(ChipTaskSlotState *slot_state, TaskId task_id_snapshot) {
+    bool push_tagged(ChipTaskSlotState *slot_state, TaskId task_id_snapshot, const uint8_t *entry_class = nullptr) {
         uint64_t pos;
         ChipReadyQueueSlot *slot;
         while (true) {
@@ -120,6 +158,7 @@ struct alignas(64) ChipReadyQueue {
 
         slot->slot_state = slot_state;
         slot->task_id_snapshot = task_id_snapshot;
+        note_push(pos, slot_state, entry_class);
         slot->sequence.store(static_cast<int64_t>(pos + 1), std::memory_order_release);
         return true;
     }
@@ -132,7 +171,9 @@ struct alignas(64) ChipReadyQueue {
     // transient and retries, so this only spins while a peer is mid-publish.
     bool push_batch(ChipTaskSlotState **items, int count) { return push_batch_tagged(items, nullptr, count); }
 
-    bool push_batch_tagged(ChipTaskSlotState **items, const TaskId *task_id_snapshots, int count) {
+    bool push_batch_tagged(
+        ChipTaskSlotState **items, const TaskId *task_id_snapshots, int count, const uint8_t *classes = nullptr
+    ) {
         if (count == 0) return true;
         if (static_cast<uint64_t>(count) > capacity) return false;
 
@@ -162,6 +203,7 @@ struct alignas(64) ChipReadyQueue {
             }
         }
 
+        note_push_batch(pos, items, count, classes);
         for (int i = 0; i < count; i++) {
             ChipReadyQueueSlot *slot = &slots[(pos + i) & mask];
             slot->slot_state = items[i];
@@ -206,6 +248,7 @@ struct alignas(64) ChipReadyQueue {
         }
 
         slot->slot_state = slot_state;
+        note_push(pos, slot_state);
         slot->sequence.store(static_cast<int64_t>(pos + 1), std::memory_order_release);
         return true;
     }
@@ -213,7 +256,7 @@ struct alignas(64) ChipReadyQueue {
 
     ChipTaskSlotState *pop() { return pop_tagged(nullptr); }
 
-    ChipTaskSlotState *pop_tagged(TaskId *task_id_snapshot) {
+    ChipTaskSlotState *pop_tagged(TaskId *task_id_snapshot, uint8_t *entry_class = nullptr) {
         // Fast-path: skip slot load when queue is clearly empty
         uint64_t d = dequeue_pos.load(std::memory_order_relaxed);
         uint64_t e = enqueue_pos.load(std::memory_order_relaxed);
@@ -238,6 +281,7 @@ struct alignas(64) ChipReadyQueue {
             }
         }
 
+        note_pop(pos, 1, entry_class);
         ChipTaskSlotState *result = slot->slot_state;
         if (task_id_snapshot != nullptr) *task_id_snapshot = slot->task_id_snapshot;
         slot->sequence.store(static_cast<int64_t>(pos + mask + 1), std::memory_order_release);
@@ -287,6 +331,7 @@ struct alignas(64) ChipReadyQueue {
             wait_cycle += (get_sys_cnt_aicpu() - t0);
         }
 
+        note_pop(pos, 1);
         ChipTaskSlotState *result = slot->slot_state;
         slot->sequence.store(static_cast<int64_t>(pos + mask + 1), std::memory_order_release);
         return result;
@@ -297,7 +342,8 @@ struct alignas(64) ChipReadyQueue {
     // Returns actual number of items popped (may be less than max_count).
     int pop_batch(ChipTaskSlotState **out, int max_count) { return pop_batch_tagged(out, nullptr, max_count); }
 
-    int pop_batch_tagged(ChipTaskSlotState **out, TaskId *task_id_snapshots, int max_count) {
+    int
+    pop_batch_tagged(ChipTaskSlotState **out, TaskId *task_id_snapshots, int max_count, uint8_t *classes = nullptr) {
         uint64_t pos;
         int count;
         while (true) {
@@ -326,6 +372,7 @@ struct alignas(64) ChipReadyQueue {
             }
         }
 
+        note_pop(pos, count, classes);
         for (int i = 0; i < count; i++) {
             ChipReadyQueueSlot *slot = &slots[(pos + i) & mask];
             out[i] = slot->slot_state;
@@ -379,6 +426,7 @@ struct alignas(64) ChipReadyQueue {
             atomic_ops++;  // failed CAS
         }
 
+        note_pop(pos, count);
         for (int i = 0; i < count; i++) {
             ChipReadyQueueSlot *slot = &slots[(pos + i) & mask];
             out[i] = slot->slot_state;
@@ -393,6 +441,9 @@ struct alignas(64) ChipReadyQueue {
     }
 #endif
 };
+
+static_assert(sizeof(ChipReadyQueueSlot) == 24, "Queue telemetry must not grow slots");
+static_assert(sizeof(ChipReadyQueue) == 192, "Queue telemetry must not grow queue headers");
 
 // Cold-path ready queue operations (defined in scheduler.cpp). Declared
 // as non-member so ChipReadyQueue stays a POD-like struct with cache-line

@@ -206,6 +206,9 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // Controlled via SIMPLER_TMR_SERIAL_ORCH_SCHED_ENABLE environment variable.
     bool serial_orch_sched;
 
+    uint64_t queue_peak_output{0};
+    uint64_t queue_peak_epoch{0};
+
     void *gm_sm_ptr_;  // GM pointer to shared memory (device)
 
     // Prebuilt-arena fast path (trb only). Set by the host before rtMemcpy'ing

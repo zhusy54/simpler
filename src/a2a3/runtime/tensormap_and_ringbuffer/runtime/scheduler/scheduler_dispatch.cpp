@@ -722,6 +722,7 @@ SchedulerContext::early_dispatch_shape(int32_t thread_idx, ResourceShape shape, 
     EarlyStagingScratch &scratch = early_staging_[thread_idx];
     ChipTaskSlotState **batch = scratch.batch;
     TaskId *task_id_snapshots = scratch.task_id_snapshots;
+    uint8_t *entry_classes = scratch.entry_classes;
     // Batch-pop in one queue op (fewer CAS than one pop per consumer); the pop is
     // bounded by the shape's capacity so the scratch above always holds it. Then for
     // each consumer: CLAIM a range sized to THIS thread's free cores by advancing
@@ -733,7 +734,7 @@ SchedulerContext::early_dispatch_shape(int32_t thread_idx, ResourceShape shape, 
     // is filled by all idle threads in parallel. When cores run out mid-batch the
     // unprocessed remainder is pushed back for peers (mirrors normal's push_batch of
     // the unconsumed tail).
-    int got = sched_->early_dispatch_queues[s].pop_batch_tagged(batch, task_id_snapshots, cores.count());
+    int got = sched_->early_dispatch_queues[s].pop_batch_tagged(batch, task_id_snapshots, cores.count(), entry_classes);
     for (int bi = 0; bi < got; bi++) {
         ChipTaskSlotState *c = batch[bi];
         if (c->task->task_id != task_id_snapshots[bi]) continue;
@@ -766,7 +767,9 @@ SchedulerContext::early_dispatch_shape(int32_t thread_idx, ResourceShape shape, 
             // producer release: try_early_dispatch_release rings whatever is staged
             // and routes the unstaged remainder to the ready queue, because it
             // returns on next_block_idx rather than on the claim state.
-            if (!sched_->early_dispatch_queues[s].push_batch_tagged(&batch[bi], &task_id_snapshots[bi], got - bi))
+            if (!sched_->early_dispatch_queues[s].push_batch_tagged(
+                    &batch[bi], &task_id_snapshots[bi], got - bi, &entry_classes[bi]
+                ))
                 LOG_DEBUG(
                     "[EARLY_DISPATCH] queue full on batch re-push, dropping %d candidate(s) to normal dispatch",
                     got - bi
@@ -778,7 +781,7 @@ SchedulerContext::early_dispatch_shape(int32_t thread_idx, ResourceShape shape, 
         if (claim == 0) continue;  // nothing left to claim -> drop (no re-push)
         // Re-push for concurrent peers BEFORE the expensive staging.
         if (start + claim < c->logical_block_num) {
-            if (!sched_->early_dispatch_queues[s].push_tagged(c, task_id_snapshots[bi]))
+            if (!sched_->early_dispatch_queues[s].push_tagged(c, task_id_snapshots[bi], &entry_classes[bi]))
                 LOG_DEBUG(
                     "[EARLY_DISPATCH] queue full on re-push, consumer=0x%" PRIx64, TaskId::to_uint64(c->task->task_id)
                 );

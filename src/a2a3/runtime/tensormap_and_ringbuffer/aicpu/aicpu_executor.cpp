@@ -8,6 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
+#include "utils/queue_peaks_device.h"
 #include <dlfcn.h>
 #include <unistd.h>
 
@@ -151,6 +152,7 @@ struct AicpuExecutor {
 
     // ===== Task queue state (managed by scheduler ready queues) =====
 
+    simpler::queue_peaks::Workspace queue_peaks_;
     simpler::ThreadCompletionGate completion_gate_;
     std::atomic<bool> runtime_init_ready_{false};
 
@@ -798,6 +800,19 @@ int32_t AicpuExecutor::run_orchestration(Runtime *runtime, int32_t thread_idx) {
             sched_ctx_.bind_runtime(rt);
         }
 
+        if (rt != nullptr) {
+            using simpler::queue_peaks::Kind;
+            queue_peaks_.reset();
+            auto &scheduler = rt->scheduler;
+            for (int i = 0; i < NUM_RESOURCE_SHAPES; ++i) {
+                queue_peaks_.bind(scheduler.ready_queues[i], Kind::Ready, i, true);
+                queue_peaks_.bind(scheduler.ready_sync_queues[i], Kind::Sync, i);
+                queue_peaks_.bind(scheduler.early_dispatch_queues[i], Kind::Early, i, true);
+            }
+            queue_peaks_.bind(scheduler.dummy_ready_queue, Kind::Dummy, -1);
+            queue_peaks_.bind(scheduler.early_sync_start_queue, Kind::EarlySync, -1);
+            rt->aicore_mailbox->queue_peaks = queue_peaks_.add(Kind::Mailbox, -1, AICORE_COMPLETION_MAILBOX_CAPACITY);
+        }
         runtime_init_ready_.store(true, std::memory_order_release);
 
 #if SIMPLER_DFX
@@ -1077,6 +1092,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         // landing behind an already-published success.
         snapshot_run_terminal(runtime);
         aicpu_publish_task_timing_tail_usage(aicpu_thread_num_);
+        simpler::queue_peaks::publish_output(
+            queue_peaks_, runtime->dev.queue_peak_output, runtime->dev.queue_peak_epoch
+        );
         // Destroy the runtime context. sm_handle / rt are recreated every run so we
         // always tear them down here, but we keep the per-cid orch SO entries
         // alive — they are loaded once by register_callable and consumed by
@@ -1141,6 +1159,7 @@ void AicpuExecutor::deinit(Runtime *runtime) {
 
     // Reset all SchedulerContext-owned state in one place.
     sched_ctx_.deinit();
+    queue_peaks_.reset();
 
     completion_gate_.reset();
     runtime_init_ready_.store(false, std::memory_order_release);

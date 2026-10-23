@@ -38,6 +38,8 @@ struct RetainedHostPreparePlan {
     sm_layout::BindUsage bind_usage{};
     void *staging_backing{nullptr};
     size_t staging_bytes{0};
+    uint64_t queue_peak_output{0};
+    uint64_t queue_peak_epoch{0};
     GraphSectionSource graph_section_source{GraphSectionSource::None};
     uint64_t graph_section_base{0};
     uint32_t graph_section_bytes{0};
@@ -48,6 +50,8 @@ struct RetainedHostPreparePlan {
     std::vector<TensorLease> leases;
 
     void park(Runtime &runtime) {
+        queue_peak_output = runtime.dev.queue_peak_output;
+        queue_peak_epoch = runtime.dev.queue_peak_epoch;
         graph_section_source = runtime.get_graph_section_source();
         graph_section_base = runtime.get_graph_section_base();
         graph_section_bytes = runtime.get_graph_section_bytes();
@@ -55,6 +59,8 @@ struct RetainedHostPreparePlan {
         leases = std::move(runtime.tensor_leases());
     }
     void resume(Runtime &runtime) {
+        runtime.dev.queue_peak_output = queue_peak_output;
+        runtime.dev.queue_peak_epoch = queue_peak_epoch;
         runtime.publish_graph_section(graph_section_source, graph_section_base, graph_section_bytes);
         runtime.restore_pending_publication(std::move(publication));
         publication = {};

@@ -59,6 +59,8 @@ bool ready_queue_init_data_from_layout(ChipReadyQueue *queue, DeviceArena &arena
     // Address the slots region for data writes without storing the pointer in
     // queue->slots — that field is set by ready_queue_wire_arena_pointers.
     auto *slots_arena = static_cast<ChipReadyQueueSlot *>(arena.region_ptr(slots_off));
+    queue->queue_peaks = nullptr;
+    queue->entry_classes = nullptr;
     queue->capacity = capacity;
     queue->mask = capacity - 1;
     queue->enqueue_pos.store(0, std::memory_order_relaxed);
