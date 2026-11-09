@@ -52,11 +52,13 @@ _ARTIFACT_LOGIC_MODULES = (
     "compile_paths.py",
     "elf_parser.py",
     "incore/cpu_sim_target.h",
+    "incore/wse_cpu_sim_target.h",
 )
 
 _CPU_SIM_TARGET_FLAGS = {
     "a2a3sim": "-DPTO_CPU_SIM_TARGET_A2A3",
     "a5sim": "-DPTO_CPU_SIM_TARGET_A5",
+    "wsesim": "-DPTO_CPU_SIM_TARGET_A5",
 }
 
 
@@ -197,6 +199,8 @@ class KernelCompiler:
             self.platform_dir = self.project_root / "src" / "a2a3" / "platform"
         elif platform in ("a5", "a5sim"):
             self.platform_dir = self.project_root / "src" / "a5" / "platform"
+        elif platform == "wsesim":
+            self.platform_dir = self.project_root / "src" / "wse" / "platform"
         else:
             raise ValueError(f"Unknown platform: {platform}")
 
@@ -236,7 +240,7 @@ class KernelCompiler:
             "-include",
             "pto/cpu/target_config.hpp",
             "-include",
-            "cpu_sim_target.h",
+            "wse_cpu_sim_target.h" if self.platform == "wsesim" else "cpu_sim_target.h",
             *self._sanitizer_flags(self.gxx15),
         ]
 
@@ -273,9 +277,11 @@ class KernelCompiler:
         if self.platform in ("a2a3", "a2a3sim"):
             arch = "a2a3"
         elif self.platform in ("a5", "a5sim"):
-            arch = "a5"  # Phase 2: A5 uses A5 runtime
+            arch = "a5"
+        elif self.platform == "wsesim":
+            arch = "wse"
         else:
-            arch = "a2a3"
+            raise ValueError(f"Unknown platform: {self.platform}")
 
         runtime_dir = str(self.project_root / "src" / arch / "runtime" / runtime_name / "runtime")
         runtime_common_dir = str(self.project_root / "src" / arch / "runtime" / runtime_name / "common")
@@ -344,9 +350,11 @@ class KernelCompiler:
         if self.platform in ("a2a3", "a2a3sim"):
             arch = "a2a3"
         elif self.platform in ("a5", "a5sim"):
-            arch = "a5"  # Phase 2: A5 uses A5 runtime
+            arch = "a5"
+        elif self.platform == "wsesim":
+            arch = "wse"
         else:
-            arch = "a2a3"
+            raise ValueError(f"Unknown platform: {self.platform}")
 
         config_path = self.project_root / "src" / arch / "runtime" / runtime_name / "build_config.py"
         if not config_path.is_file():
@@ -627,6 +635,7 @@ class KernelCompiler:
                 "a2a3sim": ToolchainType.HOST_GXX_15,
                 "a5": ToolchainType.CCEC,  # Phase 1: A5 uses same as A2A3
                 "a5sim": ToolchainType.HOST_GXX_15,  # Phase 1: A5sim uses same as A2A3sim
+                "wsesim": ToolchainType.HOST_GXX_15,
             },
         )
 

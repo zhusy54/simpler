@@ -585,6 +585,7 @@ def test_artifact_logic_token_covers_the_compilation_modules(monkeypatch):
         "compile_paths.py",
         "elf_parser.py",
         "incore/cpu_sim_target.h",
+        "incore/wse_cpu_sim_target.h",
     }
 
     def token_over(modules):

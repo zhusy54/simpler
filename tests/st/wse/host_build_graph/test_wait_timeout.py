@@ -1,0 +1,171 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+"""A host wait deadline does not cancel a kernel held at an acknowledged gate."""
+
+import ctypes
+import hashlib
+import json
+import subprocess
+from pathlib import Path
+
+import pytest
+import torch
+from simpler.task_interface import (
+    ArgDirection,
+    CallConfig,
+    ChipCallable,
+    CoreCallable,
+    DataType,
+    TaskArgs,
+    TensorArgType,
+)
+from simpler.worker import Worker
+
+from simpler_setup.kernel_compiler import KernelCompiler
+from simpler_setup.runtime_builder import RuntimeBuilder
+
+pytestmark = [pytest.mark.platforms(["wsesim"]), pytest.mark.runtime("host_build_graph"), pytest.mark.device_count(1)]
+
+_GATE = r"""
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+std::mutex mutex;
+std::condition_variable changed;
+bool entered = false;
+bool released = false;
+extern "C" void wse_test_gate() {
+    std::unique_lock<std::mutex> lock(mutex);
+    entered = true;
+    changed.notify_all();
+    changed.wait(lock, [] { return released; });
+}
+extern "C" bool await_entry() {
+    std::unique_lock<std::mutex> lock(mutex);
+    return changed.wait_for(lock, std::chrono::seconds(5), [] { return entered; });
+}
+extern "C" void release_gate() {
+    std::lock_guard<std::mutex> lock(mutex);
+    released = true;
+    changed.notify_all();
+}
+"""
+_KERNEL = r"""
+#include <cstdint>
+#include <cstdlib>
+#include <dlfcn.h>
+#include <pto/pto-inst.hpp>
+#include "tensor.h"
+extern "C" void kernel_entry(int64_t *args) {
+    auto gate = reinterpret_cast<void(*)()>(dlsym(RTLD_DEFAULT, "wse_test_gate"));
+    if (!gate) std::abort();
+    gate();
+    auto *tensor = reinterpret_cast<Tensor *>(args[0]);
+    auto *out = reinterpret_cast<float *>(tensor->buffer.addr) + tensor->start_offset;
+    out[0] = 42.0f;
+}
+"""
+_ORCH = r"""
+#include "orchestration_api.h"
+extern "C" OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &) {
+    return OrchestrationConfig{.expected_arg_count = 1};
+}
+extern "C" void aicpu_orchestration_entry(const ChipTaskArgs &args) {
+    CoreTaskArgs core;
+    core.add_output(args.tensor(0).ref());
+    rt_submit_aiv_task(0, core);
+}
+"""
+
+
+def test_wait_timeout_retains_buffer_until_real_completion(tmp_path, st_platform):
+    gate_source = tmp_path / "gate.cpp"
+    gate_source.write_text(_GATE)
+    library = tmp_path / "gate.so"
+    subprocess.run(
+        ["c++", "-std=c++17", "-shared", "-fPIC", "-pthread", str(gate_source), "-o", str(library)],
+        check=True,
+        timeout=60,
+    )
+    gate = ctypes.CDLL(str(library), mode=ctypes.RTLD_GLOBAL)
+    gate.await_entry.restype = ctypes.c_bool
+    compiler = KernelCompiler(st_platform)
+    kernel_source = tmp_path / "kernel.cpp"
+    kernel_source.write_text(_KERNEL)
+    orchestration = tmp_path / "orch.cpp"
+    orchestration.write_text(_ORCH)
+    core = CoreCallable.build(
+        signature=[ArgDirection.OUT],
+        binary=compiler.compile_incore(
+            str(kernel_source),
+            core_type="aiv",
+            extra_include_dirs=compiler.get_orchestration_include_dirs("host_build_graph"),
+        ),
+    )
+    chip = ChipCallable.build(
+        signature=[ArgDirection.OUT],
+        func_name="aicpu_orchestration_entry",
+        binary=compiler.compile_orchestration("host_build_graph", str(orchestration)),
+        children=[(0, core)],
+    )
+    worker = Worker(level=2, platform=st_platform, runtime="host_build_graph", device_id=0)
+    run = None
+    try:
+        worker.init()
+        handle = worker.register(chip)
+        buffer = worker.malloc(4)
+        args = TaskArgs()
+        args.add_tensor(buffer.tensor(shapes=(1,), dtype=DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
+        publications = worker.scheduler_mode_publish_count
+        bad_config = CallConfig()
+        bad_config.aicpu_thread_num = 1
+        with pytest.raises(RuntimeError, match="failed with code"):
+            worker.run(handle, args, bad_config)
+        assert worker.scheduler_mode_publish_count == publications
+        run = worker.submit(handle, args)
+        assert gate.await_entry(), "kernel did not acknowledge entering its gate"
+        if Path("/proc/self/maps").exists():
+            loaded = sorted(
+                {
+                    line.split()[-1]
+                    for line in Path("/proc/self/maps").read_text().splitlines()
+                    if any(name in line for name in ("libhost_runtime.so", "/tmp/aicpu_sim_", "/tmp/aicore_sim_"))
+                }
+            )
+            assert len(loaded) == 3, loaded
+            binaries = RuntimeBuilder(st_platform).get_binaries("host_build_graph")
+            expected = {
+                hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                for path in (binaries.host_path, binaries.aicpu_path, binaries.aicore_path)
+            }
+            assert {hashlib.sha256(Path(path).read_bytes()).hexdigest() for path in loaded} == expected
+            proof = {"loaded": {path: hashlib.sha256(Path(path).read_bytes()).hexdigest() for path in loaded}}
+            (tmp_path / "loaded-modules.json").write_text(json.dumps(proof, indent=2))
+        with pytest.raises(TimeoutError):
+            run.wait(timeout=0.01)
+        with pytest.raises(RuntimeError, match="in.flight"):
+            worker.free(buffer)
+        gate.release_gate()
+        run.wait(timeout=10)
+        value = torch.zeros(1)
+        worker.copy_from(value, buffer)
+        assert value.item() == 42
+        worker.run(handle, args)
+        worker.copy_from(value, buffer)
+        assert value.item() == 42
+        worker.free(buffer)
+        worker.unregister(handle)
+    finally:
+        gate.release_gate()
+        if run is not None:
+            run.wait(timeout=10)
+        worker.close()
+        if Path("/proc/self/task").exists():
+            remaining = [path.read_text().strip() for path in Path("/proc/self/task").glob("*/comm")]
+            assert not any(name.startswith(("sim-aic", "sim-aiv")) for name in remaining), remaining

@@ -182,7 +182,7 @@ class RuntimeBuilder:
         Initialize RuntimeBuilder with platform selection.
 
         Args:
-            platform: Target platform ("a2a3", "a2a3sim", "a5", or "a5sim")
+            platform: Target platform ("a2a3", "a2a3sim", "a5", "a5sim", or "wsesim")
         """
         self.platform = platform
         self._arch, self._variant = parse_platform(platform)
@@ -243,7 +243,7 @@ class RuntimeBuilder:
         bump must invalidate that build's
         cmake cache even when the runtime repo HEAD is unchanged (issue #1139:
         a stale host_runtime.so compiled against the old headers otherwise
-        survives a reinstall). A5 simulation includes ISA workspace types too,
+        survives a reinstall). A5 simulation and its WSE compatibility copy include ISA workspace types too,
         so its cache stamp includes the pin. Other simulation builds return ""
         and leave the
         stamp keyed on the runtime HEAD.
@@ -252,7 +252,7 @@ class RuntimeBuilder:
         invalid, let ``read_pto_isa_pin`` raise so an embedding onboard build
         cannot silently proceed with unknown PTO-ISA headers.
         """
-        if not self._requires_pto_isa_metadata_validation() and self.platform != "a5sim":
+        if not self._requires_pto_isa_metadata_validation() and self.platform not in {"a5sim", "wsesim"}:
             return ""
         from .pto_isa import read_pto_isa_pin  # noqa: PLC0415
 
@@ -262,7 +262,7 @@ class RuntimeBuilder:
         """Stamp identifying the sources this build was compiled from.
 
         Combines the runtime repo HEAD with the pto-isa commit for onboard
-        builds and A5 simulation so the cmake cache is invalidated whenever either
+        builds and A5/WSE simulation so the cmake cache is invalidated whenever either
         changes. An empty runtime HEAD is preserved verbatim so the
         ``_invalidate_cache_if_stale`` 'unavailable → clean rebuild' path still
         fires rather than being masked by a present pto-isa commit.

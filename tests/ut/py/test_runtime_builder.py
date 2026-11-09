@@ -400,6 +400,10 @@ class TestRuntimeBuilderGetBinaries:
             expected = dict(expected_defaults)
             if call.args[0] == "host":
                 expected["SIMPLER_RUNTIME_NAME"] = "test_rt"
+            if call.args[0] == "host" and default_test_platform in {"a5sim", "wsesim"}:
+                from simpler_setup.pto_isa import read_pto_isa_pin  # noqa: PLC0415
+
+                expected["SIMPLER_PTO_ISA_BUILD_COMMIT"] = read_pto_isa_pin()
             assert call.kwargs["cmake_defines"] == expected
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
@@ -440,6 +444,10 @@ class TestRuntimeBuilderGetBinaries:
             expected = dict(config)
             if call.args[0] == "host":
                 expected["SIMPLER_RUNTIME_NAME"] = "test_rt"
+            if call.args[0] == "host" and default_test_platform in {"a5sim", "wsesim"}:
+                from simpler_setup.pto_isa import read_pto_isa_pin  # noqa: PLC0415
+
+                expected["SIMPLER_PTO_ISA_BUILD_COMMIT"] = read_pto_isa_pin()
             assert call.kwargs["cmake_defines"] == expected
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")

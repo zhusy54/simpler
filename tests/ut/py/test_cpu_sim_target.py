@@ -82,19 +82,19 @@ def test_compiled_sim_targets_keep_semantics_on_reused_worker(tmp_path, core_typ
     source.write_text(_KERNEL)
     artifacts = {}
     tokens = {}
-    for platform in ("a2a3sim", "a5sim"):
+    for platform in ("a2a3sim", "a5sim", "wsesim"):
         compiler = KernelCompiler(platform)
         binary = compiler.compile_incore(str(source), core_type=core_type, pto_isa_root=isa_root)
         path = tmp_path / f"{platform}.so"
         path.write_bytes(binary)
         artifacts[platform] = str(path)
         tokens[platform] = compiler.incore_compile_cache_token(core_type)
-    assert tokens["a2a3sim"] != tokens["a5sim"]
+    assert len({json.dumps(token, sort_keys=True) for token in tokens.values()}) == 3
 
-    expected = {"a2a3sim": [1.0] * 8 + [2.0, 0.0], "a5sim": [0.0] * 8 + [5.0, 17.0]}
+    expected = {"a2a3sim": [1.0] * 8 + [2.0, 0.0], "a5sim": [0.0] * 8 + [5.0, 17.0], "wsesim": [0.0] * 8 + [5.0, 17.0]}
     env = dict(os.environ)
     env.pop("PTO_CPU_SIM_ARCH", None)
-    for order in (("a2a3sim", "a5sim"), ("a5sim", "a2a3sim")):
+    for order in (("a2a3sim", "a5sim", "wsesim"), ("wsesim", "a5sim", "a2a3sim")):
         result = subprocess.run(
             [sys.executable, "-c", _RUN, *(artifacts[p] for p in order)],
             env=env,

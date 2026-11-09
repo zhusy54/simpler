@@ -63,7 +63,7 @@ add_custom_target(build_runtimes ALL
     COMMAND ${_SIMPLER_BUILD_RUNTIMES_COMMAND}
     COMMENT "Building runtime binaries (incremental)..."
 )
-foreach(_platform IN ITEMS a2a3sim a5sim a2a3 a5)
+foreach(_platform IN ITEMS a2a3sim a5sim wsesim a2a3 a5)
     add_custom_target(build_runtimes_${_platform}
         COMMAND ${_SIMPLER_BUILD_RUNTIMES_COMMAND} --platforms ${_platform}
         COMMENT "Building ${_platform} runtime binaries (incremental)..."

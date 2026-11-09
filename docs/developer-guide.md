@@ -266,7 +266,7 @@ kernel_binary = compiler.compile_incore("path/to/kernel.cpp", core_type="aiv")
 ```
 
 CPU simulator kernels select their PTO instruction family from the platform:
-`a2a3sim` defines `PTO_CPU_SIM_TARGET_A2A3`, and `a5sim` defines
+`a2a3sim` defines `PTO_CPU_SIM_TARGET_A2A3`, and `a5sim` and the WSE compatibility target `wsesim` define
 `PTO_CPU_SIM_TARGET_A5`. Both AIC and AIV compilation force-include
 `pto/cpu/target_config.hpp` from the supplied `pto_isa_root` checkout, or from
 the managed pinned checkout when `pto_isa_root` is omitted. An explicit root
@@ -278,6 +278,7 @@ compiler logic, and the ISA pin participate in the managed kernel cache keys;
 previous artifacts are rebuilt after the interface or pin changes.
 Each compiled kernel also exports `simpler_cpu_sim_target()` through
 `cpu_sim_target.h`, returning the platform name (`a2a3sim` or `a5sim`).
+WSE uses `wse_cpu_sim_target.h` to export `wsesim` while retaining A5 CPU semantics.
 The simulator loader checks this marker before resolving
 the kernel entry or registering hooks. It rejects prebuilt kernels from the
 other family, unknown families, and older kernels without a marker; rebuild
@@ -304,3 +305,44 @@ registration owns; a run references those vectors' own addresses.
 - **Full Python API** via nanobind with torch integration
 - **Modular design** enables parallel component development
 - **Runtime linking** via binary loading
+
+### WSE compatibility simulation
+
+`wsesim` provides an independent `src/wse` copy of the A5 HBG simulator.
+It retains Host, AICPU, AIC/AIV0/AIV1 (1C2V), the existing GM and callable ABI,
+and the pinned PTO-ISA A5 CPU implementation. It does not model native WSE
+four-PE cores, distributed SRAM capacity, or hardware pipeline timing.
+Only `host_build_graph` is supported; there is no WSE onboard or TMR target.
+
+Build it explicitly in the existing project environment. Use GCC 15 for the
+native Python binding and simulator components (`CC=gcc-15 CXX=g++-15`),
+and make unversioned `gcc`/`g++` resolve to the same toolchain for orchestration.
+When changing compilers, configure a fresh build cache rather than reusing
+CMake caches that select an older compiler.
+
+```bash
+CC=gcc-15 CXX=g++-15 python -m pip install --no-build-isolation --no-deps \
+  --config-settings=build.targets=build_package_wsesim -e .
+```
+
+The default `build_package_sim` still builds A3/A5. WSE runtime outputs live
+under `build/lib/wse/sim/host_build_graph`, with build caches under
+`build/cache/wse/sim/host_build_graph`. WSE kernels have distinct target and
+cache identities; an A5 kernel is rejected by WSE, and vice versa.
+`src/wse/source-copy-manifest.json` records the fixed source provenance and
+per-file hashes. Shared `src/common` dependencies remain shared.
+
+The WSE suite also needs A5 binaries for cross-target rejection checks:
+
+```bash
+CC=gcc-15 CXX=g++-15 python -m pip install --no-build-isolation --no-deps \
+  '--config-settings=build.targets=build_package_wsesim;build_package_a5sim' -e .
+python -m pytest tests/st/wse/host_build_graph --platform wsesim \
+  --require-pto-isa --manual include --rounds 1 --pto-session-timeout 1200
+```
+
+The suite compiles the unchanged A5 vector and Mix/SPMD sources for WSE,
+checks complete native task/lane and AICPU lifecycle records, and exercises
+registration refusal, partial startup drain, wait deadlines and fatal-run recovery.
+A GCC 15 kernel requires a compatible `libstdc++` at runtime; use the same
+compiler runtime for reference and candidate runs.

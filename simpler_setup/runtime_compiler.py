@@ -159,8 +159,10 @@ class RuntimeCompiler:
             self.platform_dir = self.project_root / "src" / "a5" / "platform" / "onboard"
         elif platform == "a5sim":
             self.platform_dir = self.project_root / "src" / "a5" / "platform" / "sim"
+        elif platform == "wsesim":
+            self.platform_dir = self.project_root / "src" / "wse" / "platform" / "sim"
         else:
-            raise ValueError(f"Unknown platform: {platform}. Supported: a2a3, a2a3sim, a5, a5sim")
+            raise ValueError(f"Unknown platform: {platform}. Supported: a2a3, a2a3sim, a5, a5sim, wsesim")
 
         if not self.platform_dir.is_dir():
             raise ValueError(f"Platform '{platform}' not found at {self.platform_dir}")
@@ -173,8 +175,10 @@ class RuntimeCompiler:
             self._init_a5()
         elif platform == "a5sim":
             self._init_a5sim()
+        elif platform == "wsesim":
+            self._init_wsesim()
         else:
-            raise ValueError(f"Unknown platform: {platform}. Supported: a2a3, a2a3sim, a5, a5sim")
+            raise ValueError(f"Unknown platform: {platform}. Supported: a2a3, a2a3sim, a5, a5sim, wsesim")
 
     def _init_a2a3(self):
         """Initialize toolchains for real a2a3 hardware."""
@@ -249,6 +253,14 @@ class RuntimeCompiler:
         # shares one sanitizer runtime (see GxxToolchain prefer_g15).
         gxx = GxxToolchain(prefer_g15=bool(self._sanitizers))
 
+        self.aicore_target = BuildTarget(gxx, str(self.platform_dir / "aicore"), "libaicore_kernel.so")
+        self.aicpu_target = BuildTarget(gxx, str(self.platform_dir / "aicpu"), "libaicpu_kernel.so")
+        self.host_target = BuildTarget(gxx, str(self.platform_dir / "host"), "libhost_runtime.so")
+
+    def _init_wsesim(self):
+        """Build the AICPU/1C2V compatibility runtime with host toolchains."""
+        self._ensure_host_compilers()
+        gxx = GxxToolchain(prefer_g15=bool(self._sanitizers))
         self.aicore_target = BuildTarget(gxx, str(self.platform_dir / "aicore"), "libaicore_kernel.so")
         self.aicpu_target = BuildTarget(gxx, str(self.platform_dir / "aicpu"), "libaicpu_kernel.so")
         self.host_target = BuildTarget(gxx, str(self.platform_dir / "host"), "libhost_runtime.so")

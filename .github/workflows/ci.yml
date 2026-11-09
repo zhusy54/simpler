@@ -87,6 +87,11 @@ jobs:
       include_dfx_smokes: true
       python_version: ${{ matrix.python-version }}
 
+  st-sim-wse:
+    needs: [detect-changes, pre-commit]
+    if: needs.detect-changes.outputs.wse_changed == 'true' && needs.detect-changes.outputs.st_affected == 'true'
+    uses: ./.github/workflows/_st-sim-wse.yml
+
   profiling-flags-smoke:
     needs: [detect-changes, pre-commit]
     if: (needs.detect-changes.outputs.a2a3_changed == 'true' || needs.detect-changes.outputs.a5_changed == 'true') && needs.detect-changes.outputs.examples_only != 'true' && needs.detect-changes.outputs.tests_only != 'true'

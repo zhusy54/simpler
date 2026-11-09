@@ -1,0 +1,47 @@
+name: WSE A5-compatible simulation
+
+permissions:
+  contents: read
+
+on:
+  workflow_call:
+
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CC: gcc-15
+      CXX: g++-15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-gcc-15
+        with:
+          install-graphviz: "true"
+      - name: Select GCC 15 for bindings, runtimes and orchestration
+        run: |
+          mkdir -p "$RUNNER_TEMP/wse-toolchain"
+          ln -s "$(command -v gcc-15)" "$RUNNER_TEMP/wse-toolchain/gcc"
+          ln -s "$(command -v g++-15)" "$RUNNER_TEMP/wse-toolchain/g++"
+          echo "$RUNNER_TEMP/wse-toolchain" >> "$GITHUB_PATH"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+      - uses: ./.github/actions/cache-pip
+      - uses: ./.github/actions/setup-venv
+        with:
+          build-packages: "scikit-build-core nanobind<3 cmake>=3.20"
+          packages: "--no-build-isolation --config-settings=build.targets=build_package_wsesim;build_package_a5sim .[test]"
+      - name: WSE coverage, admission, drain and recovery
+        run: |
+          .venv/bin/python -m pytest tests/st/wse/host_build_graph --platform wsesim \
+            --require-pto-isa --rounds 1 --manual include --pto-session-timeout 1200
+      - name: A5 reference scenes
+        run: |
+          .venv/bin/python -m pytest tests/st/a5/host_build_graph/vector_example \
+            tests/st/a5/host_build_graph/graph_execution/test_graph_execution_mix_spmd.py \
+            --platform a5sim --require-pto-isa --rounds 1 --manual include --pto-session-timeout 1200
+      - name: CPU target semantics and cache isolation
+        run: .venv/bin/python -m pytest tests/ut/py/test_cpu_sim_target.py tests/ut/py/test_wse_platform.py
