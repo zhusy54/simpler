@@ -516,7 +516,7 @@ public:
     // host-side orchestrator sees the real core count while it submits, rather
     // than the zeros a freshly constructed Runtime carries. Returns 0 on
     // success, -1 on a bad block_dim / aicpu_thread_num.
-    int prepare_launch_shape(Runtime &runtime, const CallConfig &config);
+    virtual int prepare_launch_shape(Runtime &runtime, const CallConfig &config);
     uint64_t upload_chip_callable_buffer(const ChipCallable *callable);
     int release_chip_callable_buffer(uint64_t hash);
     int launch_device_register(int32_t callable_id);

@@ -52,7 +52,15 @@ logger = logging.getLogger(__name__)
 _compile_cache: dict[tuple, object] = {}
 
 _CASE_CONFIG_KEYS = frozenset(
-    {"aicpu_thread_num", "runtime_env", "device_count", "num_sub_workers", "launch_depth", "pipeline_depth"}
+    {
+        "aicpu_thread_num",
+        "core_count",
+        "runtime_env",
+        "device_count",
+        "num_sub_workers",
+        "launch_depth",
+        "pipeline_depth",
+    }
 )
 _TORCH_BACKEND_AUTOLOAD_ENV = "TORCH_DEVICE_BACKEND_AUTOLOAD"
 _TORCH_BACKEND_AUTOLOAD_VALUE_LIMIT = 64
@@ -2115,6 +2123,7 @@ class SceneTestCase:
         config = CallConfig()
         # 0 = auto: DeviceRunner uses the architecture default.
         config.aicpu_thread_num = config_dict.get("aicpu_thread_num", 0)
+        config.core_count = config_dict.get("core_count", 0)
         # Per-task ring sizing (tensormap_and_ringbuffer only; 0 = unset),
         # nested under the "runtime_env" key. This is the only way to size the
         # rings -- there is no process-wide env. Each value is either a scalar

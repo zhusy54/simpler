@@ -9,77 +9,11 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-/**
- * @file intrinsic.h
- * @brief SPMD execution context for AICore user kernels
- *
- * Topology data exposed to user kernels has two distinct lifetimes:
- *
- *   1. Global topology (per-core, fixed after runtime init):
- *      - sub_block_id : identifies the AIV lane within a cluster
- *        (0 = AIV0/left, 1 = AIV1/right).  Initialized once at runtime
- *        startup based on each core's cluster position; never changes.
- *        Only meaningful for AIV kernels in MIX tasks.
- *
- *   2. Local per-dispatch context (changes each dispatch):
- *      - block_idx : which logical block the current worker is executing
- *      - block_num : total number of blocks in this task (= block_dim)
- *      Written by build_payload() before each dispatch.
- *
- * Both categories are injected via two pointer slots appended at the tail
- * of the kernel args[] array:
- *
- *   args layout:
- *     [0 .. tensor_count-1]                 = tensor GM pointers
- *     [tensor_count .. +scalar_count-1]     = scalar values
- *     ...
- *     [SPMD_LOCAL_CONTEXT_INDEX]            = (uint64_t)&LocalContext   (per-dispatch)
- *     [SPMD_GLOBAL_CONTEXT_INDEX]           = (uint64_t)&GlobalContext  (per-core)
- *
- * The suffix positions are compile-time constants and do not depend on the
- * runtime tensor_count or scalar_count.
- *
- * Include this header in AICore kernel source files to use the Get* accessors.
- * Do NOT depend on the raw index constants; always use the accessor functions.
- *
- * On CCEC (real hardware), __gm__ and __aicore__ must be defined before
- * including this header (e.g. via <pto/pto-inst.hpp> or manual #define).
- * The #ifndef guards below provide fallbacks for non-kernel builds
- * (AICPU, HOST) where these qualifiers are not needed.
- *
- * IMPORTANT — do NOT mix these with the CCE built-in topology intrinsics
- * (`get_subblockid()`, `get_block_idx()`, `get_block_num()` declared in
- * `kernel_operator.h` / tikcfw). Those intrinsics read AICore hardware
- * registers that simpler's tensormap_and_ringbuffer runtime does NOT
- * program. Specifically:
- *
- *   - CCE `get_subblockid()` returns whatever stale value the AICore
- *     sub-block register holds — under simpler's MIX dispatch it is 0
- *     for BOTH AIV0 and AIV1 of every cluster, so a kernel that uses
- *     it to partition heads will silently have AIV1 redo AIV0's work
- *     and the AIV1 share of the output is never written. This is the
- *     exact failure mode that produced the partial-zero output in
- *     issue #900 (PR #899 spmd_paged_attention_highperf); the kernel
- *     compiled, ran without error, and produced wrong output. Use
- *     `get_sub_block_id(args)` instead, which reads from the runtime's
- *     `GlobalContext.sub_block_id`. Resident Mix dispatch sets it
- *     from the final physical AIV placement before publication.
- *
- *   - `get_block_idx()` and `get_block_num()` are not redirected to
- *     simpler's LocalContext either — use the `(args)` variants below
- *     so the values reflect simpler's logical block_dim (which can
- *     differ from `RUNTIME_CONFIG.block_dim`, the physical core count).
- *
- * If you are porting a kernel originally written for native CANN dispatch
- * (AscendC, ascend-transformer-boost, etc.), every reference to those
- * three CCE intrinsics needs to be rewritten against this header. See
- * `docs/aicore-kernel-programming.md` for the full author contract,
- * porting checklist, and the worked example from PR #899 / issue #900.
- */
-
 #pragma once
 
 #include <stdint.h>
+
+#include "wse/operation_trace.h"
 
 #include "aicore_completion_mailbox_types.h"
 #include "host_build_graph/task_id.h"
@@ -105,16 +39,12 @@ static constexpr int32_t SPMD_GLOBAL_CONTEXT_INDEX = 49;
 static constexpr int32_t PAYLOAD_LOCAL_CONTEXT_INDEX = SPMD_LOCAL_CONTEXT_INDEX;
 static constexpr int32_t PAYLOAD_GLOBAL_CONTEXT_INDEX = SPMD_GLOBAL_CONTEXT_INDEX;
 
-/**
- * Per-dispatch global context, stored in DispatchPayload. Resident graph
- * Mix dispatch sets sub_block_id from the final physical AIV placement; the
- * legacy scheduler seeds the equivalent per-core value during startup.
- */
+// Kernel-call identity; the observation callback is valid until this invocation returns.
 struct GlobalContext {
-    // AIV lane within cluster: 0=AIV0(left), 1=AIV1(right).
-    // Used by AIV to select the correct intra-cluster hw instruction.
-    // Not meaningful for AIC kernels or single-AIV tasks.
     int32_t sub_block_id;
+    int32_t core_id;
+    int32_t pe_id;
+    wse::OperationTrace operation_trace;
 };
 
 struct AsyncCtx {
@@ -140,8 +70,7 @@ struct AsyncCtx {
 };
 
 /**
- * Per-dispatch local context, stored in DispatchPayload.
- * Written by build_payload() before each dispatch. Different blocks of the
+ * Per-block local context populated by the PE executor. Different blocks of the
  * same task receive different block_idx values but the same block_num.
  *
  */
@@ -153,23 +82,18 @@ struct LocalContext {
     AsyncCtx async_ctx;
 };
 
-/**
- * Return the AIV lane index within the cluster.
- * In a MIX 1C2V task: AIV0(left)=0, AIV1(right)=1.
- *
- * This value is only meaningful for AIV kernels in MIX tasks.  It tells
- * the AIV whether it is the left lane or the right lane within the cluster,
- * which determines the correct hardware instruction for intra-cluster
- * communication.
- *
- * AIC kernels should NOT call this function.
- * Pure AIV tasks have no intra-cluster communication, so sub_block_id
- * has no meaning and should not be used.
- */
+// Compatibility accessor for legacy CPU-operation kernels. WSE PEs have no lane type.
 static __aicore__ inline int32_t get_sub_block_id(__gm__ int64_t *args) {
     __gm__ GlobalContext *ctx =
         reinterpret_cast<__gm__ GlobalContext *>(static_cast<uint64_t>(args[SPMD_GLOBAL_CONTEXT_INDEX]));
     return ctx->sub_block_id;
+}
+
+static __aicore__ inline int32_t get_core_id(__gm__ int64_t *args) {
+    return reinterpret_cast<GlobalContext *>(args[SPMD_GLOBAL_CONTEXT_INDEX])->core_id;
+}
+static __aicore__ inline int32_t get_pe_id(__gm__ int64_t *args) {
+    return reinterpret_cast<GlobalContext *>(args[SPMD_GLOBAL_CONTEXT_INDEX])->pe_id;
 }
 
 /**
@@ -194,4 +118,8 @@ static __aicore__ inline int32_t get_block_num(__gm__ int64_t *args) {
     __gm__ LocalContext *ctx =
         reinterpret_cast<__gm__ LocalContext *>(static_cast<uint64_t>(args[SPMD_LOCAL_CONTEXT_INDEX]));
     return ctx->block_num;
+}
+
+static inline wse::OperationTrace get_wse_operation_trace(int64_t *args) {
+    return reinterpret_cast<GlobalContext *>(args[SPMD_GLOBAL_CONTEXT_INDEX])->operation_trace;
 }

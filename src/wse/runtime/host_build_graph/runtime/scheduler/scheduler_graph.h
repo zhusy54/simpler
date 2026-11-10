@@ -29,11 +29,8 @@
 #define __aicore__
 #endif
 
-// A task's three records share one ChipTaskStorage, so AICore reaches both the
-// ones it reads from a single base: the array strides by the storage, and each
-// record sits at a fixed offset inside it. These are literals because the AICore
-// .o cannot include runtime_types.h; scheduler.h checks them against the types at
-// compile time, and the contract UT again at run time.
+// Field offsets in the shared HBG task image. The Host layout declarations
+// check these against ChipTaskStorage and TaskPayload at compile time.
 inline constexpr uint32_t SCHEDULER_GRAPH_TASK_STORAGE_STRIDE = 320;
 inline constexpr uint32_t SCHEDULER_GRAPH_DESCRIPTOR_OFFSET = 0;
 // TaskPayload includes the early-dispatch cache line in this wire layout.
@@ -64,44 +61,6 @@ inline __aicore__ bool scheduler_node_is_control(SchedulerNodeKind kind) {
            kind == SchedulerNodeKind::CONTROL_DUMMY;
 }
 
-inline constexpr bool
-scheduler_resident_task_shape_supported(uint32_t active_subtasks, uint32_t logical_block_num, bool sync_start) {
-    return active_subtasks >= 1 && active_subtasks <= 3 && logical_block_num >= 1 &&
-           logical_block_num <= static_cast<uint32_t>(INT16_MAX) / active_subtasks &&
-           (!sync_start || logical_block_num > 1);
-}
-
-struct SchedulerMinimumWorkerDemand {
-    uint32_t aic;
-    uint32_t aiv;
-};
-
-inline constexpr SchedulerMinimumWorkerDemand scheduler_minimum_worker_demand(LaneMask active_mask) {
-    const uint32_t vectors = (active_mask.has_aiv0() ? 1U : 0U) + (active_mask.has_aiv1() ? 1U : 0U);
-    // Ordinary blocks can execute in waves. A dual-AIV Mix still needs an AIC coordinator.
-    return {(active_mask.has_aic() || vectors > 1) ? 1U : 0U, vectors};
-}
-
-inline constexpr bool scheduler_resident_worker_demand_checked(
-    LaneMask active_mask, uint32_t blocks, bool sync_start, uint64_t workers, SchedulerMinimumWorkerDemand *demand
-) {
-    if (demand == nullptr || active_mask.is_empty() || !active_mask.is_valid() || workers == 0 ||
-        workers > PLATFORM_MAX_CORES || workers % PLATFORM_CORES_PER_BLOCKDIM != 0 ||
-        !scheduler_resident_task_shape_supported(static_cast<uint32_t>(active_mask.count()), blocks, sync_start))
-        return false;
-    auto required = scheduler_minimum_worker_demand(active_mask);
-    if (sync_start) {
-        const bool mix = active_mask.is_mix();
-        const bool aic_only = active_mask.is_aic();
-        required.aic = (mix || aic_only) ? blocks : 0;
-        required.aiv = mix ? blocks * required.aiv : (aic_only ? 0 : blocks);
-    }
-    const uint64_t clusters = workers / PLATFORM_CORES_PER_BLOCKDIM;
-    if (required.aic > clusters || required.aiv > clusters * PLATFORM_AIV_CORES_PER_BLOCKDIM) return false;
-    *demand = required;
-    return true;
-}
-
 struct SchedulerGraphView {
     // Base of the ChipTaskStorage array. One address, because a task's descriptor
     // and payload are members of one entry rather than peers in two arrays.
@@ -117,23 +76,16 @@ struct SchedulerGraphView {
     uint64_t native_header_offset;
     uint64_t scheduler_state_bytes;
     uint32_t original_task_count;
-    uint16_t view_version;
-    uint16_t view_bytes;
+    uint32_t view_bytes;
 };
-
-inline constexpr uint16_t SCHEDULER_GRAPH_VIEW_VERSION = 2;
 
 inline __aicore__ constexpr SchedulerGraphView
 scheduler_ordinary_graph_view(uint64_t storage_address, uint32_t task_count, uint64_t window_last_index) {
-    return {
-        storage_address,           0, task_count, window_last_index, 0, 0, 0, task_count, SCHEDULER_GRAPH_VIEW_VERSION,
-        sizeof(SchedulerGraphView)
-    };
+    return {storage_address, 0, task_count, window_last_index, 0, 0, 0, task_count, sizeof(SchedulerGraphView)};
 }
 
 inline __aicore__ bool scheduler_graph_view_format_valid(const SchedulerGraphView &graph) {
-    return graph.reserved == 0 && graph.view_version == SCHEDULER_GRAPH_VIEW_VERSION &&
-           graph.view_bytes == sizeof(SchedulerGraphView);
+    return graph.reserved == 0 && graph.view_bytes == sizeof(SchedulerGraphView);
 }
 
 inline __aicore__ bool scheduler_graph_storage_extent_valid(const SchedulerGraphView &graph) {
@@ -253,8 +205,7 @@ static_assert(offsetof(SchedulerGraphView, scheduler_state_address) == 32);
 static_assert(offsetof(SchedulerGraphView, native_header_offset) == 40);
 static_assert(offsetof(SchedulerGraphView, scheduler_state_bytes) == 48);
 static_assert(offsetof(SchedulerGraphView, original_task_count) == 56);
-static_assert(offsetof(SchedulerGraphView, view_version) == 60);
-static_assert(offsetof(SchedulerGraphView, view_bytes) == 62);
+static_assert(offsetof(SchedulerGraphView, view_bytes) == 60);
 static_assert(std::is_trivially_copyable_v<SchedulerGraphView> && std::is_standard_layout_v<SchedulerGraphView>);
 static_assert(sizeof(SchedulerTaskInfo) == 24, "root classification result layout changed");
 static_assert(sizeof(SchedulerTaskShape) == 24, "task shape result layout changed");
@@ -666,49 +617,4 @@ inline __aicore__ SchedulerGraphResult scheduler_parse_task_payload_arguments(
     arguments->tensor_count = tensor_count;
     arguments->scalar_count = scalar_count;
     return SchedulerGraphResult::OK;
-}
-
-inline __aicore__ SchedulerGraphResult scheduler_materialize_task_payload_resolved(
-    const SchedulerGraphAccess &graph, const SchedulerTaskInfo &task, uint64_t function_bin_address,
-    __gm__ DispatchPayload *dispatch_payload, const SchedulerTaskPayloadArguments *shared_arguments = nullptr,
-    bool write_arguments = true
-) {
-    if (dispatch_payload == nullptr || function_bin_address == 0) {
-        return SchedulerGraphResult::INVALID_CALLABLE;
-    }
-    SchedulerTaskPayloadArguments parsed{};
-    if (shared_arguments == nullptr) {
-        const SchedulerGraphResult status = scheduler_parse_task_payload_arguments(graph, task.task_ref, &parsed);
-        if (status != SchedulerGraphResult::OK) return status;
-        shared_arguments = &parsed;
-    }
-    dispatch_payload->function_bin_addr = function_bin_address;
-    if (write_arguments) {
-        int32_t n = 0;
-        for (int32_t i = 0; i < shared_arguments->tensor_count; ++i) {
-            dispatch_payload->args[n++] = reinterpret_cast<uint64_t>(
-                shared_arguments->tensors + static_cast<uint64_t>(i) * TASKPAYLOAD_TENSOR_STRIDE
-            );
-        }
-        for (int32_t i = 0; i < shared_arguments->scalar_count; ++i)
-            dispatch_payload->args[n++] = shared_arguments->scalars[i];
-    }
-
-    return SchedulerGraphResult::OK;
-}
-
-inline __aicore__ void scheduler_materialize_mix_arguments(
-    const SchedulerTaskPayloadArguments &arguments, __gm__ DispatchPayload *const *targets, uint8_t count
-) {
-    for (int32_t i = 0; i < arguments.tensor_count; ++i) {
-        const uint64_t value =
-            reinterpret_cast<uint64_t>(arguments.tensors + static_cast<uint64_t>(i) * TASKPAYLOAD_TENSOR_STRIDE);
-        for (uint8_t lane = 0; lane < count; ++lane)
-            targets[lane]->args[i] = value;
-    }
-    for (int32_t i = 0; i < arguments.scalar_count; ++i) {
-        const uint64_t value = arguments.scalars[i];
-        for (uint8_t lane = 0; lane < count; ++lane)
-            targets[lane]->args[arguments.tensor_count + i] = value;
-    }
 }

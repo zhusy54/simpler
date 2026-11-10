@@ -306,13 +306,61 @@ registration owns; a run references those vectors' own addresses.
 - **Modular design** enables parallel component development
 - **Runtime linking** via binary loading
 
-### WSE compatibility simulation
+### WSE functional simulation
 
-`wsesim` provides an independent `src/wse` copy of the A5 HBG simulator.
-It retains Host, AICPU, AIC/AIV0/AIV1 (1C2V), the existing GM and callable ABI,
-and the pinned PTO-ISA A5 CPU implementation. It does not model native WSE
-four-PE cores, distributed SRAM capacity, or hardware pipeline timing.
-Only `host_build_graph` is supported; there is no WSE onboard or TMR target.
+`wsesim` provides a Host/AICore runtime under `src/wse`, with no AICPU
+component or three-lane dispatch. It defaults to 40 AICores with four homogeneous
+PEs each. A block runs one Kernel entry on one PE; that entry can contain matrix
+and vector operations. Kernel block counts are independent of the Core count,
+and blocks beyond the available PEs execute in waves.
+
+`CallConfig.core_count` selects 1–40 Cores for a run; 0 selects the default 40.
+This option is WSE-only and is not transported by the remote L3 protocol.
+The packed configuration uses native ABI version 2. Rebuild the Python binding
+and runtime components together, and update handwritten C ABI mirrors. The
+existing contract check rejects version-1 components before initialization.
+`rt_submit_wse_task` submits a single entry, `rt_available_core_count` reports the
+configured topology, and Kernel `get_core_id`/`get_pe_id` report physical identity.
+PE0 initializes its Core before computing; Core0 coordinates startup and normal
+retirement. Device tasks publish completion once after all their blocks finish.
+Host wait timeouts retain resources; normal close drains and joins the PE threads
+on the thread that called `init()`.
+
+Kernels including `<wse/tile_ops.h>` use the isolated `wse-temporary-fp32`
+CPU operation backend: static FP32 Tiles up to 32x32, row/column-major logical
+storage, bounded strided views, TLOAD/TSTORE, TMATMUL/TMATMUL_ACC and TRELU.
+This does not implement physical CUBE packing. Legacy `<pto/pto-inst.hpp>`
+fixtures explicitly retain pinned A5 CPU operations; there is no implicit fallback
+from an unsupported WSE operation to A5. GM and Graph data representations remain.
+
+SharedTile uses Core-local slots S0..S63 in the existing CPU simulator context.
+The temporary backend resolves `pto_sim_get_pipe_shared_state`; the PE executor
+already binds the device/Core identity and clears shared state before each run.
+Fixed, trivially destructible FP32 slot state needs no Runtime object registry,
+layout IDs or construction/destruction callbacks. `publish` waits for prior
+consumers; `read` copies a Tile value and marks that consumer finished before
+returning. The matmul overloads consume the shared operand this way. There is no
+public storage lease. Slots keep one shape/participant configuration for a run;
+tasks deliberately sharing a slot continue its generation sequence.
+
+`get_core_id`, `get_pe_id` and block intrinsics supply execution identity.
+`get_wse_operation_trace(args)` provides an optional observation callback only.
+The producer must be runnable on an independent PE; arbitrary cross-block waits
+are not guaranteed to make progress. Shared operations do not group four PEs.
+Shared state is freed by the existing simulator reset between joined runs or
+at device teardown. It is not an addressable hardware shared-memory region.
+
+Temporary implementation details live under `src/wse/functional/temporary`,
+behind the public facade under `functional/include/wse`. The executor does not
+include backend-private Tile definitions. A future PTO WSE adapter can replace
+operation semantics while keeping scheduling, graph completion and resource
+ownership in simpler. PR #418 is reference-only and is not incorporated.
+Kernel cache identity hashes the backend headers and retains the target family and PTO pin.
+
+The implementation does not model SRAM capacity, four-PE collectives,
+hardware pipeline timing, or execution-fault recovery. Only `host_build_graph`
+is supported; there is no WSE onboard or TMR target and no SuperScalarModel/Linx
+dependency.
 
 Build it explicitly in the existing project environment. Use GCC 15 for the
 native Python binding and simulator components (`CC=gcc-15 CXX=g++-15`),
@@ -341,8 +389,23 @@ python -m pytest tests/st/wse/host_build_graph --platform wsesim \
   --require-pto-isa --manual include --rounds 1 --pto-session-timeout 1200
 ```
 
-The suite compiles the unchanged A5 vector and Mix/SPMD sources for WSE,
-checks complete native task/lane and AICPU lifecycle records, and exercises
-registration refusal, partial startup drain, wait deadlines and fatal-run recovery.
+The suite retains the original vector math and uses WSE single-entry Graph
+fixtures for the former Mix/SPMD output contract. It checks real PE execution,
+mixed matrix/vector operations, configurable blocks, Graph replay, completion,
+startup rollback, wait/close and buffer ownership. With `output_prefix` set,
+`wse_events.jsonl` records Core/PE lifecycle and expanded task/block identities;
+its sequence numbers express functional ordering, not hardware timing.
+Host dependency capture (`enable_dep_gen`) remains available. Legacy device
+swimlane, argument dump, PMU and scope-stat collector requests are rejected at
+admission; use the PE event trace for this execution model.
+WSE has no separate entry/startup/component version negotiation or protocol JSON.
+Rebuild the binding, Runtime and Kernels together after interface changes. Target
+family and required-entry checks remain, as does the shared PipelineContract ABI.
+The JSON event trace records lifecycle and operation events 12–15 (publication,
+wait, read, consumed), with slot/generation fields. It does not report a separate
+Runtime allocation service. Packaging contains only Host/AICore WSE binaries.
+Unused AICPU/three-lane executors are removed; common Host arena layout declarations
+remain because shared HBG initialization consumes them, and do not schedule PEs.
+Historical sources, binaries and capture tools are retained in migration evidence.
 A GCC 15 kernel requires a compatible `libstdc++` at runtime; use the same
 compiler runtime for reference and candidate runs.

@@ -19,7 +19,6 @@
 #include "scheduler_types.h"
 
 inline constexpr uint32_t SCHEDULER_NATIVE_GRAPH_MAGIC = 0x35474248;
-inline constexpr uint32_t SCHEDULER_NATIVE_GRAPH_VERSION = 1;
 inline constexpr uint32_t SCHEDULER_NATIVE_NO_INSTANCE = UINT32_MAX;
 inline constexpr uint64_t SCHEDULER_NATIVE_NO_PREDICATE = UINT64_MAX;
 
@@ -43,7 +42,7 @@ struct SchedulerNodeBinding {
 // run control prefix. Absolute addresses are confined to per-run instances.
 struct alignas(64) SchedulerNativeGraphHeader {
     uint32_t magic;
-    uint32_t version;
+    uint32_t padding;
     uint32_t header_bytes;
     uint32_t flags;
     uint64_t image_bytes;

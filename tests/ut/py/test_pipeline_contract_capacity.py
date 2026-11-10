@@ -35,7 +35,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 #: uses is the grant it is given, which every per-run resource is built to.
 _UNLIMITED_DEPTH = 0xFFFFFFFF
 _MAX_RESOURCES = 8
-_CONTRACT_ABI_VERSION = 1
+_CONTRACT_ABI_VERSION = 2
 
 # RUNTIME_ENV_FIELD_GROUPS(3) * RUNTIME_ENV_RING_COUNT(4).
 _RUNTIME_ENV_UINT64_FIELDS = 12
@@ -65,6 +65,7 @@ class _CallConfig(ctypes.Structure):
     _pack_ = 1
     _fields_ = [
         ("aicpu_thread_num", ctypes.c_int32),
+        ("core_count", ctypes.c_int32),
         ("enable_chip_swimlane", ctypes.c_int32),
         ("enable_dump_args", ctypes.c_int32),
         ("enable_pmu", ctypes.c_int32),

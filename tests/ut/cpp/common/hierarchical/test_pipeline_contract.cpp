@@ -68,6 +68,12 @@ TEST(PipelineContract, RejectsAnotherAbiVersion) {
     EXPECT_FALSE(is_valid_pipeline_contract(&c));
 }
 
+TEST(PipelineContract, RejectsConfigurationWithoutCoreCount) {
+    PipelineContract c = accepted_contract();
+    c.abi_version = 1;
+    EXPECT_FALSE(is_valid_pipeline_contract(&c));
+}
+
 TEST(PipelineContract, RejectsMoreResourcesThanFit) {
     PipelineContract c = accepted_contract();
     c.resource_count = PTO_PIPELINE_MAX_RESOURCES + 1;

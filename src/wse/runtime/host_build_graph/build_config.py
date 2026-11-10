@@ -6,55 +6,17 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# host_build_graph Runtime build configuration
-# All paths are relative to this file's directory (src/runtime/host_build_graph/)
-#
-# The host materializes the graph and uploads a read-only view. AICore workers
-# resolve dependencies and execute kernels. AICPU participates only in worker
-# initialization, run completion waiting, and teardown.
-#
-# The orchestration .so is built from src/common/host_build_graph/host/orchestration:
-# orchestration runs on the host for this runtime, so its API headers and the
-# context binding it exports live under "host" like everything else host-only. The
-# .so also compiles shared/assert_support.cpp, named file-wise below: assert_impl is
-# what every always_assert expands into, and being a C++ symbol it cannot be left
-# for dlopen to resolve the way extern "C" unified_log_error is.
-#
-# src/common/host_build_graph holds the sources shared with the other architecture.
-# Its .cpp files sit under a "host", "device" or "shared" subdirectory naming the
-# targets that compile them, because every source_dirs entry is collected by a
-# recursive glob: "host" code uses the STL containers the AICPU target forbids, so it
-# has to live outside any directory that target names.
-#
-# Headers stay flat there, except in host/orchestration: the API header includes
-# "tensor.h", which must resolve along the include path to the arch-local
-# runtime/tensor.h shim for the `using Tensor` alias that shim declares. A quoted
-# include searches its own directory first, so a header sitting next to the flat
-# tensor.h here would bind to this directory's definition and lose that alias.
-#
-# That directory is also on every target's include path, which is what lets the
-# runtime-agnostic platform and worker sources reach this runtime's runtime.h and
-# types.h by bare name: they resolve here when compiled for host_build_graph and to
-# tensormap_and_ringbuffer's own copies when compiled for that runtime. "runtime"
-# precedes it, so an arch-local header still wins over a shared one of the same name.
+# Host serializes an immutable graph; independent PEs initialize and execute it.
+# Tile operation state uses the existing CPU simulator context.
 SHARED = "../../../common/host_build_graph"
 
 BUILD_CONFIG = {
     "aicore": {
-        "include_dirs": ["runtime", "common", "..", SHARED],
-        "source_dirs": ["aicore"],
-    },
-    "aicpu": {
-        "include_dirs": ["runtime", "common", "..", SHARED],
-        "source_dirs": [
-            "aicpu",
-            "runtime",
-            f"{SHARED}/device",
-            f"{SHARED}/shared",
-        ],
+        "include_dirs": ["runtime", "common", "..", "../../functional/include", SHARED],
+        "source_dirs": ["pe"],
     },
     "host": {
-        "include_dirs": ["runtime", "common", "..", SHARED],
+        "include_dirs": ["runtime", "common", "..", "../../functional/include", SHARED],
         "source_dirs": [
             "host",
             f"{SHARED}/host",
@@ -62,7 +24,7 @@ BUILD_CONFIG = {
         ],
     },
     "orchestration": {
-        "include_dirs": ["runtime", "common", "..", SHARED, f"{SHARED}/host/orchestration"],
+        "include_dirs": ["runtime", "common", "..", "../../functional/include", SHARED, f"{SHARED}/host/orchestration"],
         "source_dirs": [f"{SHARED}/host/orchestration"],
         # assert_impl is a C++ symbol, so unlike the extern "C" unified_log_error it
         # cannot be left for dlopen to resolve against the loader: the .so has to

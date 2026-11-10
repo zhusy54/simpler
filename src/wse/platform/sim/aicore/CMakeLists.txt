@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 #
-# Build AICore runtime for a5sim (Simulation)
+# Build AICore runtime for wsesim (Simulation)
 #
 # This builds the AICore executor as a host-compatible shared library (.so)
 # that can be dlopen'd by the simulation runtime.
@@ -24,6 +24,7 @@ include("${SIMPLER_CMAKE_DIR}/host_log_sources.cmake")
 set(CMAKE_CUSTOM_INCLUDE_DIRS "")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../include")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/sim/sim_context")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/include")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/task_interface")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/log/include")
@@ -41,7 +42,7 @@ endif()
 set(AICORE_SOURCES "")
 
 # Add local platform-specific sources
-file(GLOB LOCAL_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
+set(LOCAL_SOURCES)
 list(APPEND AICORE_SOURCES ${LOCAL_SOURCES})
 list(APPEND AICORE_SOURCES ${SIMPLER_HOST_LOG_SOURCES})
 
@@ -83,6 +84,10 @@ target_include_directories(aicore_kernel
 
 
 target_link_libraries(aicore_kernel PRIVATE pthread)
+# CPU operation context is process-resident and loaded globally by ChipWorker.
+if(APPLE)
+    target_link_options(aicore_kernel PRIVATE -undefined dynamic_lookup)
+endif()
 set_target_properties(aicore_kernel PROPERTIES
     OUTPUT_NAME "aicore_kernel"
     # Force .so suffix on all platforms (macOS defaults to .dylib)

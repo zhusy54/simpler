@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 from .environment import PROJECT_ROOT
-from .platform_info import TARGETS, load_build_config, parse_platform
+from .platform_info import load_build_config, parse_platform, runtime_targets
 from .runtime_compiler import RuntimeCompiler
 
 logger = logging.getLogger(__name__)
@@ -152,7 +152,7 @@ class RuntimeBinaries:
     """
 
     host_path: Path
-    aicpu_path: Path
+    aicpu_path: Optional[Path]
     aicore_path: Path
     sim_context_path: Optional[Path] = None
     dispatcher_path: Optional[Path] = None
@@ -294,7 +294,7 @@ class RuntimeBuilder:
         compiler = self._runtime_compiler
         paths = {}
         missing = []
-        for target in TARGETS:
+        for target in runtime_targets(self.platform):
             target_obj = getattr(compiler, f"{target}_target")
             binary = output_dir / target_obj.get_binary_name()
             paths[target] = binary
@@ -330,7 +330,7 @@ class RuntimeBuilder:
 
         return RuntimeBinaries(
             host_path=paths["host"],
-            aicpu_path=paths["aicpu"],
+            aicpu_path=paths.get("aicpu"),
             aicore_path=paths["aicore"],
             sim_context_path=sim_context_path,
             dispatcher_path=dispatcher_path,
@@ -452,17 +452,16 @@ class RuntimeBuilder:
                     cmake_defines=cmake_defines,
                 )
 
-        logger.info("Compiling AICore, AICPU, Host in parallel...")
+        targets = runtime_targets(self.platform)
+        logger.info("Compiling runtime components: %s", ", ".join(targets))
 
         with ThreadPoolExecutor(max_workers=4) as executor:
-            fut_host = executor.submit(_compile_target, "host")
-            fut_aicpu = executor.submit(_compile_target, "aicpu")
-            fut_aicore = executor.submit(_compile_target, "aicore")
+            futures = {target: executor.submit(_compile_target, target) for target in targets}
             fut_sim_ctx = executor.submit(self.ensure_sim_context, build=build_shared) if variant == "sim" else None
-
-            host_path = fut_host.result()
-            aicpu_path = fut_aicpu.result()
-            aicore_path = fut_aicore.result()
+            paths = {target: future.result() for target, future in futures.items()}
+            host_path = paths["host"]
+            aicpu_path = paths.get("aicpu")
+            aicore_path = paths["aicore"]
             sim_context_path = fut_sim_ctx.result() if fut_sim_ctx else None
 
         self._place_compile_commands(name)
@@ -586,7 +585,7 @@ class RuntimeBuilder:
         """
         arch, variant = self._arch, self._variant
         entries = []
-        for target in TARGETS:
+        for target in runtime_targets(self.platform):
             cc = self._CACHE_DIR / arch / variant / runtime_name / target / "compile_commands.json"
             if cc.exists():
                 try:

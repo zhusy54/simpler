@@ -482,7 +482,10 @@ void ChipWorker::init(
     const PipelineContract *contract = get_pipeline_contract_fn();
     if (!is_valid_pipeline_contract(contract) || !has_serviceable_arena_topology(*contract) ||
         !has_serviceable_stream_topology(*contract)) {
-        throw std::runtime_error("host runtime returned a PipelineContract this build cannot accept");
+        throw std::runtime_error(
+            "host runtime returned an incompatible PipelineContract; rebuild the binding and runtime components "
+            "together"
+        );
     }
     PipelineContract resolved_contract = *contract;
     // The runtime publishes what it *supports*; this decides how much of it this
@@ -576,7 +579,19 @@ void ChipWorker::init(
     int init_rc = 0;
     std::string init_error_detail;
     try {
-        std::vector<uint8_t> aicpu_bytes = read_binary_file(aicpu_path);
+        std::vector<uint8_t> aicpu_bytes;
+        const auto get_platform = module->optional<const char *(*)()>("get_platform");
+        const char *platform = get_platform ? get_platform() : nullptr;
+        if (platform != nullptr && std::strcmp(platform, "wsesim") == 0) {
+            if (!aicpu_path.empty()) {
+                throw std::invalid_argument("two-component runtime does not accept an AICPU binary");
+            }
+        } else {
+            if (aicpu_path.empty()) {
+                throw std::invalid_argument("runtime requires an AICPU binary");
+            }
+            aicpu_bytes = read_binary_file(aicpu_path);
+        }
         std::vector<uint8_t> aicore_bytes = read_binary_file(aicore_path);
         // dispatcher_path is empty on sim (no dispatcher) and on tests that
         // exercise _ChipWorker.init directly without a RuntimeBinaries.
@@ -1188,6 +1203,11 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
     require_comm_cleanup_confirmed();
     try {
         config.validate();
+        if (config.core_count != 0) {
+            const auto platform = runtime_module_->required<const char *(*)()>("get_platform");
+            if (std::strcmp(platform(), "wsesim") != 0)
+                throw std::invalid_argument("core_count is supported only by wsesim");
+        }
     } catch (const std::invalid_argument &e) {
         throw RunPreparationRefused(e.what());
     }

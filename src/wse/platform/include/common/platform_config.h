@@ -11,11 +11,11 @@
 
 /**
  * @file platform_config.h
- * @brief Platform-specific configuration and architectural constraints
+ * @brief WSE topology and configuration required by common Host infrastructure
  *
- * This header defines platform architectural parameters that affect
- * both platform and runtime layers. These configurations are derived from
- * hardware capabilities and platform design decisions.
+ * Core/PE topology describes WSE execution. The shared Host infrastructure
+ * also consumes diagnostic and arena constants here; those declarations do not
+ * imply WSE has AICPU execution, register handshakes or hardware PMU support.
  *
  * Configuration Hierarchy:
  * - Base: PLATFORM_MAX_BLOCKDIM (platform capacity)
@@ -34,13 +34,13 @@
  * Maximum block dimension supported by platform
  * This is the fundamental platform capacity constraint.
  */
-constexpr int PLATFORM_MAX_BLOCKDIM = 36;
+constexpr int PLATFORM_MAX_BLOCKDIM = 40;
 
 /**
  * Core composition per block dimension
- * Current architecture: 1 block = 1 AIC cube + 2 AIV cubes
+ * WSE topology: one Core has four homogeneous PEs. Kernel block count is independent.
  */
-constexpr int PLATFORM_CORES_PER_BLOCKDIM = 3;
+constexpr int PLATFORM_CORES_PER_BLOCKDIM = 4;
 constexpr int PLATFORM_AIC_CORES_PER_BLOCKDIM = 1;
 constexpr int PLATFORM_AIV_CORES_PER_BLOCKDIM = 2;
 constexpr uint32_t PLATFORM_SSBUF_SIZE = 3 * 1024;

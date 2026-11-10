@@ -258,11 +258,10 @@ class RuntimeCompiler:
         self.host_target = BuildTarget(gxx, str(self.platform_dir / "host"), "libhost_runtime.so")
 
     def _init_wsesim(self):
-        """Build the AICPU/1C2V compatibility runtime with host toolchains."""
+        """Build the homogeneous PE runtime with host toolchains."""
         self._ensure_host_compilers()
         gxx = GxxToolchain(prefer_g15=bool(self._sanitizers))
         self.aicore_target = BuildTarget(gxx, str(self.platform_dir / "aicore"), "libaicore_kernel.so")
-        self.aicpu_target = BuildTarget(gxx, str(self.platform_dir / "aicpu"), "libaicpu_kernel.so")
         self.host_target = BuildTarget(gxx, str(self.platform_dir / "host"), "libhost_runtime.so")
 
     def _ensure_host_compilers(self):
@@ -329,6 +328,8 @@ class RuntimeCompiler:
         if target_platform == "aicore":
             target = self.aicore_target
         elif target_platform == "aicpu":
+            if self.platform == "wsesim":
+                raise ValueError("WSE has no AICPU runtime component")
             target = self.aicpu_target
         elif target_platform == "host":
             target = self.host_target

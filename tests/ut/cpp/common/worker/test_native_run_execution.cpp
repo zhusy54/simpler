@@ -27,6 +27,41 @@ static_assert(std::is_nothrow_move_constructible_v<LaunchPermit>);
 static_assert(!std::is_copy_constructible_v<LaunchReceipt>);
 static_assert(std::is_nothrow_move_constructible_v<LaunchReceipt>);
 
+TEST(NativeRunExecutionTest, SingleSubmissionRequiresMatchingIdentityAndPublishesReceipt) {
+    int calls = 0;
+    auto submit = [&](LaunchProgressSink &) {
+        ++calls;
+        return 0;
+    };
+    auto other = kIdentity;
+    ++other.run_epoch;
+    auto rejected = single_launch_transaction(other, NativeRunExecutionTestPeer::mint(kIdentity), submit);
+    EXPECT_EQ(calls, 0);
+    EXPECT_FALSE(rejected.receipt.valid());
+    auto accepted = single_launch_transaction(kIdentity, NativeRunExecutionTestPeer::mint(kIdentity), submit);
+    EXPECT_EQ(calls, 1);
+    EXPECT_EQ(accepted.rc, 0);
+    EXPECT_EQ(accepted.progress, LaunchProgress::Complete);
+    EXPECT_TRUE(accepted.receipt.matches(kIdentity));
+}
+
+TEST(NativeRunExecutionTest, SingleSubmissionDistinguishesRollbackFromPartialExecution) {
+    auto rejected =
+        single_launch_transaction(kIdentity, NativeRunExecutionTestPeer::mint(kIdentity), [](LaunchProgressSink &) {
+            return 41;
+        });
+    EXPECT_EQ(rejected.rc, 41);
+    EXPECT_EQ(rejected.progress, LaunchProgress::NotStarted);
+    EXPECT_FALSE(rejected.receipt.valid());
+    auto uncertain = single_launch_transaction(
+        kIdentity, NativeRunExecutionTestPeer::mint(kIdentity), [](LaunchProgressSink &) -> int {
+            throw std::bad_alloc();
+        }
+    );
+    EXPECT_EQ(uncertain.progress, LaunchProgress::Partial);
+    EXPECT_FALSE(uncertain.receipt.valid());
+}
+
 TEST(NativeRunExecutionTest, IdentityMismatchDoesNotSubmit) {
     NativeRunIdentity other = kIdentity;
     other.run_epoch++;

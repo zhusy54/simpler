@@ -34,6 +34,9 @@
 
 #pragma once
 
+// Common Host platform structures. WSE directly launches PEs with wse_launch.h;
+// these shared declarations do not introduce an AICPU launch path.
+
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>

@@ -12,7 +12,6 @@
 #pragma once
 
 #include "scheduler_graph.h"
-#include "scheduler_memory.h"
 
 enum class SchedulerGraphBindingError : uint32_t {
     NONE = 0,
@@ -23,12 +22,6 @@ enum class SchedulerGraphBindingError : uint32_t {
     SCALAR,
     PREDICATE,
 };
-
-inline __aicore__ SchedulerErrorSite scheduler_graph_binding_error_site(SchedulerGraphBindingError error) {
-    return static_cast<SchedulerErrorSite>(
-        static_cast<uint64_t>(SchedulerErrorSite::GRAPH_BIND_NODE) + static_cast<uint32_t>(error) - 1
-    );
-}
 
 template <typename T>
 inline __aicore__ __gm__ const T *
@@ -127,32 +120,6 @@ inline __aicore__ void scheduler_graph_store_tensor(
     dst->extent_elem_cache = src.extent_elem_cache;
 }
 
-inline __aicore__ void scheduler_graph_argument_cache_lines(uint64_t address, uint64_t bytes, bool publish) {
-    for (uint64_t offset = 0; offset < bytes; offset += 64) {
-        auto *line = reinterpret_cast<__gm__ void *>(address + offset);
-        if (publish) scheduler_writeback_cache_line(line);
-        else scheduler_invalidate_cache_line(line);
-    }
-}
-
-inline __aicore__ void scheduler_graph_arguments_cache(
-    const __gm__ SchedulerGraphInstance &instance, const __gm__ SchedulerGraphChildPlan &child, bool publish
-) {
-    scheduler_graph_argument_cache_lines(
-        instance.args_base + child.tensors_offset,
-        static_cast<uint64_t>(child.tensor_count) * TASKPAYLOAD_TENSOR_STRIDE, publish
-    );
-    scheduler_graph_argument_cache_lines(
-        instance.args_base + child.scalars_offset, static_cast<uint64_t>(child.scalar_count) * sizeof(uint64_t), publish
-    );
-    if (child.predicate_offset != SCHEDULER_NATIVE_NO_PREDICATE)
-        scheduler_graph_argument_cache_lines(instance.args_base + child.predicate_offset, 64, publish);
-    scheduler_cache_barrier();
-}
-
-// Only the child's bootstrap partition owner writes its arguments. Publication
-// completes before scan arrival; ordinary owners and admission members observe
-// the immutable argument image after the bootstrap scan gate opens.
 inline __aicore__ SchedulerGraphBindingError
 scheduler_bind_graph_arguments(const SchedulerGraphAccess &graph, int64_t ref) {
     if (graph.native_header_offset == 0) return SchedulerGraphBindingError::NONE;
@@ -248,21 +215,5 @@ scheduler_bind_graph_arguments(const SchedulerGraphAccess &graph, int64_t ref) {
         dst->elem_size = predicate->elem_size;
         dst->op = predicate->op;
     }
-    scheduler_graph_arguments_cache(instance, *child, true);
-    return SchedulerGraphBindingError::NONE;
-}
-
-inline __aicore__ SchedulerGraphBindingError
-scheduler_observe_graph_arguments(const SchedulerGraphAccess &graph, int64_t ref) {
-    if (graph.native_header_offset == 0) return SchedulerGraphBindingError::NONE;
-    SchedulerNativeNode node{};
-    if (!scheduler_native_node_checked(graph, ref, &node)) return SchedulerGraphBindingError::NODE;
-    if (node.binding->kind == SchedulerNodeKind::TOP_KERNEL) return SchedulerGraphBindingError::NONE;
-    auto *child = scheduler_native_child_plan_checked(graph, node);
-    if (node.binding->kind != SchedulerNodeKind::CHILD_KERNEL || child == nullptr ||
-        (node.definition->args_bytes != 0 && (node.instance->args_base == 0 || node.instance->args_base % 64 != 0)) ||
-        node.definition->args_bytes > UINT64_MAX - node.instance->args_base)
-        return SchedulerGraphBindingError::INSTANCE;
-    scheduler_graph_arguments_cache(*node.instance, *child, false);
     return SchedulerGraphBindingError::NONE;
 }

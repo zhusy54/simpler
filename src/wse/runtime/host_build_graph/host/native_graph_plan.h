@@ -52,16 +52,13 @@ bool native_graph_plan_nodes(
 );
 
 // Validate device-wide barriers even when the whole run needs the legacy path.
-bool native_graph_plan_worker_capacity(const NativeGraphHostPlan &plan, uint64_t workers, std::string *error);
 
 struct NativeGraphReadonlyImage {
     std::vector<std::byte> bytes;
     uint64_t header_offset{0};
 };
 
-// Reserves the existing run-control prefix without writing its live contents.
-// Commit patches the header's allocation/epoch/inbox fields and the instances'
-// external addresses before publishing the entire scheduler backing.
+// Serializes the graph behind an aligned prefix; offset zero denotes no native graph.
 bool native_graph_plan_readonly_image(
     const NativeGraphHostPlan &plan, NativeGraphReadonlyImage *out, std::string *error
 );

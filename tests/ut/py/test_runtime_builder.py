@@ -260,6 +260,7 @@ class TestRuntimeBuilderGetBinaries:
 
         assert isinstance(result, RuntimeBinaries)
         assert result.host_path.name == "libhost.so"
+        assert result.aicpu_path is not None
         assert result.aicpu_path.name == "libaicpu.so"
         assert result.aicore_path.name == "libaicore.so"
 
@@ -992,6 +993,7 @@ class TestRuntimeBuilderIntegration:
             ("aicpu", result.aicpu_path),
             ("aicore", result.aicore_path),
         ]:
+            assert path is not None
             assert path.is_file(), f"{label} binary not found: {path}"
             assert path.stat().st_size > 0, f"{label} binary is empty: {path}"
 

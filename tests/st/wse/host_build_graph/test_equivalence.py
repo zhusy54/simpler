@@ -6,56 +6,45 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Real WSE HBG coverage, using the unchanged A5 source scenes."""
+"""Preserve vector math and four-task dependencies across input rebinding.
+
+Native WSE Graph equivalence is covered in direct_launch/test_direct_launch.py.
+"""
 
 import json
-import subprocess
-import sys
-from pathlib import Path
 
 import pytest
+import torch
 
-from tests.st.wse.host_build_graph.audit_capture import audit
+from simpler_setup.scene_test import _build_l2_ref_args
+from tests.st.a5.host_build_graph.vector_example.test_vector_example import TestVectorExampleHostBuildGraphA5 as Vector
 
 pytestmark = [pytest.mark.platforms(["wsesim"]), pytest.mark.runtime("host_build_graph"), pytest.mark.device_count(1)]
 
 
-def test_original_scenes_with_complete_native_coverage(tmp_path, st_platform):
-    root = Path(__file__).resolve().parents[4]
-    destination = tmp_path / "capture"
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "tests.st.wse.host_build_graph.run_capture",
-            "--platform",
-            st_platform,
-            "--out",
-            str(destination),
-        ],
-        check=False,
-        cwd=root,
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    report = audit(destination)
-    (destination / "audit.json").write_text(json.dumps(report, indent=2))
-    assert report["status"] == "PASS"
-
-    trace_path = destination / "mix-0/chip_swimlane_records.json"
-    original = trace_path.read_text()
+def test_vector_dependencies_and_rebinding(tmp_path, st_platform):
+    case = Vector()
+    worker = case._create_worker(st_platform)
     try:
-        trace = json.loads(original)
-        trace["aicore_execution_identities"]["records"].pop()
-        trace_path.write_text(json.dumps(trace))
-        with pytest.raises(AssertionError):
-            audit(destination)
-        trace = json.loads(original)
-        trace["metadata"]["host_capture"]["dropped_records"] = 1
-        trace_path.write_text(json.dumps(trace))
-        with pytest.raises(AssertionError):
-            audit(destination)
+        handle = worker.register(case.build_callable(st_platform))
+        for repeat in range(2):
+            values = case.generate_args({})
+            if repeat:
+                values.a.copy_((torch.arange(values.a.numel()) % 13).float() - 5)
+                values.b.fill_(3)
+            expected = values.clone()
+            case.compute_golden(expected, {})
+            args, _ = _build_l2_ref_args(values, case.CALLABLE["orchestration"]["signature"], worker)
+            config = case._build_config({}, output_prefix=str(tmp_path / str(repeat)))
+            worker.run(handle, args, config)
+            assert torch.equal(values.f, expected.f)
+            rows = [json.loads(line) for line in (tmp_path / str(repeat) / "wse_events.jsonl").read_text().splitlines()]
+            assert rows[0]["expected_tasks"] == 4
+            done = {e["task"]: e["seq"] for e in rows[1:] if e["kind"] == 6}
+            begin = {e["task"]: e["seq"] for e in rows[1:] if e["kind"] == 4}
+            assert len(done) == 4
+            for producer, consumer in [(0, 1), (0, 2), (1, 3), (2, 3)]:
+                assert done[producer] < begin[consumer]
+        worker.unregister(handle)
     finally:
-        trace_path.write_text(original)
+        worker.close()

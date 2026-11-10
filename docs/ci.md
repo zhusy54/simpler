@@ -95,7 +95,7 @@ Admin PR comment /run-a5
 | `ut` | `ubuntu-24.04` | `pytest tests/ut` + `ctest -LE requires_hardware` |
 | `st-sim-a2a3` | `ubuntu-24.04` | `pytest examples tests/st --platform a2a3sim` |
 | `st-sim-a5` | `ubuntu-24.04` | `pytest examples tests/st --platform a5sim` |
-| `st-sim-wse` | `ubuntu-24.04` | WSE HBG coverage/error suite, original A5 reference scenes, CPU target semantics |
+| `st-sim-wse` | `ubuntu-24.04` | WSE HBG direct-launch and ownership suite, original A5 reference scenes, CPU target semantics |
 | `ut-a2a3` | a2a3 self-hosted | Hardware Python UT: `device_count` cases use resource scheduling, RuntimeBuilder integration runs before the xdist fanout, and remaining cases use one worker per allocated device. Then `ctest -L "^requires_hardware(_a2a3)?$" --resource-spec-file ...` and CANN example smokes. |
 | `st-onboard-a2a3` | a2a3 self-hosted | `pytest examples tests/st -m "not sdma and not sdma_fault" --platform a2a3 --exclude-level 4 --device ...`, then separate SDMA-demo and `sdma_fault` device tasks, then adaptive-parallel DFX feature smokes |
 | `st-framework-eager-a2a3` | a2a3 self-hosted | `pytest examples tests/st --platform a2a3 --test-environment torch_npu --manual exclude --require-pto-isa --device ... --max-parallel 1 -p no:xdist` in one exclusive task, then verify plan/JUnit |
@@ -763,6 +763,6 @@ simulators. No additional markers are used.
 
 The WSE simulation job uses `wse_changed && st_affected` from the canonical
 change detector. WSE-only implementation and scene changes do not select A3/A5
-scene jobs. A5 changes conservatively select WSE too because its compatibility
+scene jobs. A5 changes conservatively select WSE too because its comparison
 suite consumes the original A5 source fixtures. Shared code and CI implementation
 changes select all simulation partitions; non-code changes select none.

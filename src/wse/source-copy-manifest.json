@@ -1,48 +1,21 @@
 {
   "baseline": "c1c234667d54f4aea1582249448b24f9a08753f6",
-  "semantics": "a5-cpu-compatible",
+  "semantics": "independent-wse-pe-with-temporary-fp32-operations-and-explicit-pinned-a5-compatibility",
   "files": [
-    {
-      "source": "src/a5/platform/include/aicore/aicore_profiling_state.h",
-      "destination": "src/wse/platform/include/aicore/aicore_profiling_state.h",
-      "baseline_sha256": "ec4cedbcd5faf5e8acfb217c6765dc5dd8775f4dc65ccb45e99489558bad68f6",
-      "sha256": "ec4cedbcd5faf5e8acfb217c6765dc5dd8775f4dc65ccb45e99489558bad68f6",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/platform/include/aicore/pmu_collector_aicore.h",
-      "destination": "src/wse/platform/include/aicore/pmu_collector_aicore.h",
-      "baseline_sha256": "3cd11ed0a0b904f11d35149f830fd6f21863e0b9d36ae4d641968a709a92d30e",
-      "sha256": "3cd11ed0a0b904f11d35149f830fd6f21863e0b9d36ae4d641968a709a92d30e",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/platform/include/aicpu/platform_regs.h",
-      "destination": "src/wse/platform/include/aicpu/platform_regs.h",
-      "baseline_sha256": "63a47ca78d22b848e13e7a9a2ff0acf57154bcfad30c782230a8030af4861e52",
-      "sha256": "63a47ca78d22b848e13e7a9a2ff0acf57154bcfad30c782230a8030af4861e52",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/platform/include/aicpu/pmu_collector_aicpu.h",
-      "destination": "src/wse/platform/include/aicpu/pmu_collector_aicpu.h",
-      "baseline_sha256": "b17f136129095d6782483d38f17b9dfca0c168645fc9168be46083c78a32b5be",
-      "sha256": "b17f136129095d6782483d38f17b9dfca0c168645fc9168be46083c78a32b5be",
-      "reason": "verbatim A5 compatibility implementation"
-    },
     {
       "source": "src/a5/platform/include/common/kernel_args.h",
       "destination": "src/wse/platform/include/common/kernel_args.h",
       "baseline_sha256": "6c1744005429681f21bc05c6f368eebd136330a5d1580d089156b9df07f7ef76",
-      "sha256": "6c1744005429681f21bc05c6f368eebd136330a5d1580d089156b9df07f7ef76",
+      "sha256": "eec830f8e0b5edbef70ebf134c31c70578dc6101be00244b30dc2b6a507c7d25",
       "reason": "verbatim A5 compatibility implementation"
     },
     {
       "source": "src/a5/platform/include/common/platform_config.h",
       "destination": "src/wse/platform/include/common/platform_config.h",
       "baseline_sha256": "aa440b6160cd05363cd5a44ee059d725d15d1ca2e018082abd7ef1c49d4e1dd2",
-      "sha256": "aa440b6160cd05363cd5a44ee059d725d15d1ca2e018082abd7ef1c49d4e1dd2",
-      "reason": "verbatim A5 compatibility implementation"
+      "sha256": "7400556177295393c5c6c411ea90f79ca1b7950e2043241e311adc7b5748ecea",
+      "reason": "derived WSE implementation; common Host layout declarations retained where required",
+      "step00_sha256": "aa440b6160cd05363cd5a44ee059d725d15d1ca2e018082abd7ef1c49d4e1dd2"
     },
     {
       "source": "src/a5/platform/include/common/pmu_profiling.h",
@@ -59,31 +32,10 @@
       "reason": "verbatim A5 compatibility implementation"
     },
     {
-      "source": "src/a5/platform/include/host/host_regs.h",
-      "destination": "src/wse/platform/include/host/host_regs.h",
-      "baseline_sha256": "a02b893f535d970dbd054973f4c5ab35f510f91da57bfe53ebaa37e66273ca10",
-      "sha256": "a02b893f535d970dbd054973f4c5ab35f510f91da57bfe53ebaa37e66273ca10",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
       "source": "src/a5/platform/include/host/pmu_collector.h",
       "destination": "src/wse/platform/include/host/pmu_collector.h",
       "baseline_sha256": "0233a0b3614f2d83057ca6c9cb92560f2c1acec98aa4132b90a6626f43968145",
       "sha256": "0233a0b3614f2d83057ca6c9cb92560f2c1acec98aa4132b90a6626f43968145",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/platform/shared/aicpu/platform_regs.cpp",
-      "destination": "src/wse/platform/shared/aicpu/platform_regs.cpp",
-      "baseline_sha256": "bdbb5c6269c06ef6646ca1d2063b08d4a267ae44c7976e5044d530ea79a610ed",
-      "sha256": "bdbb5c6269c06ef6646ca1d2063b08d4a267ae44c7976e5044d530ea79a610ed",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/platform/shared/aicpu/pmu_collector_aicpu.cpp",
-      "destination": "src/wse/platform/shared/aicpu/pmu_collector_aicpu.cpp",
-      "baseline_sha256": "42adfd5b1738e91d64766925d26e6f0e57ee6e18a94e5207f331993d852e8cd3",
-      "sha256": "42adfd5b1738e91d64766925d26e6f0e57ee6e18a94e5207f331993d852e8cd3",
       "reason": "verbatim A5 compatibility implementation"
     },
     {
@@ -97,64 +49,41 @@
       "source": "src/a5/platform/sim/CMakeLists.txt",
       "destination": "src/wse/platform/sim/CMakeLists.txt",
       "baseline_sha256": "af517073fdd29477c8ebfaf3585e305005f31807d2e11fdf6e46d89ea2f46320",
-      "sha256": "af517073fdd29477c8ebfaf3585e305005f31807d2e11fdf6e46d89ea2f46320",
-      "reason": "verbatim A5 compatibility implementation"
+      "sha256": "698b693f26d5e568bdb6457b165065bb098c2436d1b444a1422cf027702bb034",
+      "reason": "derived WSE implementation; common Host layout declarations retained where required"
     },
     {
       "source": "src/a5/platform/sim/aicore/CMakeLists.txt",
       "destination": "src/wse/platform/sim/aicore/CMakeLists.txt",
       "baseline_sha256": "2cdd38508c98dfd0996bd6becdf9b49e47e6e15a683b6adc9e822a31bc2df8dc",
-      "sha256": "2cdd38508c98dfd0996bd6becdf9b49e47e6e15a683b6adc9e822a31bc2df8dc",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/platform/sim/aicore/inner_kernel.h",
-      "destination": "src/wse/platform/sim/aicore/inner_kernel.h",
-      "baseline_sha256": "f2a08434f0fc20c54dd1c49a0e2d9f41e1d61882dec3908ad0f26f838c381910",
-      "sha256": "f2a08434f0fc20c54dd1c49a0e2d9f41e1d61882dec3908ad0f26f838c381910",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/platform/sim/aicore/kernel.cpp",
-      "destination": "src/wse/platform/sim/aicore/kernel.cpp",
-      "baseline_sha256": "2c1907cbdc2a9ac75fa7bdf74593992a1d83c5bdef2aa62aea55059fdd515f46",
-      "sha256": "2c1907cbdc2a9ac75fa7bdf74593992a1d83c5bdef2aa62aea55059fdd515f46",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/platform/sim/aicpu/CMakeLists.txt",
-      "destination": "src/wse/platform/sim/aicpu/CMakeLists.txt",
-      "baseline_sha256": "f0f85acc48854f04f3849e73b84ae99c31b8458f7ca27bef76bec88989bd69dc",
-      "sha256": "f0f85acc48854f04f3849e73b84ae99c31b8458f7ca27bef76bec88989bd69dc",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/platform/sim/aicpu/inner_platform_regs.cpp",
-      "destination": "src/wse/platform/sim/aicpu/inner_platform_regs.cpp",
-      "baseline_sha256": "833bc21a95fbe8518cd3cc15dec552b1609711fe96e5399171919b79f8fcac2f",
-      "sha256": "833bc21a95fbe8518cd3cc15dec552b1609711fe96e5399171919b79f8fcac2f",
-      "reason": "verbatim A5 compatibility implementation"
+      "sha256": "e65a4aa0859a931df379284429556cc207aab096740b00e77380699cc1acce63",
+      "reason": "derived WSE implementation; common Host layout declarations retained where required",
+      "step00_sha256": "2cdd38508c98dfd0996bd6becdf9b49e47e6e15a683b6adc9e822a31bc2df8dc"
     },
     {
       "source": "src/a5/platform/sim/host/CMakeLists.txt",
       "destination": "src/wse/platform/sim/host/CMakeLists.txt",
       "baseline_sha256": "151b633d524e4c0c801228470b77785d00f6c9a5356d0cb9073e3cba9a464372",
-      "sha256": "8de42b1238031388e60806b167afdff810e4bd182bc5d3def71f001d9f217c21",
-      "reason": "independent WSE simulator target identity"
+      "sha256": "91297d588f969c6c65fba083868075c0c21d3a987ca7c394e88ae744708e23f1",
+      "reason": "derived WSE implementation; common Host layout declarations retained where required",
+      "step00_sha256": "8de42b1238031388e60806b167afdff810e4bd182bc5d3def71f001d9f217c21"
     },
     {
       "source": "src/a5/platform/sim/host/device_runner.cpp",
       "destination": "src/wse/platform/sim/host/device_runner.cpp",
       "baseline_sha256": "620853d3e8e64d9021935b82921c5a1a8a3eb1bfe7fb4eb3922c38c914ff671e",
-      "sha256": "620853d3e8e64d9021935b82921c5a1a8a3eb1bfe7fb4eb3922c38c914ff671e",
-      "reason": "verbatim A5 compatibility implementation"
+      "sha256": "2817bca0aea7656676b919768e292b839de9b84d53f54ba8ca69eb562d372b79",
+      "reason": "derived WSE implementation; common Host layout declarations retained where required",
+      "step00_sha256": "620853d3e8e64d9021935b82921c5a1a8a3eb1bfe7fb4eb3922c38c914ff671e",
+      "step01_sha256": "865c801d8ee2201a672f6185a58586d57fc27c4bc627118fa3929692b7a1825a"
     },
     {
       "source": "src/a5/platform/sim/host/device_runner.h",
       "destination": "src/wse/platform/sim/host/device_runner.h",
       "baseline_sha256": "54f7b460fe979734167abd8ababe9a6391ad25108ee20e4ef9716b10c010862f",
-      "sha256": "4d9a687a4b5a63e66089e4b7a1b89c10264287de4d045b36b192de2cd595d64d",
-      "reason": "independent WSE simulator target identity"
+      "sha256": "b89af637ecde5f21287d30ddb0dea3fd8ad23d1642f876ead3386282a7d8d387",
+      "reason": "derived WSE implementation; common Host layout declarations retained where required",
+      "step00_sha256": "4d9a687a4b5a63e66089e4b7a1b89c10264287de4d045b36b192de2cd595d64d"
     },
     {
       "source": "src/a5/platform/sim/host/profiling_copy.cpp",
@@ -167,106 +96,41 @@
       "source": "src/a5/platform/sim/host/runtime_c_api.cpp",
       "destination": "src/wse/platform/sim/host/runtime_c_api.cpp",
       "baseline_sha256": "09c7ab9a3b4b7e76a4e4c55b7c070b1b17e168d2f12cf667135e01b5c5e88087",
-      "sha256": "09c7ab9a3b4b7e76a4e4c55b7c070b1b17e168d2f12cf667135e01b5c5e88087",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/aicore/aicore_executor.cpp",
-      "destination": "src/wse/runtime/host_build_graph/aicore/aicore_executor.cpp",
-      "baseline_sha256": "4a2ada0678a2737c7250fe22a633de63be3bdc158acd11001ed15e8fc01167ac",
-      "sha256": "4a2ada0678a2737c7250fe22a633de63be3bdc158acd11001ed15e8fc01167ac",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/aicore/aicore_legacy_executor.cpp",
-      "destination": "src/wse/runtime/host_build_graph/aicore/aicore_legacy_executor.cpp",
-      "baseline_sha256": "8531382778c31f450f9a2176ae0562901bbeac1e4cfd1f3253d65513d5639651",
-      "sha256": "8531382778c31f450f9a2176ae0562901bbeac1e4cfd1f3253d65513d5639651",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/aicpu/aicore_lifecycle.cpp",
-      "destination": "src/wse/runtime/host_build_graph/aicpu/aicore_lifecycle.cpp",
-      "baseline_sha256": "eba306bfe816f26e3e86ea1c7cde26bcfccd971ae0ee19f36d6a58684558399a",
-      "sha256": "eba306bfe816f26e3e86ea1c7cde26bcfccd971ae0ee19f36d6a58684558399a",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/aicpu/aicore_lifecycle.h",
-      "destination": "src/wse/runtime/host_build_graph/aicpu/aicore_lifecycle.h",
-      "baseline_sha256": "e06e179fb033e9c42372d986e6f80544f81c72b6b6c5bd14e8186d93bc0d903c",
-      "sha256": "e06e179fb033e9c42372d986e6f80544f81c72b6b6c5bd14e8186d93bc0d903c",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/aicpu/aicore_scheduler_error.h",
-      "destination": "src/wse/runtime/host_build_graph/aicpu/aicore_scheduler_error.h",
-      "baseline_sha256": "b8acb4636efdf1283abba069252dafb55d1949d29152bb04424eb96150909349",
-      "sha256": "b8acb4636efdf1283abba069252dafb55d1949d29152bb04424eb96150909349",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/aicpu/aicore_scheduler_state.h",
-      "destination": "src/wse/runtime/host_build_graph/aicpu/aicore_scheduler_state.h",
-      "baseline_sha256": "246d9f5e9363ce964fd8781b469da12a9aa7b97844cd6f27b38f349f870f3afb",
-      "sha256": "246d9f5e9363ce964fd8781b469da12a9aa7b97844cd6f27b38f349f870f3afb",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/aicpu/aicpu_executor.cpp",
-      "destination": "src/wse/runtime/host_build_graph/aicpu/aicpu_executor.cpp",
-      "baseline_sha256": "35c6b88ede25a7b2f1ce3239a18c095409f26422efd3dca542e5454bc52b8526",
-      "sha256": "35c6b88ede25a7b2f1ce3239a18c095409f26422efd3dca542e5454bc52b8526",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/aicpu/aicpu_legacy_executor.cpp",
-      "destination": "src/wse/runtime/host_build_graph/aicpu/aicpu_legacy_executor.cpp",
-      "baseline_sha256": "e12cae162345ead8c89f6fa1ca48f06dce39826c04216277a06e8db1049f48d7",
-      "sha256": "e12cae162345ead8c89f6fa1ca48f06dce39826c04216277a06e8db1049f48d7",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/aicpu/scheduler_ready_watchdog.h",
-      "destination": "src/wse/runtime/host_build_graph/aicpu/scheduler_ready_watchdog.h",
-      "baseline_sha256": "2b673c46e7d9ba2f399215e345d173ec0fd91106c976813945d11913790676de",
-      "sha256": "2b673c46e7d9ba2f399215e345d173ec0fd91106c976813945d11913790676de",
-      "reason": "verbatim A5 compatibility implementation"
+      "sha256": "5f4ff4570752088d1629e575e6d9234157db1f19dee91cdd9ebc60288d15a86b",
+      "reason": "derived WSE implementation; common Host layout declarations retained where required",
+      "step00_sha256": "09c7ab9a3b4b7e76a4e4c55b7c070b1b17e168d2f12cf667135e01b5c5e88087"
     },
     {
       "source": "src/a5/runtime/host_build_graph/build_config.py",
       "destination": "src/wse/runtime/host_build_graph/build_config.py",
       "baseline_sha256": "57569e02e0945a47d9306b727d767da8b724bca1e3b178c8727cf937630a31d1",
-      "sha256": "57569e02e0945a47d9306b727d767da8b724bca1e3b178c8727cf937630a31d1",
-      "reason": "verbatim A5 compatibility implementation"
+      "sha256": "a7e092a8d28f2af94cb3fdfaaedc71a314c1d1b7458bc46ac2115bb7bc54c49e",
+      "reason": "derived WSE implementation; common Host layout declarations retained where required",
+      "step00_sha256": "57569e02e0945a47d9306b727d767da8b724bca1e3b178c8727cf937630a31d1",
+      "step01_sha256": "0f299faaa880f157a2f0a5ea81a5c015c94990aa7e7b2d2bcc5d69c90f832339"
     },
     {
       "source": "src/a5/runtime/host_build_graph/common/intrinsic.h",
       "destination": "src/wse/runtime/host_build_graph/common/intrinsic.h",
       "baseline_sha256": "8ccb073100c82a353e372cafade7671b30e77e3b058e95a85eaacadebb153cf3",
-      "sha256": "8ccb073100c82a353e372cafade7671b30e77e3b058e95a85eaacadebb153cf3",
-      "reason": "verbatim A5 compatibility implementation"
+      "sha256": "5d7786e667c9e03664e3f3d45296818ef44d8768b7b44fb707e0005dd0c6f20f",
+      "reason": "derived WSE implementation; common Host layout declarations retained where required",
+      "step00_sha256": "8ccb073100c82a353e372cafade7671b30e77e3b058e95a85eaacadebb153cf3",
+      "step01_sha256": "bb51c732944266e291d5c32b8fb36fbbc652dceb01baf9691151ee53d496efd7"
     },
     {
       "source": "src/a5/runtime/host_build_graph/host/native_graph_plan.cpp",
       "destination": "src/wse/runtime/host_build_graph/host/native_graph_plan.cpp",
       "baseline_sha256": "e300c85f84a5ed48ecd798ba4b7f61f4c5bf9ec4caa78b6e5c8e513849a6f6e7",
-      "sha256": "e300c85f84a5ed48ecd798ba4b7f61f4c5bf9ec4caa78b6e5c8e513849a6f6e7",
-      "reason": "verbatim A5 compatibility implementation"
+      "sha256": "50d7ba75dbf21a7912dc349867b6f00e2497ff32b694b6f7c3ea3deb2098d797",
+      "reason": "derived WSE implementation; common Host layout declarations retained where required"
     },
     {
       "source": "src/a5/runtime/host_build_graph/host/native_graph_plan.h",
       "destination": "src/wse/runtime/host_build_graph/host/native_graph_plan.h",
       "baseline_sha256": "dc565152e3fdd71cb2bf9899ff75a5c8bf1215afbef3da98bc264fbfb0ef62ea",
-      "sha256": "dc565152e3fdd71cb2bf9899ff75a5c8bf1215afbef3da98bc264fbfb0ef62ea",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/host/ready_pool_plan.h",
-      "destination": "src/wse/runtime/host_build_graph/host/ready_pool_plan.h",
-      "baseline_sha256": "9f5b72cd0ff9c6b731b6ea6c23b516036d7565ccd03b59af8185edaba2b0752b",
-      "sha256": "9f5b72cd0ff9c6b731b6ea6c23b516036d7565ccd03b59af8185edaba2b0752b",
-      "reason": "verbatim A5 compatibility implementation"
+      "sha256": "c759a8ba6a8f3e04d2eb0503d6c25a974093cf8fb4076a062f2cddbbb1e285a8",
+      "reason": "derived WSE implementation; common Host layout declarations retained where required"
     },
     {
       "source": "src/a5/runtime/host_build_graph/host/runtime_compile_info.cpp",
@@ -279,22 +143,9 @@
       "source": "src/a5/runtime/host_build_graph/host/runtime_maker.cpp",
       "destination": "src/wse/runtime/host_build_graph/host/runtime_maker.cpp",
       "baseline_sha256": "f9a3d1817a6068f12f2097c8f85818a8a3e28a2027024de5354479b2fed56660",
-      "sha256": "f9a3d1817a6068f12f2097c8f85818a8a3e28a2027024de5354479b2fed56660",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/host/scheduler_protocol_export.h",
-      "destination": "src/wse/runtime/host_build_graph/host/scheduler_protocol_export.h",
-      "baseline_sha256": "574051add9427f6602475bdf31cb689bc679056ae5c8e8e9762ddefe37b271ff",
-      "sha256": "574051add9427f6602475bdf31cb689bc679056ae5c8e8e9762ddefe37b271ff",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/host/scheduler_protocol_graph_source.h",
-      "destination": "src/wse/runtime/host_build_graph/host/scheduler_protocol_graph_source.h",
-      "baseline_sha256": "82526348aac75a364efba36114bb681fb93fdab21fa4d148d8ffb1782749907b",
-      "sha256": "82526348aac75a364efba36114bb681fb93fdab21fa4d148d8ffb1782749907b",
-      "reason": "verbatim A5 compatibility implementation"
+      "sha256": "4356e3f39f0080ab9da96150df190ace11706900c3759e75d2a06f27085e16c7",
+      "reason": "derived WSE implementation; common Host layout declarations retained where required",
+      "step00_sha256": "f9a3d1817a6068f12f2097c8f85818a8a3e28a2027024de5354479b2fed56660"
     },
     {
       "source": "src/a5/runtime/host_build_graph/runtime/aicore_completion_mailbox.h",
@@ -311,270 +162,62 @@
       "reason": "verbatim A5 compatibility implementation"
     },
     {
-      "source": "src/a5/runtime/host_build_graph/runtime/async_kernel_api.h",
-      "destination": "src/wse/runtime/host_build_graph/runtime/async_kernel_api.h",
-      "baseline_sha256": "b01532e0c422075991a2317be6e23c87789be9d66488fc57078608d8f2c81dae",
-      "sha256": "b01532e0c422075991a2317be6e23c87789be9d66488fc57078608d8f2c81dae",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
       "source": "src/a5/runtime/host_build_graph/runtime/async_wait.h",
       "destination": "src/wse/runtime/host_build_graph/runtime/async_wait.h",
       "baseline_sha256": "6e4cb9e5850729a7504e7d5a4f4604f2aec4550aa16d18fc5c9d74973e260267",
-      "sha256": "6e4cb9e5850729a7504e7d5a4f4604f2aec4550aa16d18fc5c9d74973e260267",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/runtime/backend/sdma/sdma_completion_kernel.h",
-      "destination": "src/wse/runtime/host_build_graph/runtime/backend/sdma/sdma_completion_kernel.h",
-      "baseline_sha256": "2e57b87c642f34ac0476334138ee3eab8705654c0c5af22e5b6ade507b1bf537",
-      "sha256": "2e57b87c642f34ac0476334138ee3eab8705654c0c5af22e5b6ade507b1bf537",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/runtime/backend/sdma/sdma_completion_scheduler.h",
-      "destination": "src/wse/runtime/host_build_graph/runtime/backend/sdma/sdma_completion_scheduler.h",
-      "baseline_sha256": "fa87f6ab721077c461077aaf5cb75a33c3baca2d45ad0b19b9910e43d08d95d3",
-      "sha256": "fa87f6ab721077c461077aaf5cb75a33c3baca2d45ad0b19b9910e43d08d95d3",
-      "reason": "verbatim A5 compatibility implementation"
+      "sha256": "29c0e675da693ce641ead62ef9689d84997d4a696b218e89f44b5cb032abddc4",
+      "reason": "derived WSE implementation; common Host layout declarations retained where required"
     },
     {
       "source": "src/a5/runtime/host_build_graph/runtime/dispatch_payload.h",
       "destination": "src/wse/runtime/host_build_graph/runtime/dispatch_payload.h",
       "baseline_sha256": "4ce1d60e5182cb4e83aca76d46a1dd37e0f7b065c816f3739f42c69a2f23f8cc",
-      "sha256": "4ce1d60e5182cb4e83aca76d46a1dd37e0f7b065c816f3739f42c69a2f23f8cc",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler.cpp",
-      "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler.cpp",
-      "baseline_sha256": "343eb48c12c01e4376058d3bdf0768e3279c6cb5a39eaf6172cc77897dbfff45",
-      "sha256": "343eb48c12c01e4376058d3bdf0768e3279c6cb5a39eaf6172cc77897dbfff45",
-      "reason": "verbatim A5 compatibility implementation"
+      "sha256": "944975d3ca04a539ef3a83c322e82ebd4be8413e056d8c9b9d8ebbc6b3ab3b5b",
+      "reason": "derived WSE implementation; common Host layout declarations retained where required"
     },
     {
       "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler.h",
       "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler.h",
       "baseline_sha256": "efdc8a78690b55dca307c4f531bf83fa254373f49b502a03c2c288528e4a7697",
-      "sha256": "efdc8a78690b55dca307c4f531bf83fa254373f49b502a03c2c288528e4a7697",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_admission.h",
-      "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_admission.h",
-      "baseline_sha256": "e0e1e13cf0ca320feea8664abc3ad8ebc46fc362f832490d506851e9adaaed6e",
-      "sha256": "e0e1e13cf0ca320feea8664abc3ad8ebc46fc362f832490d506851e9adaaed6e",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_chunk_queue.h",
-      "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_chunk_queue.h",
-      "baseline_sha256": "4ec2f7c55d64c037c1b6efaa35b705c34afbada62b4657e2466ba1d5b77c7030",
-      "sha256": "4ec2f7c55d64c037c1b6efaa35b705c34afbada62b4657e2466ba1d5b77c7030",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_cold_path.cpp",
-      "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_cold_path.cpp",
-      "baseline_sha256": "0bdb5a624c2959821c958502c128c6f1196ba97005d4467406cfff4716264162",
-      "sha256": "0bdb5a624c2959821c958502c128c6f1196ba97005d4467406cfff4716264162",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_completion.cpp",
-      "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_completion.cpp",
-      "baseline_sha256": "8c88cfd0d62b70832d21ea89b56da7f54acb2bcdb5a45ef7ae17a57c94ceebe9",
-      "sha256": "8c88cfd0d62b70832d21ea89b56da7f54acb2bcdb5a45ef7ae17a57c94ceebe9",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_completion.h",
-      "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_completion.h",
-      "baseline_sha256": "74e16a48ef5dba41169d1e01ebbe98b7a8c70a194cd9281da3370f27f9fbab74",
-      "sha256": "74e16a48ef5dba41169d1e01ebbe98b7a8c70a194cd9281da3370f27f9fbab74",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_context.h",
-      "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_context.h",
-      "baseline_sha256": "bd5a6c883fac286ba5f6ae3404a001df6b5e3e2dd1400b7e08f06184c245c789",
-      "sha256": "bd5a6c883fac286ba5f6ae3404a001df6b5e3e2dd1400b7e08f06184c245c789",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_dispatch.cpp",
-      "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_dispatch.cpp",
-      "baseline_sha256": "1d69beca980f22e438ac14cb0737448f233ab689c83daee62014f5dba3349ed3",
-      "sha256": "1d69beca980f22e438ac14cb0737448f233ab689c83daee62014f5dba3349ed3",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_dispatch.h",
-      "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_dispatch.h",
-      "baseline_sha256": "d1a4f52dafb65ceb200045c4eac8a2ec706c06cb5735f29a50fa8c1df506d342",
-      "sha256": "d1a4f52dafb65ceb200045c4eac8a2ec706c06cb5735f29a50fa8c1df506d342",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_error.h",
-      "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_error.h",
-      "baseline_sha256": "afebe55102ba60c2ecc8bfe5815136eff56215ec88b142cfdfb108ec112d877f",
-      "sha256": "afebe55102ba60c2ecc8bfe5815136eff56215ec88b142cfdfb108ec112d877f",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_gm_mix.h",
-      "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_gm_mix.h",
-      "baseline_sha256": "1165e55f114a7fe7399ac924810b6c867aca3c09214181f597c6f24a938cd135",
-      "sha256": "1165e55f114a7fe7399ac924810b6c867aca3c09214181f597c6f24a938cd135",
-      "reason": "verbatim A5 compatibility implementation"
+      "sha256": "caa845669f43c21412768c29b7cc43172209370437c0dfe19a82c7b10d4d0dc0",
+      "reason": "derived WSE implementation; common Host layout declarations retained where required"
     },
     {
       "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_graph.h",
       "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_graph.h",
       "baseline_sha256": "4f7929e79fda7c8b73f423ca5415f5024e097cd221300da3c70fefa3c04a2d11",
-      "sha256": "4f7929e79fda7c8b73f423ca5415f5024e097cd221300da3c70fefa3c04a2d11",
-      "reason": "verbatim A5 compatibility implementation"
+      "sha256": "91a31b7578b3bcc705cf4974e643df9ec3415c85cab54a69f4603423745db8fa",
+      "reason": "derived WSE implementation; common Host layout declarations retained where required"
     },
     {
       "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_graph_binding.h",
       "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_graph_binding.h",
       "baseline_sha256": "6aa576fdd18952742e8319dee8f512ce248ce618c16de3ad631992a8e3576173",
-      "sha256": "6aa576fdd18952742e8319dee8f512ce248ce618c16de3ad631992a8e3576173",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_graph_control.h",
-      "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_graph_control.h",
-      "baseline_sha256": "aaf42c4827e6cb372b4f75281515eab1e58e473287b9ab75434a829150f64b73",
-      "sha256": "aaf42c4827e6cb372b4f75281515eab1e58e473287b9ab75434a829150f64b73",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_layout.h",
-      "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_layout.h",
-      "baseline_sha256": "4f539f777b0de9ae566ec93af5ab05ec012b9cfc4cc087da02db17cb1e690129",
-      "sha256": "4f539f777b0de9ae566ec93af5ab05ec012b9cfc4cc087da02db17cb1e690129",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_linked_queue.h",
-      "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_linked_queue.h",
-      "baseline_sha256": "7c11ecf0686ddd21ea7d65eebe153280afd83baac5241bcf58ced3cca0469c70",
-      "sha256": "7c11ecf0686ddd21ea7d65eebe153280afd83baac5241bcf58ced3cca0469c70",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_memory.h",
-      "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_memory.h",
-      "baseline_sha256": "120d5fc8006314fd648f9d06dabb6a0541dbac692b3a7c4def072d10794e4e2e",
-      "sha256": "120d5fc8006314fd648f9d06dabb6a0541dbac692b3a7c4def072d10794e4e2e",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_mix.h",
-      "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_mix.h",
-      "baseline_sha256": "a4f15f3f82f15256bf5d57fae83046af1b8a8748a73783edb829ab8b150fc579",
-      "sha256": "a4f15f3f82f15256bf5d57fae83046af1b8a8748a73783edb829ab8b150fc579",
-      "reason": "verbatim A5 compatibility implementation"
+      "sha256": "c2cff91f56e3314acd7f88457d434aa5254f9ecc02aa9c82c7802772339c697d",
+      "reason": "derived WSE implementation; common Host layout declarations retained where required"
     },
     {
       "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_native_graph.h",
       "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_native_graph.h",
       "baseline_sha256": "b0cbd2e6d2be1f47b6edcb345ccbf2545a6da23a6fbcfca288af93cdc728afe2",
-      "sha256": "b0cbd2e6d2be1f47b6edcb345ccbf2545a6da23a6fbcfca288af93cdc728afe2",
-      "reason": "verbatim A5 compatibility implementation"
+      "sha256": "4e518a4d6d880ba44e214e989ef248a6c73d44370ea25d1d1779e7051e2598e3",
+      "reason": "derived WSE implementation; common Host layout declarations retained where required"
     },
     {
       "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_native_graph_access.h",
       "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_native_graph_access.h",
       "baseline_sha256": "5ea2419ec474faebe54f95c2d70ac77feb3c09c5fa7c6fd4d2f0d596cf2808d1",
-      "sha256": "5ea2419ec474faebe54f95c2d70ac77feb3c09c5fa7c6fd4d2f0d596cf2808d1",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_protocol.h",
-      "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_protocol.h",
-      "baseline_sha256": "f278e25420842b3e2db5a1c227d070bb9044327da0f5a1af1f1e273b570291b2",
-      "sha256": "f278e25420842b3e2db5a1c227d070bb9044327da0f5a1af1f1e273b570291b2",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_protocol_block.h",
-      "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_protocol_block.h",
-      "baseline_sha256": "812827576877eec977481fb8aea442162b25d405e1d93b55d678a37c761ebda7",
-      "sha256": "812827576877eec977481fb8aea442162b25d405e1d93b55d678a37c761ebda7",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_protocol_execute.h",
-      "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_protocol_execute.h",
-      "baseline_sha256": "464bc6c07d8edbbb7fd4c1676eb12dd591c5a57778580167ffa65f50ddde9177",
-      "sha256": "464bc6c07d8edbbb7fd4c1676eb12dd591c5a57778580167ffa65f50ddde9177",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_protocol_execution.h",
-      "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_protocol_execution.h",
-      "baseline_sha256": "1e2a50fdd48aab5ab9df613aebf1a90a398b5d1382b53e73f273bb8924d7bfab",
-      "sha256": "1e2a50fdd48aab5ab9df613aebf1a90a398b5d1382b53e73f273bb8924d7bfab",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_protocol_types.h",
-      "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_protocol_types.h",
-      "baseline_sha256": "d975ff13eaa17f726b692b1acb4fc972e9bb6ddbd894a46963fe40413e209c82",
-      "sha256": "d975ff13eaa17f726b692b1acb4fc972e9bb6ddbd894a46963fe40413e209c82",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_ready.h",
-      "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_ready.h",
-      "baseline_sha256": "910cc0076a5e92edf6eaaa789a32d9262e90a09e6587d37bab391172fa24b3e6",
-      "sha256": "910cc0076a5e92edf6eaaa789a32d9262e90a09e6587d37bab391172fa24b3e6",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_ready_pool.h",
-      "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_ready_pool.h",
-      "baseline_sha256": "cfef78990f794edbbc7e2d66574fdb63edf582b3f87952cdeb1ac9f7614854f0",
-      "sha256": "cfef78990f794edbbc7e2d66574fdb63edf582b3f87952cdeb1ac9f7614854f0",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_ssbuf.h",
-      "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_ssbuf.h",
-      "baseline_sha256": "cdca33e1ea5c187410271812ca3f01ab8777ef624d3870e2608df7ccf36480d4",
-      "sha256": "cdca33e1ea5c187410271812ca3f01ab8777ef624d3870e2608df7ccf36480d4",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_ticket_queue.h",
-      "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_ticket_queue.h",
-      "baseline_sha256": "0466a6a29c8936c56fd79f36c4489b9fcaf45e79cf7e82127d0cb9d38713a064",
-      "sha256": "0466a6a29c8936c56fd79f36c4489b9fcaf45e79cf7e82127d0cb9d38713a064",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_topology.h",
-      "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_topology.h",
-      "baseline_sha256": "e4f9bd2a0ad8998afd4a6cd40d3d71331240f7eaeb783e0fc3e4d6a09c3b7b03",
-      "sha256": "e4f9bd2a0ad8998afd4a6cd40d3d71331240f7eaeb783e0fc3e4d6a09c3b7b03",
-      "reason": "verbatim A5 compatibility implementation"
+      "sha256": "ac5e1278aeb0b007729a9ec195b3632aecc849f203ba3b18d1f163bddf3dd62a",
+      "reason": "derived WSE implementation; common Host layout declarations retained where required",
+      "step00_sha256": "5ea2419ec474faebe54f95c2d70ac77feb3c09c5fa7c6fd4d2f0d596cf2808d1"
     },
     {
       "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h",
       "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_types.h",
       "baseline_sha256": "1c177ee96fb9eeadd0b94200baeb546f03b63c2d8de4d256fe4f8e5f103de7d3",
-      "sha256": "1c177ee96fb9eeadd0b94200baeb546f03b63c2d8de4d256fe4f8e5f103de7d3",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_watchdog.h",
-      "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_watchdog.h",
-      "baseline_sha256": "152ea29656dde29a6a1f2b5bc3a5f6600a4ea8af833ae8aa476edd30194ec87a",
-      "sha256": "152ea29656dde29a6a1f2b5bc3a5f6600a4ea8af833ae8aa476edd30194ec87a",
-      "reason": "verbatim A5 compatibility implementation"
+      "sha256": "fb7eb38aec2dc4f3a2f094e70cc58140ae6f60ba7c95f4f84fba7e62885f062b",
+      "reason": "derived WSE implementation; common Host layout declarations retained where required",
+      "step00_sha256": "1c177ee96fb9eeadd0b94200baeb546f03b63c2d8de4d256fe4f8e5f103de7d3"
     },
     {
       "source": "src/a5/runtime/host_build_graph/runtime/tensor.h",
@@ -583,5 +226,8 @@
       "sha256": "8dcd808289e2c3beb2f0df513a8e034f79b914c489b0e2fc6e8b999a26fe0c99",
       "reason": "verbatim A5 compatibility implementation"
     }
-  ]
+  ],
+  "derivation_baseline": "a3a951a1f9ef4dd898b254dc88f233b9cfac0b32",
+  "scope": "Provenance of inherited files; this is not a build or runtime component manifest.",
+  "operation_backend": "wse-temporary-fp32"
 }

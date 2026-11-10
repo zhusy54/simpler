@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 #
-# Build Host runtime for a5sim (Simulation)
+# Build Host runtime for wsesim (Simulation)
 #
 # This builds the simulated host runtime that uses threads instead of
 # actual device execution.
@@ -59,7 +59,6 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/args_dump_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/args_dump_retained_runs.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/scope_stats_retained_runs.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/sim/aicpu/platform_aicpu_affinity.cpp"
     # Shared POSIX-shm sim comm backend (same source as a2a3 sim).
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform_comm/comm_sim.cpp"
 )

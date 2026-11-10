@@ -22,7 +22,7 @@ scheduler_native_region_valid(uint64_t bytes, uint64_t offset, uint64_t count, u
 
 inline __aicore__ bool scheduler_native_header_extent_valid(uint64_t base, uint64_t bytes, uint64_t offset) {
     return base != 0 && base % SCHEDULER_STATE_ALIGNMENT == 0 && bytes <= UINT64_MAX - base &&
-           offset >= sizeof(SchedulerRunControl) &&
+           offset >= SCHEDULER_STATE_ALIGNMENT &&
            scheduler_native_region_valid(
                bytes, offset, 1, sizeof(SchedulerNativeGraphHeader), alignof(SchedulerNativeGraphHeader)
            );
@@ -33,15 +33,14 @@ inline __aicore__ __gm__ const SchedulerNativeGraphHeader *scheduler_native_head
 ) {
     if (!scheduler_native_header_extent_valid(base, bytes, offset)) return nullptr;
     auto *header = reinterpret_cast<__gm__ const SchedulerNativeGraphHeader *>(base + offset);
-    if (header->magic != SCHEDULER_NATIVE_GRAPH_MAGIC || header->version != SCHEDULER_NATIVE_GRAPH_VERSION ||
-        header->header_bytes != sizeof(SchedulerNativeGraphHeader) || header->flags != 0 || header->reserved != 0 ||
-        header->image_bytes != bytes || header->node_count != nodes || nodes == 0 || nodes > INT32_MAX ||
-        header->original_task_count != original_tasks || original_tasks == 0 ||
+    if (header->magic != SCHEDULER_NATIVE_GRAPH_MAGIC || header->header_bytes != sizeof(SchedulerNativeGraphHeader) ||
+        header->flags != 0 || header->reserved != 0 || header->image_bytes != bytes || header->node_count != nodes ||
+        nodes == 0 || nodes > INT32_MAX || header->original_task_count != original_tasks || original_tasks == 0 ||
         original_tasks > TaskId::GLOBAL_TASK_MAX_NUM || header->instance_count == 0 ||
         header->instance_count > original_tasks || header->definition_count == 0 ||
         header->definition_count > header->instance_count || header->run_epoch == 0 ||
         header->readonly_end_offset > bytes || header->readonly_end_offset % SCHEDULER_STATE_ALIGNMENT != 0 ||
-        header->control_inbox_count == 0 || header->control_inbox_count > SCHEDULER_WORKER_CAPACITY)
+        header->control_inbox_count != 0)
         return nullptr;
     const uint64_t end = header->readonly_end_offset;
     if (!scheduler_native_region_valid(
@@ -57,10 +56,6 @@ inline __aicore__ __gm__ const SchedulerNativeGraphHeader *scheduler_native_head
         !scheduler_native_region_valid(
             end, header->instances_offset, header->instance_count, sizeof(SchedulerGraphInstance),
             alignof(SchedulerGraphInstance)
-        ) ||
-        !scheduler_native_region_valid(
-            bytes, header->control_inboxes_offset, header->control_inbox_count, sizeof(SchedulerReadyInbox),
-            alignof(SchedulerReadyInbox)
         ))
         return nullptr;
     if (header->bindings_offset < offset + sizeof(SchedulerNativeGraphHeader) ||

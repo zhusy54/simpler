@@ -112,6 +112,7 @@ struct CallConfig {
     // 0 = auto: use the architecture default (a2a3: 4; a5: 5).
     // Explicit normal-run values must be at least 2.
     int32_t aicpu_thread_num = 0;
+    int32_t core_count = 0;  // 0 selects the platform topology; WSE accepts 1..40.
     int32_t enable_chip_swimlane = 0;
     int32_t enable_dump_args = 0;
     int32_t enable_pmu = 0;  // 0 = disabled; >0 = enabled, value selects event type
@@ -132,6 +133,7 @@ struct CallConfig {
     // Called at every submit/run entry point so the failure surfaces as close
     // to the user's call site as possible (no IPC round-trip).
     void validate() const {
+        if (core_count < 0) throw std::invalid_argument("CallConfig: core_count must be nonnegative");
         if (diagnostics_any() && !output_prefix_set()) {
             throw std::invalid_argument(
                 "CallConfig: output_prefix must be set whenever any of "
@@ -145,6 +147,6 @@ struct CallConfig {
 #pragma pack(pop)
 static_assert(sizeof(RuntimeEnv) == RUNTIME_ENV_UINT64_FIELD_COUNT * sizeof(uint64_t), "RuntimeEnv wire layout drift");
 static_assert(
-    sizeof(CallConfig) == 6 * sizeof(int32_t) + RUNTIME_ENV_UINT64_FIELD_COUNT * sizeof(uint64_t) + 1024,
+    sizeof(CallConfig) == 7 * sizeof(int32_t) + RUNTIME_ENV_UINT64_FIELD_COUNT * sizeof(uint64_t) + 1024,
     "CallConfig wire layout drift"
 );

@@ -85,6 +85,8 @@ private:
     friend class SimDeviceRunnerBase;
     template <typename AicoreSubmit, typename AicpuSubmit>
     friend struct ExactLaunchTransaction;
+    template <typename Submit>
+    friend struct SingleLaunchTransaction;
 
     explicit LaunchPermit(const NativeRunIdentity &identity) :
         identity_(identity),
@@ -126,6 +128,8 @@ public:
 private:
     template <typename AicoreSubmit, typename AicpuSubmit>
     friend struct ExactLaunchTransaction;
+    template <typename Submit>
+    friend struct SingleLaunchTransaction;
 
     explicit LaunchReceipt(const NativeRunIdentity &identity) :
         identity_(identity),
@@ -190,6 +194,36 @@ struct DrainOutcome {
     }
     static DrainOutcome device_complete(int diagnostics_rc) { return DrainOutcome{0, diagnostics_rc, true}; }
 };
+
+// A single executor submission with the same identity/receipt ownership as multi-component launches.
+template <typename Submit>
+struct SingleLaunchTransaction {
+    static LaunchTransactionResult run(const NativeRunIdentity &identity, LaunchPermit permit, Submit &&submit) {
+        LaunchTransactionResult result;
+        if (!permit.consume(identity)) return result;
+        LaunchProgressSink sink;
+        try {
+            result.rc = std::forward<Submit>(submit)(sink);
+        } catch (...) {
+            result.rc = -1;
+            result.progress = LaunchProgress::Partial;
+            return result;
+        }
+        if (result.rc != 0) {
+            if (sink.submitted()) result.progress = LaunchProgress::Partial;
+            return result;
+        }
+        result.progress = LaunchProgress::Complete;
+        result.receipt = LaunchReceipt(identity);
+        return result;
+    }
+};
+
+template <typename Submit>
+LaunchTransactionResult
+single_launch_transaction(const NativeRunIdentity &identity, LaunchPermit permit, Submit &&submit) {
+    return SingleLaunchTransaction<Submit>::run(identity, std::move(permit), std::forward<Submit>(submit));
+}
 
 /**
  * The exact two-submission launch transaction.

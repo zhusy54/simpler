@@ -32,6 +32,12 @@ ARCHS = ("a2a3", "a5", "wse")
 TARGETS = ("host", "aicpu", "aicore")
 
 
+def runtime_targets(platform: str) -> tuple[str, ...]:
+    """Required execution components, independent of files left in a build directory."""
+    parse_platform(platform)
+    return ("host", "aicore") if platform == "wsesim" else TARGETS
+
+
 def parse_platform(platform: str) -> tuple[str, str]:
     """Parse platform string into (arch, variant).
 

@@ -14,7 +14,7 @@
  * The shared c_api glue (simpler_init / simpler_register_callable / simpler_run /
  * device_*_ctx / etc.) lives in `src/common/platform/sim/host/c_api_shared.cpp`
  * and is linked into this same libhost_runtime.so. This file keeps only the
- * entries that need the concrete a5 sim `DeviceRunner` subclass
+ * entries that need the concrete WSE sim `DeviceRunner` subclass
  * (`create_device_context`) plus the ACL no-op stubs that ChipWorker dlsyms
  * unconditionally — sim has no ACL / aclrtStream concept, and the comm_* paired
  * entry points come from `src/common/platform_comm/comm_sim.cpp`.

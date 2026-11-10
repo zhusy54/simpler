@@ -3399,6 +3399,7 @@ NB_MODULE(_task_interface, m) {
     nb::class_<CallConfig>(m, "CallConfig")
         .def(nb::init<>())
         .def_rw("aicpu_thread_num", &CallConfig::aicpu_thread_num)
+        .def_rw("core_count", &CallConfig::core_count)
         // runtime_env returns an internal reference so `cfg.runtime_env.ring_heap = X`
         // writes through to the owning CallConfig (rv_policy::reference_internal).
         .def_prop_rw(

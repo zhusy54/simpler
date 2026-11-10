@@ -101,7 +101,13 @@ if(SKBUILD_MODE)
             OPTIONAL
             # The standalone logger is not a package artifact; every host
             # consumer compiles its own logging implementation.
-            PATTERN "libsimpler_log.so" EXCLUDE)
+            PATTERN "libsimpler_log.so" EXCLUDE
+            PATTERN "wse" EXCLUDE)
+    install(FILES
+            ${CMAKE_SOURCE_DIR}/build/lib/wse/sim/host_build_graph/libhost_runtime.so
+            ${CMAKE_SOURCE_DIR}/build/lib/wse/sim/host_build_graph/libaicore_kernel.so
+            DESTINATION simpler_setup/_assets/build/lib/wse/sim/host_build_graph
+            OPTIONAL)
     if(EXISTS "${CMAKE_SOURCE_DIR}/pto_isa.pin")
         install(FILES ${CMAKE_SOURCE_DIR}/pto_isa.pin
                 DESTINATION simpler_setup/_assets)

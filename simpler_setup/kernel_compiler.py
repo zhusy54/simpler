@@ -235,7 +235,7 @@ class KernelCompiler:
         except KeyError as error:
             raise ValueError(f"Unsupported CPU simulator platform: {self.platform}") from error
         return [
-            *self.gxx15.get_compile_flags(core_type=core_type),
+            *self.gxx15.get_compile_flags(core_type="" if self.platform == "wsesim" else core_type),
             target_flag,
             "-include",
             "pto/cpu/target_config.hpp",
@@ -304,7 +304,14 @@ class KernelCompiler:
         headers (e.g. ``intrinsic.h``) can pull shared platform headers like
         ``common/dma_workspace.h`` regardless of what the call site passes.
         """
-        return [
+        return (
+            [
+                str(Path(__file__).resolve().parent / "incore" / "wse"),
+                str(self.project_root / "src/wse/functional/include"),
+            ]
+            if self.platform == "wsesim"
+            else []
+        ) + [
             str(Path(__file__).resolve().parent / "incore"),
             str(self.project_root / "src" / "common" / "platform" / "include"),
         ]
@@ -466,6 +473,14 @@ class KernelCompiler:
             },
         }
 
+    def _wse_operation_backend_identity(self) -> dict[str, str]:
+        root = self.project_root / "src/wse/functional"
+        digest = hashlib.sha256()
+        for path in sorted(root.rglob("*.h")):
+            digest.update(str(path.relative_to(root)).encode())
+            digest.update(path.read_bytes())
+        return {"backend": "wse-temporary-fp32", "headers_sha256": digest.hexdigest()}
+
     def incore_compile_cache_token(self, core_type: str) -> dict[str, object]:
         """Describe the compiler inputs shared by identical incore sources."""
         if self.platform.endswith("sim"):
@@ -485,6 +500,7 @@ class KernelCompiler:
             "logic": _artifact_logic_token(),
             "identity": _executable_cache_identity(incore.cxx_path),
             "core_type": core_type,
+            "wse_operation_backend": self._wse_operation_backend_identity() if self.platform == "wsesim" else None,
             "flags": flags,
             "linker": linker,
             "pto_isa_commit": read_pto_isa_pin() if self.platform.endswith("sim") else None,

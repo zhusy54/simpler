@@ -476,6 +476,10 @@ int SimDeviceRunnerBase::ensure_dma_workspace_provisioned() {
 }
 
 int SimDeviceRunnerBase::prepare_launch_shape(Runtime &runtime, const CallConfig &config) {
+    if (config.core_count != 0) {
+        LOG_ERROR("core_count configuration is unsupported by this platform");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
     if (config.aicpu_thread_num == 1 || config.aicpu_thread_num < 0 ||
         config.aicpu_thread_num > PLATFORM_MAX_AICPU_THREADS) {
         LOG_ERROR(

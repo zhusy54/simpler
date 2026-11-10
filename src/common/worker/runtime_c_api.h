@@ -162,7 +162,9 @@ enum {
 };
 
 enum {
-    PTO_PIPELINE_CONTRACT_ABI_VERSION = 1,
+    /* Validated before initialization passes CallConfig across the native boundary.
+       Version 2 includes the core_count field in the packed configuration. */
+    PTO_PIPELINE_CONTRACT_ABI_VERSION = 2,
     PTO_PIPELINE_MAX_RESOURCES = 8,
 };
 

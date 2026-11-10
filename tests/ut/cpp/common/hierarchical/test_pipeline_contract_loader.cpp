@@ -106,10 +106,18 @@ TEST(PipelineContractLoader, MissingOrMisclassifiedStreamsRejectBeforeCreatingCo
         auto contract = program_contract();
         contract.resources[index] = contract.resources[3];
         ASSERT_TRUE(is_valid_pipeline_contract(&contract));
-        expect_factory_admission(contract, 0, "host runtime returned a PipelineContract this build cannot accept");
+        expect_factory_admission(
+            contract, 0,
+            "host runtime returned an incompatible PipelineContract; rebuild the binding and runtime components "
+            "together"
+        );
         contract = program_contract();
         contract.resources[index].resource_class = PTO_PIPELINE_HOST_PER_RUN;
-        expect_factory_admission(contract, 0, "host runtime returned a PipelineContract this build cannot accept");
+        expect_factory_admission(
+            contract, 0,
+            "host runtime returned an incompatible PipelineContract; rebuild the binding and runtime components "
+            "together"
+        );
     }
 }
 
