@@ -25,6 +25,7 @@
 #pragma once
 
 #include <cstdint>
+#include "common/hardware_spec.h"
 
 // =============================================================================
 // Base Platform Configuration
@@ -34,13 +35,13 @@
  * Maximum block dimension supported by platform
  * This is the fundamental platform capacity constraint.
  */
-constexpr int PLATFORM_MAX_BLOCKDIM = 40;
+constexpr int PLATFORM_MAX_BLOCKDIM = wse::MAX_CORE_COUNT;
 
 /**
  * Core composition per block dimension
  * WSE topology: one Core has four homogeneous PEs. Kernel block count is independent.
  */
-constexpr int PLATFORM_CORES_PER_BLOCKDIM = 4;
+constexpr int PLATFORM_CORES_PER_BLOCKDIM = wse::PE_PER_CORE;
 constexpr int PLATFORM_AIC_CORES_PER_BLOCKDIM = 1;
 constexpr int PLATFORM_AIV_CORES_PER_BLOCKDIM = 2;
 constexpr uint32_t PLATFORM_SSBUF_SIZE = 3 * 1024;

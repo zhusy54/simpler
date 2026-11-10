@@ -9,7 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * simpler host-runtime C API — a5 sim arch-specific entries.
+ * simpler host-runtime C API — WSE sim arch-specific entries.
  *
  * The shared c_api glue (simpler_init / simpler_register_callable / simpler_run /
  * device_*_ctx / etc.) lives in `src/common/platform/sim/host/c_api_shared.cpp`
@@ -22,6 +22,9 @@
 
 #include "device_runner.h"
 #include "runtime_c_api.h"
+#include <algorithm>
+#include <cstdio>
+#include <stdexcept>
 
 extern "C" {
 
@@ -56,3 +59,44 @@ int destroy_comm_stream_ctx(DeviceContextHandle ctx, void *stream) {
 }
 
 }  // extern "C"
+
+namespace {
+template <class F>
+int sram_call(char *error, size_t size, F body) noexcept {
+    try {
+        body();
+        return 0;
+    } catch (const std::exception &e) {
+        if (error && size) std::snprintf(error, size, "%s", e.what());
+    } catch (...) {
+        if (error && size) std::snprintf(error, size, "WSE SRAM operation failed");
+    }
+    return -1;
+}
+}  // namespace
+extern "C" int wse_configure_ctx(
+    void *ctx, uint32_t cores, uint32_t pes, const uint64_t *capacities, const uint64_t *reserves, char *error,
+    size_t size
+) {
+    return sram_call(error, size, [&] {
+        static_cast<DeviceRunner *>(ctx)->configure_sram(cores, pes, capacities, reserves);
+    });
+}
+extern "C" int
+wse_malloc_sram_ctx(void *ctx, size_t bytes, uint32_t core, size_t alignment, uint64_t *out, char *error, size_t size) {
+    return sram_call(error, size, [&] {
+        *out = reinterpret_cast<uint64_t>(static_cast<DeviceRunner *>(ctx)->allocate_sram(bytes, core, alignment));
+    });
+}
+extern "C" int wse_sram_query_ctx(void *ctx, uint32_t core, uint64_t *out, size_t count, char *error, size_t size) {
+    int needed = 0;
+    const int rc = sram_call(error, size, [&] {
+        auto values = static_cast<DeviceRunner *>(ctx)->sram_query(core);
+        needed = values.size();
+        if (out) {
+            if (count < values.size()) throw std::invalid_argument("SRAM query output too small");
+            std::copy(values.begin(), values.end(), out);
+        }
+    });
+    return rc == 0 ? needed : rc;
+}

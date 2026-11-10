@@ -44,4 +44,4 @@ jobs:
             tests/st/a5/host_build_graph/graph_execution/test_graph_execution_mix_spmd.py \
             --platform a5sim --require-pto-isa --rounds 1 --manual include --pto-session-timeout 1200
       - name: CPU target semantics and cache isolation
-        run: .venv/bin/python -m pytest tests/ut/py/test_cpu_sim_target.py tests/ut/py/test_wse_platform.py tests/ut/py/test_wse_tile_operations.py tests/ut/py/test_wse_counter_operations.py
+        run: .venv/bin/python -m pytest tests/ut/py/test_cpu_sim_target.py tests/ut/py/test_wse_platform.py tests/ut/py/test_wse_tile_operations.py tests/ut/py/test_wse_counter_operations.py tests/ut/py/test_wse_sram.py

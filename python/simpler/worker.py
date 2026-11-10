@@ -337,6 +337,7 @@ from .worker_chip_orch_comm import (
 )
 from .worker_level import WorkerLevel
 from .worker_level import span_prefix as _span_prefix
+from .wse_config import normalize_config
 
 # Upper bound on how long the parent waits for every chip's bootstrap mailbox
 # to leave IDLE.  Well above a realistic HCCL init (seconds) but short enough
@@ -12786,6 +12787,78 @@ class Worker:
         """
         if worker_id < 0 or worker_id >= len(self._chip_shms):
             raise IndexError(f"worker_id {worker_id} out of range (have {len(self._chip_shms)} chips)")
+
+    def wse_configuration(self) -> dict:
+        """Return the effective WSE device specification and its supported limits."""
+        if self.level != 2:
+            raise TypeError("WSE configuration requires a direct L2 Worker")
+        with self._operation_lease("wse_configuration"), self._device_control_admission("wse_configuration"):
+            assert self._chip_worker is not None
+            values = self._chip_worker.sram_query(0xFFFFFFFF)
+        return {
+            "hardware": {"core_count": values[0], "pe_per_core": values[1], "sram_bytes_per_core": list(values[4::2])},
+            "runtime": {"sram_reserve_bytes_per_core": list(values[5::2])},
+            "limits": {"max_core_count": values[2]},
+            "frozen": bool(values[3]),
+        }
+
+    def configure_wse(self, config: dict | str | os.PathLike) -> None:
+        """Configure an unused WSE device from JSON or explicit field overrides."""
+        current = self.wse_configuration()
+        cores, pes, capacities, reserves = normalize_config(config, current)
+        with self._operation_lease("configure_wse"), self._device_control_admission("configure_wse"):
+            assert self._chip_worker is not None
+            self._chip_worker.configure_wse(cores, pes, capacities, reserves)
+
+    def sram_info(self, core_id: int) -> dict:
+        """Inspect one WSE core's physical capacity and live application/runtime usage."""
+        if self.level != 2:
+            raise TypeError("SRAM query requires a direct L2 Worker")
+        if type(core_id) is not int or not 0 <= core_id < 0xFFFFFFFF:
+            raise ValueError("invalid SRAM core_id")
+        with self._operation_lease("sram_info"), self._device_control_admission("sram_info"):
+            assert self._chip_worker is not None
+            values = self._chip_worker.sram_query(core_id)
+        names = (
+            "base",
+            "capacity_bytes",
+            "runtime_reserve_bytes",
+            "application_used_bytes",
+            "application_free_bytes",
+            "largest_free_bytes",
+            "runtime_used_bytes",
+        )
+        return {name: int(value) for name, value in zip(names, values, strict=True)}
+
+    def malloc_sram(self, size: int, *, core_id: int, alignment: int = 64) -> Buffer:
+        """Allocate a caller-owned buffer in one WSE core's SRAM application partition."""
+        if self.level != 2:
+            raise TypeError("SRAM allocation requires a direct L2 Worker")
+        if any(type(v) is not int for v in (size, core_id, alignment)) or size <= 0 or core_id < 0:
+            raise ValueError("invalid SRAM size/core/alignment")
+        if alignment <= 0 or alignment & (alignment - 1):
+            raise ValueError("SRAM alignment must be a positive power of two")
+        with self._operation_lease("malloc_sram"), self._device_control_admission("malloc_sram"):
+            identity = self._burn_buffer_identity()
+            assert self._chip_worker is not None
+            with self._child_prov_lock:
+                ptr = int(self._chip_worker.malloc_sram(size, core_id, alignment))
+                try:
+                    handle = wrap_device_malloc(
+                        ptr,
+                        size,
+                        bytes(identity.owner_instance_id),
+                        int(identity.buffer_id),
+                        f"L{self.level}",
+                        generation=int(identity.generation),
+                        owner_worker_id=0,
+                    )
+                    self._record_device_alloc(handle)
+                except BaseException:
+                    self._drop_device_alloc(identity)
+                    self._chip_worker.free(ptr)
+                    raise
+        return handle
 
     def malloc(self, size: int) -> Buffer:
         """Allocate device memory on this L2 worker's own chip; returns a DEVICE_MALLOC ``Buffer``.

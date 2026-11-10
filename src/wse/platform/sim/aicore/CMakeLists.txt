@@ -65,7 +65,7 @@ target_compile_options(aicore_kernel
     PRIVATE
         -Wall
         -Wextra
-        -std=c++17
+        -std=c++23
         -fPIC
         -O3
         -g

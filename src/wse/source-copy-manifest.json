@@ -13,8 +13,8 @@
       "source": "src/a5/platform/include/common/platform_config.h",
       "destination": "src/wse/platform/include/common/platform_config.h",
       "baseline_sha256": "aa440b6160cd05363cd5a44ee059d725d15d1ca2e018082abd7ef1c49d4e1dd2",
-      "sha256": "7400556177295393c5c6c411ea90f79ca1b7950e2043241e311adc7b5748ecea",
-      "reason": "derived WSE implementation; common Host layout declarations retained where required",
+      "sha256": "492335fcb8e1fda2e94f70c3af733a477c570a9bdea8f64a71d63640e49bac41",
+      "reason": "derived WSE implementation with configurable topology and finite SRAM execution",
       "step00_sha256": "aa440b6160cd05363cd5a44ee059d725d15d1ca2e018082abd7ef1c49d4e1dd2"
     },
     {
@@ -56,24 +56,24 @@
       "source": "src/a5/platform/sim/aicore/CMakeLists.txt",
       "destination": "src/wse/platform/sim/aicore/CMakeLists.txt",
       "baseline_sha256": "2cdd38508c98dfd0996bd6becdf9b49e47e6e15a683b6adc9e822a31bc2df8dc",
-      "sha256": "e65a4aa0859a931df379284429556cc207aab096740b00e77380699cc1acce63",
-      "reason": "derived WSE implementation; common Host layout declarations retained where required",
+      "sha256": "120197d8c807f07f49b1ec427fd855b7c008c52023b27f0e1359d2d169739ea6",
+      "reason": "derived WSE implementation with configurable topology and finite SRAM execution",
       "step00_sha256": "2cdd38508c98dfd0996bd6becdf9b49e47e6e15a683b6adc9e822a31bc2df8dc"
     },
     {
       "source": "src/a5/platform/sim/host/CMakeLists.txt",
       "destination": "src/wse/platform/sim/host/CMakeLists.txt",
       "baseline_sha256": "151b633d524e4c0c801228470b77785d00f6c9a5356d0cb9073e3cba9a464372",
-      "sha256": "91297d588f969c6c65fba083868075c0c21d3a987ca7c394e88ae744708e23f1",
-      "reason": "derived WSE implementation; common Host layout declarations retained where required",
+      "sha256": "c298a2acbc1d355dc6225b9ffffbb0fb055c7d2a7ca6d3362ad24e85ea3de49f",
+      "reason": "derived WSE implementation with configurable topology and finite SRAM execution",
       "step00_sha256": "8de42b1238031388e60806b167afdff810e4bd182bc5d3def71f001d9f217c21"
     },
     {
       "source": "src/a5/platform/sim/host/device_runner.cpp",
       "destination": "src/wse/platform/sim/host/device_runner.cpp",
       "baseline_sha256": "620853d3e8e64d9021935b82921c5a1a8a3eb1bfe7fb4eb3922c38c914ff671e",
-      "sha256": "2817bca0aea7656676b919768e292b839de9b84d53f54ba8ca69eb562d372b79",
-      "reason": "derived WSE implementation; common Host layout declarations retained where required",
+      "sha256": "2caf090d6cd11490b9f79e56e022cf9e6a951eb05860f09ae584efe411b6fde7",
+      "reason": "derived WSE implementation with configurable topology and finite SRAM execution",
       "step00_sha256": "620853d3e8e64d9021935b82921c5a1a8a3eb1bfe7fb4eb3922c38c914ff671e",
       "step01_sha256": "865c801d8ee2201a672f6185a58586d57fc27c4bc627118fa3929692b7a1825a"
     },
@@ -81,8 +81,8 @@
       "source": "src/a5/platform/sim/host/device_runner.h",
       "destination": "src/wse/platform/sim/host/device_runner.h",
       "baseline_sha256": "54f7b460fe979734167abd8ababe9a6391ad25108ee20e4ef9716b10c010862f",
-      "sha256": "b89af637ecde5f21287d30ddb0dea3fd8ad23d1642f876ead3386282a7d8d387",
-      "reason": "derived WSE implementation; common Host layout declarations retained where required",
+      "sha256": "b1de5aae6503e99dbb45bfffca310132e1db022a81cd75e202805f72bb73ee54",
+      "reason": "derived WSE implementation with configurable topology and finite SRAM execution",
       "step00_sha256": "4d9a687a4b5a63e66089e4b7a1b89c10264287de4d045b36b192de2cd595d64d"
     },
     {
@@ -96,8 +96,8 @@
       "source": "src/a5/platform/sim/host/runtime_c_api.cpp",
       "destination": "src/wse/platform/sim/host/runtime_c_api.cpp",
       "baseline_sha256": "09c7ab9a3b4b7e76a4e4c55b7c070b1b17e168d2f12cf667135e01b5c5e88087",
-      "sha256": "5f4ff4570752088d1629e575e6d9234157db1f19dee91cdd9ebc60288d15a86b",
-      "reason": "derived WSE implementation; common Host layout declarations retained where required",
+      "sha256": "78be8eb1b46c9203df264a35098610d7a8d9e5634a92a8014829e4a300b86f67",
+      "reason": "derived WSE implementation with configurable topology and finite SRAM execution",
       "step00_sha256": "09c7ab9a3b4b7e76a4e4c55b7c070b1b17e168d2f12cf667135e01b5c5e88087"
     },
     {
@@ -113,8 +113,8 @@
       "source": "src/a5/runtime/host_build_graph/common/intrinsic.h",
       "destination": "src/wse/runtime/host_build_graph/common/intrinsic.h",
       "baseline_sha256": "8ccb073100c82a353e372cafade7671b30e77e3b058e95a85eaacadebb153cf3",
-      "sha256": "5d7786e667c9e03664e3f3d45296818ef44d8768b7b44fb707e0005dd0c6f20f",
-      "reason": "derived WSE implementation; common Host layout declarations retained where required",
+      "sha256": "c66604154c424f6c8d225e1b350d11a67d48588851c3ab766f37ee4cc9f9220d",
+      "reason": "derived WSE implementation with configurable topology and finite SRAM execution",
       "step00_sha256": "8ccb073100c82a353e372cafade7671b30e77e3b058e95a85eaacadebb153cf3",
       "step01_sha256": "bb51c732944266e291d5c32b8fb36fbbc652dceb01baf9691151ee53d496efd7"
     },

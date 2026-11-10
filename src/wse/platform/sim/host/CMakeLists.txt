@@ -45,6 +45,7 @@ set(HOST_RUNTIME_SOURCES "")
 list(APPEND HOST_RUNTIME_SOURCES ${SIMPLER_HOST_LOG_SOURCES})
 list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/device_runner.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/sram_storage.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/profiling_copy.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime_c_api.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/platform_compile_info.cpp"
@@ -81,6 +82,8 @@ endif()
 
 # Create shared library
 add_library(host_runtime SHARED ${HOST_RUNTIME_SOURCES})
+include("${SIMPLER_CMAKE_DIR}/wse_hardware.cmake")
+simpler_configure_wse_hardware(host_runtime)
 include("${SIMPLER_CMAKE_DIR}/profiling_config.cmake")
 simpler_configure_profiling(host_runtime)
 

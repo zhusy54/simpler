@@ -372,6 +372,11 @@ public:
     size_t unobserved_completed_run_count() const noexcept;
     size_t unobserved_completed_run_high_water() const noexcept;
 
+    void configure_wse(
+        uint32_t cores, uint32_t pes, const std::vector<uint64_t> &capacities, const std::vector<uint64_t> &reserves
+    );
+    uint64_t malloc_sram(size_t bytes, uint32_t core, size_t alignment);
+    std::vector<uint64_t> sram_query(uint32_t core);
     uint64_t malloc(size_t size);
     void free(uint64_t ptr);
     void copy_to(uint64_t dst, uint64_t src, size_t size);

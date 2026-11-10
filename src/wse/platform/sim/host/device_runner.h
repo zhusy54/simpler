@@ -12,10 +12,17 @@
 #include "device_runner_base.h"
 #include "sim_run_completion.h"
 #include "wse_launch.h"
+#include "sram_storage.h"
 
 class DeviceRunner : public SimDeviceRunnerBase {
 public:
     DeviceRunner();
+    void configure_sram(uint32_t cores, uint32_t pes, const uint64_t *capacities, const uint64_t *reserves);
+    void *allocate_sram(size_t bytes, uint32_t core, size_t alignment);
+    std::vector<uint64_t> sram_query(uint32_t core) const;
+    void free_tensor(void *ptr) override;
+    int copy_to_device(void *ptr, const void *host, size_t bytes) override;
+    int copy_from_device(void *host, const void *ptr, size_t bytes) override;
     ~DeviceRunner() override;
     const char *cpu_sim_target_family() const override { return "wsesim"; }
     int prepare_launch_shape(Runtime &, const CallConfig &) override;
@@ -34,6 +41,7 @@ private:
     int invoke_device_register(const RegisterCallableArgs &) override { return PTO_RUNTIME_ERR_UNSUPPORTED; }
     void cleanup_run() noexcept;
     void unload_executor();
+    wse::SramStorage sram_;
     struct ActiveRun;
     std::unique_ptr<ActiveRun> active_run_;
     simpler::common::sim_host::SimRunCompletion completion_;
@@ -42,4 +50,7 @@ private:
     decltype(&wse_execute_pe) execute_pe_{nullptr};
     decltype(&wse_run_events) run_events_{nullptr};
     decltype(&wse_completed_tasks) completed_tasks_{nullptr};
+    decltype(&wse_runtime_used) runtime_used_{nullptr};
+    decltype(&wse_memory_sections) memory_sections_{nullptr};
+    decltype(&wse_control_address) control_address_{nullptr};
 };

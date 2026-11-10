@@ -45,6 +45,8 @@ struct GlobalContext {
     int32_t core_id;
     int32_t pe_id;
     wse::OperationTrace operation_trace;
+    uint64_t sram_base;
+    uint64_t sram_access_offset;
 };
 
 struct AsyncCtx {

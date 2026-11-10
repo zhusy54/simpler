@@ -4123,6 +4123,9 @@ NB_MODULE(_task_interface, m) {
             },
             "Return the ACL_HBM_MEM free/total byte snapshot for this worker's device."
         )
+        .def("configure_wse", &ChipWorker::configure_wse)
+        .def("malloc_sram", &ChipWorker::malloc_sram)
+        .def("sram_query", &ChipWorker::sram_query)
         .def("malloc", &ChipWorker::malloc, nb::arg("size"))
         .def("free", &ChipWorker::free, nb::arg("ptr"))
         .def("copy_to", &ChipWorker::copy_to, nb::arg("dst"), nb::arg("src"), nb::arg("size"))

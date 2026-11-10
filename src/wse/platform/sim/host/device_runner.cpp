@@ -39,17 +39,50 @@ struct DeviceRunner::ActiveRun {
 DeviceRunner::DeviceRunner() = default;
 DeviceRunner::~DeviceRunner() { finalize(); }
 void DeviceRunner::arm_host_dep_gen_capture(bool enabled) { dep_gen_host_graph_set_enabled(enabled); }
+void DeviceRunner::configure_sram(uint32_t cores, uint32_t pes, const uint64_t *capacities, const uint64_t *reserves) {
+    sram_.configure(cores, pes, capacities, reserves);
+}
+void *DeviceRunner::allocate_sram(size_t bytes, uint32_t core, size_t alignment) {
+    auto *ptr = sram_.allocate(bytes, core, alignment);
+    try {
+        caller_device_buffers_.record(ptr, bytes);
+    } catch (...) {
+        sram_.release(ptr);
+        throw;
+    }
+    return ptr;
+}
+std::vector<uint64_t> DeviceRunner::sram_query(uint32_t core) const {
+    return core == UINT32_MAX ? sram_.configuration() : sram_.info(core);
+}
+void DeviceRunner::free_tensor(void *ptr) {
+    if (sram_.touches(reinterpret_cast<uint64_t>(ptr), 1)) sram_.release(ptr);
+    else SimDeviceRunnerBase::free_tensor(ptr);
+}
+int DeviceRunner::copy_to_device(void *ptr, const void *host, size_t bytes) {
+    if (sram_.touches(reinterpret_cast<uint64_t>(ptr), bytes))
+        sram_.check_application(reinterpret_cast<uint64_t>(ptr), bytes);
+    return SimDeviceRunnerBase::copy_to_device(ptr, host, bytes);
+}
+int DeviceRunner::copy_from_device(void *host, const void *ptr, size_t bytes) {
+    if (sram_.touches(reinterpret_cast<uint64_t>(ptr), bytes))
+        sram_.check_application(reinterpret_cast<uint64_t>(ptr), bytes);
+    return SimDeviceRunnerBase::copy_from_device(host, ptr, bytes);
+}
 
 int DeviceRunner::prepare_launch_shape(Runtime &runtime, const CallConfig &config) {
-    const int cores = config.core_count == 0 ? WSE_DEFAULT_CORE_COUNT : config.core_count;
-    if (cores < 1 || cores > static_cast<int>(WSE_DEFAULT_CORE_COUNT) || config.aicpu_thread_num != 0) {
-        LOG_ERROR("WSE requires core_count in [1,40] (0 defaults to 40) and no AICPU threads");
+    const int cores = config.core_count == 0 ? sram_.core_count() : config.core_count;
+    if (cores < 1 || cores > static_cast<int>(sram_.core_count()) || config.aicpu_thread_num != 0) {
+        LOG_ERROR(
+            "WSE core_count exceeds configured device (%u cores), or AICPU threads requested", sram_.core_count()
+        );
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     if (config.enable_chip_swimlane || config.enable_dump_args || config.enable_pmu || config.enable_scope_stats) {
         LOG_ERROR("WSE exposes PE events through output_prefix; legacy device diagnostic collectors are unsupported");
         return PTO_RUNTIME_ERR_UNSUPPORTED;
     }
+    sram_.freeze();
     block_dim_ = cores;
     worker_count_ = cores * WSE_PE_PER_CORE;
     runtime.set_worker_count(worker_count_);
@@ -79,7 +112,11 @@ int DeviceRunner::ensure_binaries_loaded() {
     execute_pe_ = reinterpret_cast<decltype(execute_pe_)>(dlsym(aicore_so_handle_, "wse_execute_pe"));
     run_events_ = reinterpret_cast<decltype(run_events_)>(dlsym(aicore_so_handle_, "wse_run_events"));
     completed_tasks_ = reinterpret_cast<decltype(completed_tasks_)>(dlsym(aicore_so_handle_, "wse_completed_tasks"));
-    if (!create_run_ || !destroy_run_ || !execute_pe_ || !run_events_ || !completed_tasks_) {
+    runtime_used_ = reinterpret_cast<decltype(runtime_used_)>(dlsym(aicore_so_handle_, "wse_runtime_used"));
+    memory_sections_ = reinterpret_cast<decltype(memory_sections_)>(dlsym(aicore_so_handle_, "wse_memory_sections"));
+    control_address_ = reinterpret_cast<decltype(control_address_)>(dlsym(aicore_so_handle_, "wse_control_address"));
+    if (!create_run_ || !destroy_run_ || !execute_pe_ || !run_events_ || !completed_tasks_ || !runtime_used_ ||
+        !control_address_) {
         LOG_ERROR("WSE PE runtime is missing a required entry point");
         unload_executor();
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -103,8 +140,21 @@ int DeviceRunner::prepare_execution(
         reinterpret_cast<const WseGraphDescriptor *>(runtime.dev.scheduler_bootstrap.worker_context_base);
     auto run = std::make_unique<ActiveRun>();
     run->threads.reserve(prepared->num_aicore);
-    run->state = create_run_(descriptor, prepared->num_aicore / WSE_PE_PER_CORE, identity.run_epoch);
-    if (!run->state) return PTO_RUNTIME_ERR_INTERNAL;
+    const auto regions = sram_.regions();
+    const auto allocations = sram_.allocations();
+    char error[512]{};
+    run->state = create_run_(
+        descriptor, prepared->num_aicore / WSE_PE_PER_CORE, identity.run_epoch, regions.data(), regions.size(),
+        allocations.data(), allocations.size(), error, sizeof(error)
+    );
+    if (!run->state) {
+        LOG_ERROR("WSE SRAM run admission rejected: %s", error);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    std::vector<uint64_t> used;
+    for (uint32_t core = 0; core < regions.size(); ++core)
+        used.push_back(runtime_used_(run->state, core));
+    sram_.set_runtime_used(used);
     run->epoch = identity.run_epoch;
     run->expected = descriptor->expected_tasks;
     active_run_ = std::move(run);
@@ -187,6 +237,29 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
             }
         }
         if (!trace) return DrainOutcome::device_complete(PTO_RUNTIME_ERR_INTERNAL);
+        std::ofstream memory(std::filesystem::path(config.output_prefix) / "wse_sram.json");
+        memory << "{\"configuration\":[";
+        const auto effective = sram_.configuration();
+        for (size_t i = 0; i < effective.size(); ++i)
+            memory << (i ? "," : "") << effective[i];
+        memory << "],\"cores\":[";
+        for (uint32_t core = 0; core < sram_.core_count(); ++core) {
+            const auto info = sram_.info(core);
+            memory << (core ? "," : "") << "{\"owner\":" << core << ",\"base\":" << info[0]
+                   << ",\"capacity\":" << info[1] << ",\"reserve\":" << info[2] << ",\"application_used\":" << info[3]
+                   << ",\"runtime_used\":" << info[6]
+                   << ",\"control_address\":" << control_address_(active_run_->state, core) << "}";
+        }
+        memory << "],\"sections\":[";
+        uint64_t section_count = 0;
+        const auto *sections = memory_sections_(active_run_->state, &section_count);
+        for (uint64_t i = 0; i < section_count; ++i) {
+            const auto &section = sections[i];
+            memory << (i ? "," : "") << "{\"owner\":" << section.owner << ",\"kind\":" << section.kind
+                   << ",\"address\":" << section.address << ",\"bytes\":" << section.bytes << "}";
+        }
+        memory << "]}";
+        if (!memory) return DrainOutcome::device_complete(PTO_RUNTIME_ERR_INTERNAL);
     }
     return DrainOutcome::device_complete(0);
 }
@@ -196,6 +269,7 @@ void DeviceRunner::cleanup_run() noexcept {
     active_run_->join();
     destroy_run_(active_run_->state);
     active_run_.reset();
+    sram_.reset_runtime_used();
 }
 void DeviceRunner::abandon_prepared_execution(PreparedExecution &) noexcept {
     completion_.abandon();
@@ -209,6 +283,9 @@ void DeviceRunner::unload_executor() {
     execute_pe_ = nullptr;
     run_events_ = nullptr;
     completed_tasks_ = nullptr;
+    runtime_used_ = nullptr;
+    memory_sections_ = nullptr;
+    control_address_ = nullptr;
     if (!aicore_so_path_.empty()) std::remove(aicore_so_path_.c_str());
     aicore_so_path_.clear();
 }
@@ -251,6 +328,7 @@ int DeviceRunner::finalize() {
         dma_workspace_addr_[kind] = 0;
     }
 
+    sram_.clear();
     mem_alloc_.finalize();
     clear_cpu_sim_shared_storage();
 

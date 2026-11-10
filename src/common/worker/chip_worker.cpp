@@ -2436,6 +2436,45 @@ void ChipWorker::require_comm_reclamation_safe() const {
     }
 }
 
+void ChipWorker::configure_wse(
+    uint32_t cores, uint32_t pes, const std::vector<uint64_t> &capacities, const std::vector<uint64_t> &reserves
+) {
+    if (!initialized_) throw std::runtime_error("ChipWorker is not initialized");
+    validate_execution_context();
+    using Fn = int (*)(void *, uint32_t, uint32_t, const uint64_t *, const uint64_t *, char *, size_t);
+    auto fn = runtime_module_->optional<Fn>("wse_configure_ctx");
+    if (!fn) throw std::runtime_error("hardware configuration requires WSEsim");
+    if (capacities.size() != cores || reserves.size() != cores)
+        throw std::invalid_argument("WSE per-core configuration shape");
+    char error[512]{};
+    if (fn(device_ctx_, cores, pes, capacities.data(), reserves.data(), error, sizeof(error)) != 0)
+        throw std::runtime_error(error);
+}
+uint64_t ChipWorker::malloc_sram(size_t bytes, uint32_t core, size_t alignment) {
+    if (!initialized_) throw std::runtime_error("ChipWorker is not initialized");
+    validate_execution_context();
+    using Fn = int (*)(void *, size_t, uint32_t, size_t, uint64_t *, char *, size_t);
+    auto fn = runtime_module_->optional<Fn>("wse_malloc_sram_ctx");
+    if (!fn) throw std::runtime_error("SRAM allocation requires WSEsim");
+    uint64_t ptr = 0;
+    char error[512]{};
+    if (fn(device_ctx_, bytes, core, alignment, &ptr, error, sizeof(error)) != 0) throw std::runtime_error(error);
+    return ptr;
+}
+std::vector<uint64_t> ChipWorker::sram_query(uint32_t core) {
+    if (!initialized_) throw std::runtime_error("ChipWorker is not initialized");
+    validate_execution_context();
+    using Fn = int (*)(void *, uint32_t, uint64_t *, size_t, char *, size_t);
+    auto fn = runtime_module_->optional<Fn>("wse_sram_query_ctx");
+    if (!fn) throw std::runtime_error("SRAM query requires WSEsim");
+    char error[512]{};
+    const int count = fn(device_ctx_, core, nullptr, 0, error, sizeof(error));
+    if (count < 0) throw std::runtime_error(error);
+    std::vector<uint64_t> result(count);
+    if (fn(device_ctx_, core, result.data(), result.size(), error, sizeof(error)) < 0) throw std::runtime_error(error);
+    return result;
+}
+
 uint64_t ChipWorker::malloc(size_t size) {
     if (!initialized_) {
         throw std::runtime_error("ChipWorker not initialized; call init() first");

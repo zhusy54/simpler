@@ -388,11 +388,12 @@ independent PEs. The examples in `tests/st/wse/host_build_graph/counter` exercis
 this with producer/consumer acknowledgement before either task can finish.
 There is no counter allocation service or scheduler change. The CPU semantics
 apply within one simulated device/process and do not certify remote hardware
-atomics. Application/Runtime SRAM partitioning and control-state placement remain
-future Local SRAM work.
+atomics. Explicit SRAM buffers use the same counter operations and lifetime protection.
+See [WSE SRAM and hardware configuration](wse-sram.md) for allocation and capacity contracts.
 
-The implementation does not model SRAM capacity, four-PE collectives,
-hardware pipeline timing, or execution-fault recovery. Only `host_build_graph`
+The implementation accounts for application SRAM and resident execution/control data.
+Device program/stack storage, physical Tile capacity, hardware pipeline timing,
+and execution-fault recovery are not modeled. Only `host_build_graph`
 is supported; there is no WSE onboard or TMR target and no SuperScalarModel/Linx
 dependency.
 
