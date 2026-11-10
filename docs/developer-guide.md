@@ -357,6 +357,40 @@ operation semantics while keeping scheduling, graph completion and resource
 ownership in simpler. PR #418 is reference-only and is not incorporated.
 Kernel cache identity hashes the backend headers and retains the target family and PTO pin.
 
+Kernels including `<wse/counter_ops.h>` can signal and poll application-owned
+contiguous `UINT64` buffers. Include `counter_args.h` to adapt a runtime Tensor
+with `wse::make_counter_view(tensor, view)`; it returns `CounterStatus::OK` or
+`INVALID_ARGUMENT` and checks dtype, one-dimensional shape, unit stride,
+element offset, byte extent and atomic alignment without dereferencing memory.
+The view borrows the allocation; it cannot validate forged or dangling pointers.
+
+`counter_signal(view, index, delta=1)` atomically adds a positive delta and
+returns `status`, `old_value` and `new_value`. Zero delta and invalid views return
+`INVALID_ARGUMENT`; overflow returns `OVERFLOW` without wrapping or modifying
+the word. `counter_poll(view, index, target, max_reads=1)` performs at most the
+specified number of acquire reads and returns `READY` when `observed >= target`,
+otherwise `NOT_READY`. A zero read budget is invalid. This is a read-count budget,
+not an elapsed timeout or a cancellation mechanism; no operation throws.
+
+Initialize live uint64_t objects through existing Host copies before submission.
+During concurrent use, access each counter only through the atomic operations.
+Producers write disjoint payloads before signal; consumers read after READY.
+The CPU backend uses acq_rel CAS and acquire loads. For repeated rounds use
+checked cumulative targets, and a separate application ack counter before
+reusing payload storage. Keep buffers alive until execution drains; a Host wait
+timeout does not permit reset or free. Concurrent runs use disjoint counter
+ranges; reset a reused range only after its previous users have exited.
+
+Counters do not update Runtime task completion or SharedTile generations.
+Cross-Kernel concurrent protocols must declare actual read/write arguments and
+explicit manual dependencies; the caller must ensure producers can run on
+independent PEs. The examples in `tests/st/wse/host_build_graph/counter` exercise
+this with producer/consumer acknowledgement before either task can finish.
+There is no counter allocation service or scheduler change. The CPU semantics
+apply within one simulated device/process and do not certify remote hardware
+atomics. Application/Runtime SRAM partitioning and control-state placement remain
+future Local SRAM work.
+
 The implementation does not model SRAM capacity, four-PE collectives,
 hardware pipeline timing, or execution-fault recovery. Only `host_build_graph`
 is supported; there is no WSE onboard or TMR target and no SuperScalarModel/Linx
