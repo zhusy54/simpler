@@ -12,24 +12,26 @@
 #include <stdexcept>
 namespace {
 void layer(const GraphTaskArgs &a) {
+    WseLaunchSpec launch;
+    launch.thread_num = 4;
     CoreTaskArgs first;
     first.add_input(a.tensor(0).ref());
     first.add_input(a.tensor(1).ref());
     first.add_output(a.tensor(3).ref());
     first.add_output(a.tensor(6).ref());
-    first.launch_spec.set_block_num(160);
-    rt_submit_wse_task(0, first);
+    first.launch_spec.set_block_num(40);
+    rt_submit_wse_task(0, first, launch);
     CoreTaskArgs relu;
     relu.add_input(a.tensor(3).ref());
     relu.add_output(a.tensor(4).ref());
-    relu.launch_spec.set_block_num(160);
-    rt_submit_wse_task(1, relu);
+    relu.launch_spec.set_block_num(40);
+    rt_submit_wse_task(1, relu, launch);
     CoreTaskArgs second;
     second.add_input(a.tensor(4).ref());
     second.add_input(a.tensor(2).ref());
     second.add_output(a.tensor(5).ref());
-    second.launch_spec.set_block_num(160);
-    rt_submit_wse_task(2, second);
+    second.launch_spec.set_block_num(40);
+    rt_submit_wse_task(2, second, launch);
 }
 }  // namespace
 extern "C" OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &) { return {.expected_arg_count = 7}; }

@@ -14,6 +14,7 @@
 #include <stdint.h>
 
 #include "wse/operation_trace.h"
+#include "wse/block_scope.h"
 
 #include "aicore_completion_mailbox_types.h"
 #include "host_build_graph/task_id.h"
@@ -81,6 +82,9 @@ struct LocalContext {
     int32_t block_num;  // Original logical block count, including multi-wave execution.
                         // NOT the same as RUNTIME_CONFIG.block_dim in kernel_config.py,
                         // which controls how many physical cores the runtime launches.
+    int32_t thread_idx;
+    int32_t thread_num;
+    wse::BlockScope block_scope;
     AsyncCtx async_ctx;
 };
 
@@ -124,4 +128,14 @@ static __aicore__ inline int32_t get_block_num(__gm__ int64_t *args) {
 
 static inline wse::OperationTrace get_wse_operation_trace(int64_t *args) {
     return reinterpret_cast<GlobalContext *>(args[SPMD_GLOBAL_CONTEXT_INDEX])->operation_trace;
+}
+
+static inline int32_t get_thread_idx(int64_t *args) {
+    return reinterpret_cast<LocalContext *>(args[SPMD_LOCAL_CONTEXT_INDEX])->thread_idx;
+}
+static inline int32_t get_thread_num(int64_t *args) {
+    return reinterpret_cast<LocalContext *>(args[SPMD_LOCAL_CONTEXT_INDEX])->thread_num;
+}
+static inline wse::BlockScope get_wse_block_scope(int64_t *args) {
+    return reinterpret_cast<LocalContext *>(args[SPMD_LOCAL_CONTEXT_INDEX])->block_scope;
 }

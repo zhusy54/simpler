@@ -58,8 +58,8 @@ def audit_events(path, cores, blocks):
     assert by_kind[10][0]["seq"] < min(e["seq"] for e in by_kind[7])
     assert len(by_kind[7]) == 4 * cores and len(by_kind[8]) == cores
     assert max(e["seq"] for e in by_kind[8]) < by_kind[9][0]["seq"]
-    if blocks >= cores * 4:
-        assert {(e["core"], e["pe"]) for e in by_kind[4]} == {(c, p) for c in range(cores) for p in range(4)}
+    if blocks >= cores:
+        assert {(e["core"], e["pe"]) for e in by_kind[4]} == {(c, 0) for c in range(cores)}
 
 
 @pytest.mark.parametrize(
@@ -96,8 +96,7 @@ def test_mixed_entry_and_independent_blocks(tmp_path, cores, blocks, st_platform
         identities = tensors[3].to(torch.int64)
         assert torch.all((identities[:, 0] >= 0) & (identities[:, 0] < actual_cores))
         assert torch.all((identities[:, 1] >= 0) & (identities[:, 1] < 4))
-        if blocks >= actual_cores * 4:
-            assert len(set(map(tuple, identities.tolist()))) == actual_cores * 4
+        assert identities.tolist() == [[b % actual_cores, 0] for b in range(blocks)]
         audit_events(tmp_path / "wse_events.jsonl", actual_cores, blocks)
         for buffer in buffers:
             worker.free(buffer)
@@ -163,9 +162,8 @@ def test_graph_record_replay_and_rebinding(tmp_path, cores, st_platform):
             for shell in range(3):
                 enter, child, exit_node = shell * 3, shell * 3 + 1, shell * 3 + 2
                 child_begins = [row["seq"] for row in rows[1:] if row["kind"] == 4 and row["task"] == child]
-                exit_begin = next(row["seq"] for row in rows[1:] if row["kind"] == 4 and row["task"] == exit_node)
                 assert done[enter] < min(child_begins)
-                assert done[child] < exit_begin
+                assert done[child] < done[exit_node]
         assert epochs[0] != epochs[1]
         worker.unregister(handle)
     finally:

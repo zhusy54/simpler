@@ -8,16 +8,5 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-#include "orchestration_api.h"
-#include <stdexcept>
-extern "C" OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &) { return {.expected_arg_count = 2}; }
-extern "C" void aicpu_orchestration_entry(const ChipTaskArgs &a) {
-    if (rt_available_core_count() != 40) throw std::invalid_argument("probe requires forty cores");
-    CoreTaskArgs producer;
-    producer.add_input(a.tensor(0).ref());
-    rt_submit_wse_task(0, producer);
-    CoreTaskArgs consumer;
-    consumer.add_output(a.tensor(1).ref());
-    consumer.launch_spec.set_block_num(160);
-    rt_submit_wse_task(1, consumer);
-}
+#include "shared_block.h"
+extern "C" void kernel_entry(int64_t *args) { shared_block_compute(args, get_thread_idx(args) == 0); }

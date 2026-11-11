@@ -1,6 +1,6 @@
 {
   "baseline": "c1c234667d54f4aea1582249448b24f9a08753f6",
-  "semantics": "independent-wse-pe-with-temporary-fp32-operations-and-explicit-pinned-a5-compatibility",
+  "semantics": "wse-static-aicore-blocks-with-local-pe-threads-and-temporary-fp32-operations",
   "files": [
     {
       "source": "src/a5/platform/include/common/kernel_args.h",
@@ -113,8 +113,8 @@
       "source": "src/a5/runtime/host_build_graph/common/intrinsic.h",
       "destination": "src/wse/runtime/host_build_graph/common/intrinsic.h",
       "baseline_sha256": "8ccb073100c82a353e372cafade7671b30e77e3b058e95a85eaacadebb153cf3",
-      "sha256": "c66604154c424f6c8d225e1b350d11a67d48588851c3ab766f37ee4cc9f9220d",
-      "reason": "derived WSE implementation with configurable topology and finite SRAM execution",
+      "sha256": "547bd7a6a1b1e41208365bb287e3212f6290715d2b58253ac1213ebacda58057",
+      "reason": "derived WSE implementation with static AICore Blocks, local PE Threads and finite SRAM execution",
       "step00_sha256": "8ccb073100c82a353e372cafade7671b30e77e3b058e95a85eaacadebb153cf3",
       "step01_sha256": "bb51c732944266e291d5c32b8fb36fbbc652dceb01baf9691151ee53d496efd7"
     },
@@ -123,7 +123,7 @@
       "destination": "src/wse/runtime/host_build_graph/host/native_graph_plan.cpp",
       "baseline_sha256": "e300c85f84a5ed48ecd798ba4b7f61f4c5bf9ec4caa78b6e5c8e513849a6f6e7",
       "sha256": "50d7ba75dbf21a7912dc349867b6f00e2497ff32b694b6f7c3ea3deb2098d797",
-      "reason": "derived WSE implementation; common Host layout declarations retained where required"
+      "reason": "derived WSE implementation with static AICore Blocks, local PE Threads and finite SRAM execution"
     },
     {
       "source": "src/a5/runtime/host_build_graph/host/native_graph_plan.h",
@@ -143,8 +143,8 @@
       "source": "src/a5/runtime/host_build_graph/host/runtime_maker.cpp",
       "destination": "src/wse/runtime/host_build_graph/host/runtime_maker.cpp",
       "baseline_sha256": "f9a3d1817a6068f12f2097c8f85818a8a3e28a2027024de5354479b2fed56660",
-      "sha256": "1130c3cf18c1de9f30f686f2529db9a820bd7200a7a4157cbe30d38f33664f72",
-      "reason": "derived WSE implementation; common Host layout declarations retained where required",
+      "sha256": "9685acd165a6270c4c968193ff45e9cc8a370bebdb45c59bb4b78361919d237d",
+      "reason": "derived WSE implementation with static AICore Blocks, local PE Threads and finite SRAM execution",
       "step00_sha256": "f9a3d1817a6068f12f2097c8f85818a8a3e28a2027024de5354479b2fed56660"
     },
     {

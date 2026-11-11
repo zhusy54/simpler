@@ -18,18 +18,27 @@
 inline constexpr uint32_t WSE_PE_PER_CORE = wse::PE_PER_CORE;
 
 // Immutable host-published image. Mutable scheduling state belongs to the PE runtime.
+struct WseBlockPlan {
+    uint32_t core_id, thread_num;
+    uint32_t thread_pes[WSE_PE_PER_CORE];
+    uint32_t tensor_count, scalar_count;
+    uint64_t tensors_offset, scalars_offset;
+};
+
 struct WseNodePlan {
     uint64_t entry;
     uint32_t blocks;
     uint32_t host_done;
     uint32_t has_predicate;
-    uint32_t reserved;
+    uint32_t block_plan_count;
+    uint64_t block_plans_offset;
 };
 
 struct WseGraphDescriptor {
     SchedulerGraphView graph;
     uint64_t nodes_address;
     uint64_t expected_tasks;
+    uint64_t descriptor_bytes;
 };
 
 enum class WseEventKind : uint32_t {
@@ -48,7 +57,9 @@ enum class WseEventKind : uint32_t {
     OP_PUBLISH,
     OP_WAIT,
     OP_READ,
-    OP_CONSUMED
+    OP_CONSUMED,
+    THREAD_BEGIN,
+    THREAD_END
 };
 struct WseEvent {
     uint64_t sequence;

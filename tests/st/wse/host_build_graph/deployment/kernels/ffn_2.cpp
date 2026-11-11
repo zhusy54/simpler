@@ -8,5 +8,5 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-#include "cross_dso_body.h"
-extern "C" void kernel_entry(int64_t *args) { cross_dso_compute(args, true); }
+#include "sram_ffn.h"
+extern "C" void kernel_entry(int64_t *args) { sram_ffn(args, 2); }

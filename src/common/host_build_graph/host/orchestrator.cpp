@@ -581,7 +581,7 @@ resolve_dispatch_predicate(OrchestratorState *orch, const CoreTaskPredicate &pre
 // Orch-side wiring/ready publication.
 static TaskOutputTensors submit_task_common(
     OrchestratorState *orch, const CoreTaskArgs &args, LaneMask active_mask, TaskAttrs task_attrs,
-    int32_t aic_kernel_id, int32_t aiv0_kernel_id, int32_t aiv1_kernel_id
+    int32_t aic_kernel_id, int32_t aiv0_kernel_id, int32_t aiv1_kernel_id, const DepInputs *dependencies = nullptr
 ) {
     ORCH_STEP_START();
     ORCH_PHASE_START();
@@ -638,6 +638,7 @@ static TaskOutputTensors submit_task_common(
         args.tensor_count(),       args.tensor_data(), args.tag_data(), static_cast<int32_t>(args.explicit_dep_count()),
         args.explicit_deps_data(),
     };
+    if (dependencies) dep_inputs = *dependencies;
     if (!append_explicit_fanins_or_fail(
             *orch, task_id, dep_inputs, fanin_slots, payload.fanin_count, capture_dep_graph
         )) {
@@ -764,7 +765,9 @@ static TaskOutputTensors submit_task_common(
     return result;
 }
 
-TaskOutputTensors OrchestratorState::submit_task(const MixedKernels &mixed_kernels, const CoreTaskArgs &args) {
+TaskOutputTensors OrchestratorState::submit_task(
+    const MixedKernels &mixed_kernels, const CoreTaskArgs &args, const DepInputs *dependencies
+) {
     if (!require_device_arguments(this, args)) return {};
     auto *orch = this;
 
@@ -846,13 +849,13 @@ TaskOutputTensors OrchestratorState::submit_task(const MixedKernels &mixed_kerne
     if (active_graph_recording(orch) != nullptr) {
         return graph_record_submit_sub_task(
             orch, args, active_mask, task_attrs, normalized.aic_kernel_id, normalized.aiv0_kernel_id,
-            normalized.aiv1_kernel_id
+            normalized.aiv1_kernel_id, dependencies
         );
     }
 
     return submit_task_common(
         orch, args, active_mask, task_attrs, normalized.aic_kernel_id, normalized.aiv0_kernel_id,
-        normalized.aiv1_kernel_id
+        normalized.aiv1_kernel_id, dependencies
     );
 }
 

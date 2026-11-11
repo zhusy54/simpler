@@ -76,6 +76,7 @@
 #include "host_build_graph/host/host_phase_trace.h"
 #include "host_build_graph/host/orchestrator.h"
 #include "host_build_graph/host/orch_ops.h"
+#include "wse_submission.h"
 #include "host_build_graph/host/ready_queue_sizing.h"
 #include "host_build_graph/host/graph_recorder_pool.h"
 #include "host_build_graph/runtime_core.h"
@@ -766,7 +767,8 @@ struct GraphHostStateBinding {
 
 bool create_scheduler_state(
     Runtime *runtime, const HostApi *api, SharedMemoryHandle &host_sm_handle, int32_t total_tasks,
-    uint64_t task_window_size, const sm_layout::SegmentOffsets &device_segments, NativeGraphHostPlan &native_plan
+    uint64_t task_window_size, const sm_layout::SegmentOffsets &device_segments, NativeGraphHostPlan &native_plan,
+    const WseLaunchRecords &launch_records
 ) {
     runtime->publish_scheduler_bootstrap(0, 0);
     if (total_tasks < 0 || task_window_size == 0 || static_cast<uint64_t>(total_tasks) > task_window_size) return false;
@@ -790,7 +792,53 @@ bool create_scheduler_state(
     const size_t descriptor_offset = graph_bytes;
     const size_t nodes_offset = descriptor_offset + sizeof(WseGraphDescriptor);
     if (count > (SIZE_MAX - nodes_offset) / sizeof(WseNodePlan)) return false;
-    const size_t bytes = nodes_offset + count * sizeof(WseNodePlan);
+    size_t bytes = nodes_offset + count * sizeof(WseNodePlan);
+    if (!native && !launch_records.definitions.empty()) {
+        LOG_ERROR("WSE per-Block Graph arguments require native Graph execution");
+        return false;
+    }
+    std::vector<const WseKernelLaunch *> launches(count);
+    auto reserve = [&](size_t size, size_t alignment) {
+        if (bytes > SIZE_MAX - alignment || size > SIZE_MAX - bytes - alignment)
+            throw std::overflow_error("WSE launch image overflow");
+        bytes = (bytes + alignment - 1) & ~(alignment - 1);
+        const auto offset = bytes - descriptor_offset;
+        bytes += size;
+        return offset;
+    };
+    std::vector<uint64_t> block_offsets(count);
+    std::vector<std::vector<WseBlockPlan>> block_plans(count);
+    for (uint64_t ref = 0; ref < count; ++ref) {
+        const std::unordered_map<uint32_t, WseKernelLaunch> *records = &launch_records.ordinary;
+        uint32_t index = ref;
+        if (native) {
+            const auto &binding = native_plan.bindings[ref];
+            index = binding.source_index;
+            if (binding.kind == SchedulerNodeKind::CHILD_KERNEL) {
+                const auto &instance = native_plan.instances[binding.instance_index];
+                const auto key = native_plan.definitions[instance.definition_index].definition.graph_key;
+                const auto found = launch_records.definitions.find(key);
+                if (found == launch_records.definitions.end()) continue;
+                records = &found->second;
+            } else if (binding.instance_index != SCHEDULER_NATIVE_NO_INSTANCE) {
+                continue;
+            }
+        }
+        const auto found = records->find(index);
+        if (found == records->end()) continue;
+        launches[ref] = &found->second;
+        const auto &blocks = found->second.blocks;
+        block_offsets[ref] = reserve(blocks.size() * sizeof(WseBlockPlan), alignof(WseBlockPlan));
+        for (const auto &block : blocks) {
+            auto plan = block.plan;
+            plan.tensors_offset =
+                reserve(block.tensors.size() * sizeof(simpler::hbg::Tensor), alignof(simpler::hbg::Tensor));
+            // Scalar values and boundary indices are adjacent within this WSE-only image.
+            plan.scalars_offset = reserve(block.scalars.size() * sizeof(uint64_t), alignof(uint64_t));
+            reserve(block.scalar_parameters.size() * sizeof(int32_t), alignof(int32_t));
+            block_plans[ref].push_back(plan);
+        }
+    }
     void *device = nullptr;
     void *host = nullptr;
     if (api->acquire_scheduler_state_storage(bytes, SCHEDULER_STATE_ALIGNMENT, &device, &host) != 0 || !device || !host)
@@ -831,6 +879,36 @@ bool create_scheduler_state(
         } else {
             plan.host_done = host_sm_handle.header->tasks.is_completed(original);
             control = host_sm_handle.header->tasks.get_slot_state_by_task_id(original).active_mask.is_empty();
+        }
+        if (launches[ref]) {
+            if (plan.host_done || control) return false;
+            const auto &blocks = launches[ref]->blocks;
+            plan.block_plan_count = blocks.size();
+            plan.block_plans_offset = block_offsets[ref];
+            auto *descriptor_bytes = static_cast<std::byte *>(host) + descriptor_offset;
+            std::memcpy(
+                descriptor_bytes + plan.block_plans_offset, block_plans[ref].data(),
+                blocks.size() * sizeof(WseBlockPlan)
+            );
+            for (size_t b = 0; b < blocks.size(); ++b) {
+                const auto &block = blocks[b];
+                const auto &wire = block_plans[ref][b];
+                if (!block.tensors.empty())
+                    std::memcpy(
+                        descriptor_bytes + wire.tensors_offset, block.tensors.data(),
+                        block.tensors.size() * sizeof(simpler::hbg::Tensor)
+                    );
+                if (!block.scalars.empty()) {
+                    std::memcpy(
+                        descriptor_bytes + wire.scalars_offset, block.scalars.data(),
+                        block.scalars.size() * sizeof(uint64_t)
+                    );
+                    std::memcpy(
+                        descriptor_bytes + wire.scalars_offset + block.scalars.size() * sizeof(uint64_t),
+                        block.scalar_parameters.data(), block.scalar_parameters.size() * sizeof(int32_t)
+                    );
+                }
+            }
         }
         plan.blocks = 1;
         if (!plan.host_done && !control) {
@@ -883,6 +961,7 @@ bool create_scheduler_state(
     descriptor->graph.scheduler_state_address = reinterpret_cast<uint64_t>(device);
     descriptor->nodes_address = reinterpret_cast<uint64_t>(device) + nodes_offset;
     descriptor->expected_tasks = expected;
+    descriptor->descriptor_bytes = bytes - descriptor_offset;
     runtime->publish_scheduler_bootstrap(
         SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING, reinterpret_cast<uint64_t>(device) + descriptor_offset
     );
@@ -893,6 +972,7 @@ bool create_scheduler_state(
 
 struct HostPreparePlan : RetainedHostPreparePlan<RuntimeArenaLayout> {
     NativeGraphHostPlan native_graph;
+    WseLaunchRecords launches;
 };
 
 int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &plan) {
@@ -1013,7 +1093,7 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
         instance.args_base = instance.heap_base + definition.required_heap;
     }
     if (!create_scheduler_state(
-            runtime, api, host_sm_handle, total_tasks, task_capacity, device_segments, plan.native_graph
+            runtime, api, host_sm_handle, total_tasks, task_capacity, device_segments, plan.native_graph, plan.launches
         )) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -1081,6 +1161,7 @@ int32_t run_host_orchestration(
     }
     auto &storage = *static_cast<OrchestrationScratch *>(scratch.get());
     OrchestratorState orchestrator{};
+    WseLaunchState wse_state;
     storage.swap_storage(orchestrator);
     OrchContext orch_ctx{};
     orch_ctx.orchestrator = &orchestrator;
@@ -1140,6 +1221,8 @@ int32_t run_host_orchestration(
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     orch_bind_ops(&orch_ctx);
+    WseOrchOps wse_ops{};
+    wse_bind_ops(&orch_ctx, wse_ops, wse_state);
     orchestrator.total_cluster_count = block_dim * PLATFORM_AIC_CORES_PER_BLOCKDIM;
     orchestrator.total_aiv_count = block_dim * PLATFORM_AIV_CORES_PER_BLOCKDIM;
     rt->mode = MODE_EXECUTE;
@@ -1325,6 +1408,7 @@ int32_t run_host_orchestration(
     plan.image_bytes = image_bytes;
     plan.total_tasks = total_tasks;
     plan.bind_usage = bind_usage;
+    plan.launches = std::move(wse_state.launches);
     return total_tasks;
 }
 

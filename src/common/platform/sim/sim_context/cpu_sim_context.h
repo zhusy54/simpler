@@ -83,4 +83,7 @@ void sim_context_set_cluster_id(uint32_t cluster_id);
 /** Clear pipe shared state for the current thread's device. */
 void clear_cpu_sim_shared_storage();
 
+/** Release matching pipe states after every participant on this core has drained. */
+void clear_cpu_sim_core_pipe_states(uint32_t core, uint64_t key_prefix, uint64_t key_mask);
+
 #endif

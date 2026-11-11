@@ -3,7 +3,7 @@
 WSEsim provides finite per-core SRAM for direct L2 Workers using
 `host_build_graph`. Application buffers persist across kernels and runs until
 freed or the Worker closes. Resident execution metadata, dependency state and
-PE queues occupy the Runtime partitions while a run is active.
+Static Core Block queues occupy the Runtime partitions while a run is active.
 
 ## Configure a device
 
@@ -104,12 +104,12 @@ addresses. This is checked API access, not a sandbox for arbitrary C++ pointers.
 
 Runtime preparation constructs a compact execution image from the bound graph.
 PEs execute its SRAM-backed task records, tensor/scalar arguments, predicates
-and successor lists. Per-core controls and PE queue payloads reside in their
-own core's Runtime partition. Shared graph control and execution metadata
-currently reside on Core0. All PEs may update shared state through the existing
+and original Graph predecessor references. Core controls, static Block queues,
+Thread mappings and bound Block arguments reside in the executing Core's Runtime
+partition. Whole-Graph coordination and node state currently reside on Core0. All PEs may update shared state through the existing
 CPU synchronization; Core0 is not a dedicated per-task dispatcher.
 
-Queue capacity conservatively covers all blocks assigned to that PE in the
+Queue capacity conservatively covers all blocks assigned to that Core in the
 graph. A graph that exceeds a core's Runtime reservation is rejected before
 GO, and the same Worker can subsequently execute a smaller legal graph.
 No unbounded Host queue or shadow graph supplies overflow storage.
@@ -118,7 +118,7 @@ With `CallConfig.output_prefix`, `wse_sram.json` accompanies PE events. It
 records the effective numeric configuration, per-core usage and actual
 resident section addresses/sizes. Section kinds identify run control (1),
 task records (2), core offsets (3), region descriptors (4), tensors (5),
-scalars (6), successors (7), core controls (8), queues (9) and application
+scalars (6), predecessors (7), core controls (8), queues (9) and application
 range descriptors (10). Padding is included in Runtime usage. Observations
 are emitted after execution and do not provide kernel synchronization.
 
@@ -128,7 +128,9 @@ CPU atomics do not certify hardware atomic visibility, and execution-fault
 recovery or forced kernel interruption is not provided. Core0 capacity and
 remote shared-state traffic remain limitations of the centralized placement.
 
-The primary FFN qualification starts all 40 cores and executes 160 blocks in
-each compute stage, covering every core and PE. Its 40 column shards and four
-row shards are checked against independent H/A/Y golden tensors, including
-replay and pending runs. Boundary cases use the same 40-core topology.
+The deployment FFN qualification starts all 40 Cores and executes 40 Blocks with
+four Threads in each of three Kernels. Its ten independent FFN groups use
+72 KiB of main data and 2 KiB diagnostics on each owner Core per instance.
+Two instances use 148 KiB/Core; Runtime usage is additional. Default 100 MiB/Core
+and explicit 1 MiB/Core configurations are tested with independent H/A/Y goldens,
+Core/PE permutations, replay and pending runs. See [Block deployment](wse-deployment.md).

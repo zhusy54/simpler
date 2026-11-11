@@ -14,7 +14,7 @@
 #include <dlfcn.h>
 #include <cstdlib>
 extern "C" void kernel_entry(int64_t *args) {
-    const auto block = get_block_idx(args);
+    const auto block = get_block_idx(args) * get_thread_num(args) + get_thread_idx(args);
     auto pointer = [&](int i) {
         auto *t = reinterpret_cast<Tensor *>(args[i]);
         return reinterpret_cast<float *>(t->buffer.addr) + t->start_offset;
@@ -31,5 +31,5 @@ extern "C" void kernel_entry(int64_t *args) {
     wse::TSTORE({pointer(1) + block * 4, 4, 2, 2, 2, 1}, c);
     pointer(2)[block * 2] = get_core_id(args);
     pointer(2)[block * 2 + 1] = get_pe_id(args);
-    if (gated && get_core_id(args) == 0 && block != 0) hook(block / 40);
+    if (gated && block > 0 && block <= 4) hook(block);
 }

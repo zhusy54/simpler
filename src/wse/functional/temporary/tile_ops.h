@@ -9,6 +9,8 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #pragma once
+#include "wse/block_scope.h"
+#include "block_lifecycle.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -138,22 +140,27 @@ template <typename T>
 class SharedTile {
     uint32_t pe_, slot_;
     OperationTrace trace_;
+    BlockScope scope_;
     SharedTileState *state_;
     void trace(OperationEvent event, uint64_t generation) const { trace_(event, slot_, generation); }
 
 public:
-    SharedTile(uint32_t pe, uint32_t slot, uint32_t producer, uint32_t consumers, OperationTrace trace = {}) :
+    SharedTile(
+        uint32_t pe, uint32_t slot, uint32_t producer, uint32_t consumers, BlockScope scope, OperationTrace trace = {}
+    ) :
         pe_(pe),
         slot_(slot),
         trace_(trace),
+        scope_(scope),
         state_(nullptr) {
+        scope_.validate();
         if (pe >= 4 || slot >= 64 || producer >= 4 || !consumers || (consumers & ~15u))
             throw std::invalid_argument("invalid WSE shared tile slot or participants");
         using GetState = void *(*)(uint64_t, size_t);
         auto get = reinterpret_cast<GetState>(dlsym(RTLD_DEFAULT, "pto_sim_get_pipe_shared_state"));
         if (!get) throw std::runtime_error("CPU simulator shared state hook is unavailable");
         // Reserve a key prefix for the temporary WSE operation backend's S0..S63.
-        state_ = static_cast<SharedTileState *>(get(0x5753455300000000ULL | slot, sizeof(SharedTileState)));
+        state_ = static_cast<SharedTileState *>(get(SHARED_TILE_KEY_PREFIX | slot, sizeof(SharedTileState)));
         if (!state_) throw std::runtime_error("CPU simulator shared state allocation failed");
         std::lock_guard lock(*state_);
         if (!state_->configured) {
@@ -169,6 +176,7 @@ public:
         }
     }
     void publish(uint64_t generation, const T &value) {
+        scope_.validate();
         std::unique_lock lock(*state_);
         if (pe_ != state_->producer || !generation || state_->generation == UINT64_MAX ||
             generation != state_->generation + 1)
@@ -184,6 +192,7 @@ public:
         state_->notify();
     }
     T read(uint64_t generation) {
+        scope_.validate();
         std::unique_lock lock(*state_);
         const uint32_t bit = 1u << pe_;
         if (!generation || !(state_->consumers & bit) || generation < state_->generation ||

@@ -17,5 +17,10 @@ extern "C" void aicpu_orchestration_entry(const ChipTaskArgs &a) {
     task.add_output(a.tensor(2).ref());
     task.add_scalar(a.scalar<int64_t>(1));
     task.launch_spec.set_block_num(a.scalar<int64_t>(0));
-    rt_submit_wse_task(0, task);
+    WseLaunchSpec launch;
+    if (a.scalar<int64_t>(1)) {
+        launch.thread_num = 4;
+        task.launch_spec.set_block_num(a.scalar<int64_t>(0) / 4);
+    }
+    rt_submit_wse_task(0, task, launch);
 }

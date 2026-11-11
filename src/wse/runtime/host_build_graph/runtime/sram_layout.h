@@ -15,8 +15,10 @@
 namespace wse {
 struct Work {
     uint64_t task;
-    uint32_t block;
-    uint32_t reserved;
+    uint32_t block, thread_num;
+    uint32_t thread_pes[PE_PER_CORE];
+    uint32_t tensor_count, scalar_count;
+    uint64_t tensors_offset, scalars_offset;
 };
 struct Queue {
     uint64_t work_offset, capacity, head, tail;
@@ -24,12 +26,14 @@ struct Queue {
 struct CoreControl {
     uint32_t initialized, ready, quiet, retired;
     uint64_t expected_tasks;
-    Queue queues[PE_PER_CORE];
+    Queue queue;
+    uint64_t block_epoch, block_serial;
+    uint32_t active, started, finished, execute;
 };
 struct TaskRecord {
-    uint64_t entry, tensors_offset, scalars_offset, successors_offset;
-    uint32_t blocks, host_done, has_predicate, tensor_count, scalar_count, successor_count;
-    uint32_t initial_dependencies, remaining_dependencies, remaining_blocks;
+    uint64_t entry, predecessors_offset;
+    uint32_t blocks, host_done, has_predicate, predecessor_count;
+    uint32_t remaining_blocks, completed;
     SchedulerDispatchPredicate predicate;
 };
 struct RunControl {

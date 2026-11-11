@@ -13,7 +13,6 @@
 namespace {
 template <bool split>
 void protocol(const GraphTaskArgs &args) {
-    constexpr int producers = 2, consumers = 2;
     auto counters = args.tensor(0).ref();
     auto payload = args.tensor(1).ref();
     auto result = args.tensor(2).ref();
@@ -26,8 +25,11 @@ void protocol(const GraphTaskArgs &args) {
         task.add_inout(counters, payload, result);
         for (int scalar = 3; scalar < 8; ++scalar)
             task.add_scalar(args.scalar(scalar - 3));
-        task.launch_spec.set_block_num(split && child == 0 ? producers : producers + consumers);
-        rt_submit_wse_task(split ? child + 1 : 0, task);
+        WseLaunchSpec launch;
+        launch.thread_num = 2;
+        task.launch_spec.set_block_num(split ? 1 : 2);
+        if (split) launch.placement = {{static_cast<uint32_t>(child), {0, 1}}};
+        rt_submit_wse_task(split ? child + 1 : 0, task, launch);
     }
 }
 }  // namespace

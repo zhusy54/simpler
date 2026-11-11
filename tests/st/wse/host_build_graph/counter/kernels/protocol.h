@@ -25,7 +25,9 @@ inline bool await_counter(wse::CounterView view, size_t index, uint64_t target) 
 }
 
 inline void counter_protocol(int64_t *args, int role) {
-    const int b = get_block_idx(args);
+    const int b = role == 1 ? 2 + get_thread_idx(args) :
+                  role == 0 ? get_thread_idx(args) :
+                              get_block_idx(args) * get_thread_num(args) + get_thread_idx(args);
     const int producers = args[3], consumers = args[4], rounds = args[5];
     const uint64_t base = args[6];
     if ((role == 0 && b >= producers) || (role == 1 && b < producers)) return;

@@ -499,7 +499,7 @@ bool graph_finalize_pending_submissions(OrchestratorState *orch, GraphHostState 
 
 TaskOutputTensors graph_record_submit_sub_task(
     OrchestratorState *orch, const CoreTaskArgs &args, LaneMask active_mask, TaskAttrs task_attrs,
-    int32_t aic_kernel_id, int32_t aiv0_kernel_id, int32_t aiv1_kernel_id
+    int32_t aic_kernel_id, int32_t aiv0_kernel_id, int32_t aiv1_kernel_id, const DepInputs *dependencies
 ) {
     ORCH_PHASE_START();
     TaskOutputTensors result;
@@ -698,13 +698,14 @@ TaskOutputTensors graph_record_submit_sub_task(
     // through boundary tensors, and the outer Graph shell already carries those
     // args, so the shell's own fanin orders the whole body behind them.
     {
-        const DepInputs dep_inputs{
+        DepInputs dep_inputs{
             tensor_count,
             args.tensor_data(),
             args.tag_data(),
             static_cast<int32_t>(args.explicit_dep_count()),
             args.explicit_deps_data(),
         };
+        if (dependencies) dep_inputs = *dependencies;
         const bool manual_scope = recording.in_manual_scope();
         if (!recording.storage_ready || task_index >= SUB_TASK_MAX_NUM) {
             // An over-cap body is already abandoned, and its task ids have run past

@@ -68,7 +68,7 @@ def prepare(worker, base, split, gated=False):
     return args, buffers, tensors
 
 
-def check(worker, buffers, tensors, base, cores, path, split):
+def check(worker, buffers, tensors, base, cores, path, split, *, placements=None):
     for buffer, tensor in zip(buffers, tensors, strict=True):
         worker.copy_from(tensor, buffer)
     assert tensors[0].tolist() == [991, 992, base + ROUNDS * PRODUCERS, ROUNDS * CONSUMERS, CONSUMERS, 993]
@@ -90,7 +90,7 @@ def check(worker, buffers, tensors, base, cores, path, split):
     for g in range(1, ROUNDS + 1):
         for b, rounds in enumerate(rows):
             row = rounds[g - 1]
-            assert row[:2] == [b % cores, (b // cores) % 4]
+            assert row[:2] == (placements[b] if placements is not None else [b // 2, b % 2])
             assert row[4] == row[3] + 1
             expected = base + g * 100 + b if b < PRODUCERS else sum(base + g * 100 + p for p in range(PRODUCERS))
             assert row[5] == expected

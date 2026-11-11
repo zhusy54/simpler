@@ -27,12 +27,12 @@ inline void probe_trace(void *owner, wse::OperationEvent event, uint32_t slot, u
         notify(p.pe);
     }
 }
-inline void cross_dso_compute(int64_t *args, bool producer) {
+inline void shared_block_compute(int64_t *args, bool producer) {
     if (get_core_id(args) != 0) return;
     const auto pe = get_pe_id(args);
     if (!producer && pe == 0) return;
     ProbeTrace trace{get_wse_operation_trace(args), static_cast<uint32_t>(pe)};
-    wse::SharedTile<wse::Tile<2, 2>> shared(pe, 2, 0, 14, {&trace, probe_trace});
+    wse::SharedTile<wse::Tile<2, 2>> shared(pe, 2, 0, 14, get_wse_block_scope(args), {&trace, probe_trace});
     if (producer) {
         auto gate = reinterpret_cast<void (*)(int)>(dlsym(RTLD_DEFAULT, "wse_shared_probe"));
         if (!gate) std::abort();
@@ -44,8 +44,8 @@ inline void cross_dso_compute(int64_t *args, bool producer) {
         shared.publish(1, value);
     } else {
         auto value = shared.read(1);
-        auto *t = reinterpret_cast<Tensor *>(args[0]);
-        auto *out = reinterpret_cast<float *>(t->buffer.addr) + t->start_offset + get_block_idx(args) * 4;
+        auto *t = reinterpret_cast<Tensor *>(args[1]);
+        auto *out = reinterpret_cast<float *>(t->buffer.addr) + t->start_offset + get_thread_idx(args) * 4;
         wse::TSTORE({out, 4, 2, 2, 2, 1}, value);
     }
 }

@@ -42,5 +42,5 @@ GraphRecording *active_graph_recording(OrchestratorState *orch);
 // stay valid for the rest of the recording.
 TaskOutputTensors graph_record_submit_sub_task(
     OrchestratorState *orch, const CoreTaskArgs &args, LaneMask active_mask, TaskAttrs task_attrs,
-    int32_t aic_kernel_id, int32_t aiv0_kernel_id, int32_t aiv1_kernel_id
+    int32_t aic_kernel_id, int32_t aiv0_kernel_id, int32_t aiv1_kernel_id, const DepInputs *dependencies = nullptr
 );

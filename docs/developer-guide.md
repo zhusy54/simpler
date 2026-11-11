@@ -310,17 +310,22 @@ registration owns; a run references those vectors' own addresses.
 
 `wsesim` provides a Host/AICore runtime under `src/wse`, with no AICPU
 component or three-lane dispatch. It defaults to 40 AICores with four homogeneous
-PEs each. A block runs one Kernel entry on one PE; that entry can contain matrix
-and vector operations. Kernel block counts are independent of the Core count,
-and blocks beyond the available PEs execute in waves.
+PEs each. A Block runs on one Core and expands into 1–4 Threads, each invoking
+the same Kernel entry on a distinct PE. That entry can contain matrix and vector
+operations. Block counts are independent of Core count; later Blocks wait in
+their assigned Core's static queue.
 
-`CallConfig.core_count` selects 1–40 Cores for a run; 0 selects the default 40.
+`CallConfig.core_count` selects an active prefix of the configured Cores; 0
+selects all configured Cores (40 by default).
 This option is WSE-only and is not transported by the remote L3 protocol.
 The packed configuration uses native ABI version 2. Rebuild the Python binding
 and runtime components together, and update handwritten C ABI mirrors. The
 existing contract check rejects version-1 components before initialization.
 `rt_submit_wse_task` submits a single entry, `rt_available_core_count` reports the
 configured topology, and Kernel `get_core_id`/`get_pe_id` report physical identity.
+Blocks belong to Cores; `get_thread_idx`/`get_thread_num` identify the 1–4 Threads
+mapped to local PEs. Each Core advances its static Block queue only after the
+active Block drains; original Graph predecessor completion gates its head.
 PE0 initializes its Core before computing; Core0 coordinates startup and normal
 retirement. Device tasks publish completion once after all their blocks finish.
 Host wait timeouts retain resources; normal close drains and joins the PE threads
@@ -341,15 +346,17 @@ Fixed, trivially destructible FP32 slot state needs no Runtime object registry,
 layout IDs or construction/destruction callbacks. `publish` waits for prior
 consumers; `read` copies a Tile value and marks that consumer finished before
 returning. The matmul overloads consume the shared operand this way. There is no
-public storage lease. Slots keep one shape/participant configuration for a run;
-tasks deliberately sharing a slot continue its generation sequence.
+public storage lease. Slots keep one shape/participant configuration within a
+Kernel Block. Construct them with `get_wse_block_scope(args)`; all participating
+Threads drain before that scope and its operation state are invalidated. A later
+Block can reuse the slot with a new configuration and start generation one.
 
-`get_core_id`, `get_pe_id` and block intrinsics supply execution identity.
+`get_core_id`, `get_pe_id`, Block and Thread intrinsics supply execution identity.
 `get_wse_operation_trace(args)` provides an optional observation callback only.
-The producer must be runnable on an independent PE; arbitrary cross-block waits
-are not guaranteed to make progress. Shared operations do not group four PEs.
-Shared state is freed by the existing simulator reset between joined runs or
-at device teardown. It is not an addressable hardware shared-memory region.
+SharedTile participants belong to one Block and use its independent Threads.
+An ended Block handle is rejected. Ending one Core's Block releases only its
+operation state; another Core may remain active. Device reset and teardown also
+clear retained simulator state. It is not an addressable hardware shared-memory region.
 
 Temporary implementation details live under `src/wse/functional/temporary`,
 behind the public facade under `functional/include/wse`. The executor does not
@@ -385,12 +392,14 @@ ranges; reset a reused range only after its previous users have exited.
 Counters do not update Runtime task completion or SharedTile generations.
 Cross-Kernel concurrent protocols must declare actual read/write arguments and
 explicit manual dependencies; the caller must ensure producers can run on
-independent PEs. The examples in `tests/st/wse/host_build_graph/counter` exercise
+Threads of one Block or concurrent Blocks on different Cores. The examples in `tests/st/wse/host_build_graph/counter` exercise
 this with producer/consumer acknowledgement before either task can finish.
 There is no counter allocation service or scheduler change. The CPU semantics
 apply within one simulated device/process and do not certify remote hardware
 atomics. Explicit SRAM buffers use the same counter operations and lifetime protection.
 See [WSE SRAM and hardware configuration](wse-sram.md) for allocation and capacity contracts.
+See [WSE block deployment](wse-deployment.md) for Block-to-Core and Thread-to-PE placement,
+Graph ownership, SRAM capacity accounting and the sharded FFN examples.
 
 The implementation accounts for application SRAM and resident execution/control data.
 Device program/stack storage, physical Tile capacity, hardware pipeline timing,
@@ -429,7 +438,7 @@ The suite retains the original vector math and uses WSE single-entry Graph
 fixtures for the former Mix/SPMD output contract. It checks real PE execution,
 mixed matrix/vector operations, configurable blocks, Graph replay, completion,
 startup rollback, wait/close and buffer ownership. With `output_prefix` set,
-`wse_events.jsonl` records Core/PE lifecycle and expanded task/block identities;
+`wse_events.jsonl` records Core/PE lifecycle and expanded Kernel/Block/Thread identities;
 its sequence numbers express functional ordering, not hardware timing.
 Host dependency capture (`enable_dep_gen`) remains available. Legacy device
 swimlane, argument dump, PMU and scope-stat collector requests are rejected at
@@ -438,7 +447,8 @@ WSE has no separate entry/startup/component version negotiation or protocol JSON
 Rebuild the binding, Runtime and Kernels together after interface changes. Target
 family and required-entry checks remain, as does the shared PipelineContract ABI.
 The JSON event trace records lifecycle and operation events 12–15 (publication,
-wait, read, consumed), with slot/generation fields. It does not report a separate
+wait, read, consumed), with slot/generation fields, plus Thread begin/end events
+16/17 whose value is the logical Thread index. It does not report a separate
 Runtime allocation service. Packaging contains only Host/AICore WSE binaries.
 Unused AICPU/three-lane executors are removed; common Host arena layout declarations
 remain because shared HBG initialization consumes them, and do not schedule PEs.

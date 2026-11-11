@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Observe independent PE progress and runtime-owned sharing across kernel DSOs."""
+"""Observe Block/Thread progress and operation sharing within a Kernel Block."""
 
 import ctypes
 import json
@@ -43,9 +43,9 @@ extern "C" void release_probe(){std::lock_guard lock(mutex);released=true;change
 """
 
 
-def load_gate(tmp_path, hook, mask):
+def load_gate(tmp_path, hook, mask, *, source_code=_GATE):
     source = tmp_path / "gate.cpp"
-    source.write_text(_GATE.replace("HOOK", hook).replace("MASK", str(mask)))
+    source.write_text(source_code.replace("HOOK", hook).replace("MASK", str(mask)))
     library = tmp_path / "gate.so"
     subprocess.run(
         ["c++", "-std=c++17", "-shared", "-fPIC", "-pthread", str(source), "-o", str(library)], check=True, timeout=60
@@ -58,8 +58,8 @@ def load_gate(tmp_path, hook, mask):
 @lru_cache
 def build_probe(platform, shared=False):
     compiler = KernelCompiler(platform)
-    sources = ["producer", "consumer"] if shared else ["probe"]
-    signatures = [[D.IN], [D.OUT]] if shared else [[D.IN, D.OUT, D.OUT, D.IN]]
+    sources = ["shared_block"] if shared else ["probe"]
+    signatures = [[D.IN, D.OUT]] if shared else [[D.IN, D.OUT, D.OUT, D.IN]]
     children = []
     for index, (name, sig) in enumerate(zip(sources, signatures, strict=True)):
         binary = compiler.compile_incore(
@@ -72,7 +72,7 @@ def build_probe(platform, shared=False):
         signature=[D.IN, D.OUT] if shared else [D.IN, D.OUT, D.OUT, D.IN, D.IN],
         func_name="aicpu_orchestration_entry",
         binary=compiler.compile_orchestration(
-            "host_build_graph", str(HERE / ("kernels/cross_dso_orch.cpp" if shared else "kernels/probe_orch.cpp"))
+            "host_build_graph", str(HERE / ("kernels/shared_block_orch.cpp" if shared else "kernels/probe_orch.cpp"))
         ),
         children=children,
     )
@@ -124,8 +124,8 @@ def test_temporary_operations_keep_independent_blocks(tmp_path, st_platform, cor
         worker.close()
 
 
-def test_one_waiting_pe_does_not_stall_sibling_waves(tmp_path, st_platform):
-    gate = load_gate(tmp_path, "wse_independent_probe", 224)
+def test_waiting_thread_holds_its_block_but_not_other_cores(tmp_path, st_platform):
+    gate = load_gate(tmp_path, "wse_independent_probe", 30)
     worker = Worker(level=2, platform=st_platform, runtime="host_build_graph", device_id=0)
     try:
         worker.init()
@@ -138,7 +138,7 @@ def test_one_waiting_pe_does_not_stall_sibling_waves(tmp_path, st_platform):
         config.core_count = 40
         config.output_prefix = str(tmp_path)
         run = worker.submit(handle, args, config)
-        assert gate.wait_probe(), "sibling PEs did not reach their second wave while PE0 was held"
+        assert gate.wait_probe(), "sibling Threads and another Core did not progress while Thread 0 was held"
         with pytest.raises(TimeoutError):
             run.wait(timeout=0.01)
         gate.release_probe()
@@ -147,8 +147,16 @@ def test_one_waiting_pe_does_not_stall_sibling_waves(tmp_path, st_platform):
         torch.testing.assert_close(tensors[1], torch.relu(tensors[0] @ tensors[0]).expand(320, 2, 2), rtol=0, atol=0)
         events = [json.loads(line) for line in (tmp_path / "wse_events.jsonl").read_text().splitlines()][1:]
         end = {e["block"]: e["seq"] for e in events if e["kind"] == 5}
-        assert all(end[b] < end[0] for b in (40, 80, 120))
-        assert next(e["seq"] for e in events if e["kind"] == 4 and e["block"] == 160) > end[0]
+        first_thread_end = next(e["seq"] for e in events if e["kind"] == 17 and e["block"] == 0 and e["value"] == 0)
+        assert all(
+            next(e["seq"] for e in events if e["kind"] == 16 and e["block"] == 0 and e["value"] == thread)
+            < first_thread_end
+            for thread in (1, 2, 3)
+        )
+        assert (
+            next(e["seq"] for e in events if e["kind"] == 16 and e["block"] == 1 and e["value"] == 0) < first_thread_end
+        )
+        assert next(e["seq"] for e in events if e["kind"] == 4 and e["block"] == 40) > end[0]
         for b in buffers:
             worker.free(b)
         worker.unregister(handle)
@@ -157,13 +165,13 @@ def test_one_waiting_pe_does_not_stall_sibling_waves(tmp_path, st_platform):
         worker.close()
 
 
-def test_shared_state_between_independent_kernel_dsos(tmp_path, st_platform):
+def test_shared_state_between_threads_of_one_block(tmp_path, st_platform):
     gate = load_gate(tmp_path, "wse_shared_probe", 14)
     worker = Worker(level=2, platform=st_platform, runtime="host_build_graph", device_id=0)
     try:
         worker.init()
         handle = worker.register(build_probe(st_platform, True))
-        tensors = [torch.tensor([[11.0, 12.0], [13.0, 14.0]]), torch.full((160, 2, 2), -99.0)]
+        tensors = [torch.tensor([[11.0, 12.0], [13.0, 14.0]]), torch.full((4, 2, 2), -99.0)]
         args, buffers = prepare(worker, tensors)
         config = CallConfig()
         config.core_count = 40
@@ -177,14 +185,14 @@ def test_shared_state_between_independent_kernel_dsos(tmp_path, st_platform):
         gate.release_probe()
         run.wait()
         worker.copy_from(tensors[1], buffers[1])
-        torch.testing.assert_close(tensors[1][[40, 80, 120]], tensors[0].expand(3, 2, 2), rtol=0, atol=0)
+        torch.testing.assert_close(tensors[1][[1, 2, 3]], tensors[0].expand(3, 2, 2), rtol=0, atol=0)
         assert torch.all(tensors[1][0] == -99)
         events = [json.loads(line) for line in (tmp_path / "wse_events.jsonl").read_text().splitlines()][1:]
         publication = next(e["seq"] for e in events if e["kind"] == 12)
         assert {e["pe"] for e in events if e["kind"] == 13 and e["seq"] < publication} == {1, 2, 3}
         assert {e["slot"] for e in events if e["kind"] in (12, 13, 14, 15)} == {2}
         assert {e["pe"] for e in events if e["kind"] == 15} == {1, 2, 3}
-        assert len([e for e in events if e["kind"] == 6]) == 2
+        assert len([e for e in events if e["kind"] == 6]) == 1
         for b in buffers:
             worker.free(b)
         worker.unregister(handle)

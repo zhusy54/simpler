@@ -216,6 +216,20 @@ void clear_cpu_sim_shared_storage() {
     ctx->pipe_states.clear();
 }
 
+void clear_cpu_sim_core_pipe_states(uint32_t core, uint64_t key_prefix, uint64_t key_mask) {
+    auto *ctx = get_current_device_context();
+    if (!ctx) return;
+    std::lock_guard lock(ctx->pipe_state_mutex);
+    for (auto it = ctx->pipe_states.begin(); it != ctx->pipe_states.end();) {
+        if (it->first.cluster_id == core && (it->first.pipe_key & key_mask) == key_prefix) {
+            std::free(it->second);
+            it = ctx->pipe_states.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-thread core identity setters (called by sim aicore platform code)
 // ---------------------------------------------------------------------------

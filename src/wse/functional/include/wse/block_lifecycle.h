@@ -8,5 +8,9 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-#include "cross_dso_body.h"
-extern "C" void kernel_entry(int64_t *args) { cross_dso_compute(args, false); }
+#pragma once
+#include "../../temporary/block_lifecycle.h"
+
+namespace wse {
+using temporary::end_block_operations;
+}  // namespace wse

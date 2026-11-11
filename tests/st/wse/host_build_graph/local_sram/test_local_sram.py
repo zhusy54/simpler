@@ -206,7 +206,7 @@ def test_sram_remote_owner_and_cross_kernel(tmp_path, st_platform, device_cores,
         rows = tensors[2].reshape(blocks, 2, 4).tolist()
         cores = active or device_cores
         for b, row in enumerate(rows):
-            assert row == [[device_cores - 1, 0, b % cores, (b // cores) % 4]] * 2
+            assert row == [[device_cores - 1, 0, b % cores, 0]] * 2
         assert worker.sram_info(device_cores - 1)["application_used_bytes"] == before
         assert worker.sram_info(0)["runtime_used_bytes"] == 0
         for buffer in buffers:

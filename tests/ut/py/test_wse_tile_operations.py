@@ -25,6 +25,9 @@ _SOURCE = r"""
 #include <thread>
 #include <vector>
 
+alignas(8) uint64_t block_epoch=1;
+const wse::BlockScope scope{&block_epoch,1};
+
 void rejects(const std::function<void()> &call) {
     bool caught=false;
     try { call(); } catch (const std::exception &) { caught=true; }
@@ -81,7 +84,7 @@ void shared() {
     for(uint32_t core=0;core<2;++core) for(uint32_t pe=0;pe<4;++pe) threads.emplace_back([&,core,pe]{
         assert(pto_cpu_sim_bind_device_checked(0)==0);
         sim_context_set_cluster_id(core);
-        wse::SharedTile<wse::Tile<2,3>> tile(pe, 0, 0, 15);
+        wse::SharedTile<wse::Tile<2,3>> tile(pe, 0, 0, 15, scope);
         for(uint64_t gen=1;gen<=4;++gen) {
             if(pe==0) {
                 wse::Tile<2,3> value;
@@ -110,13 +113,13 @@ void overwrite_wait() {
     std::thread producer([&] {
         assert(pto_cpu_sim_bind_device_checked(0)==0);
         sim_context_set_cluster_id(0);
-        Shared slot(0,0,0,6,{&waiting,notify});
+        Shared slot(0,0,0,6,scope,{&waiting,notify});
         wse::Tile<2,3> value;value.at(0,0)=11;slot.publish(1,value);
         value.at(0,0)=22;slot.publish(2,value);
         finished.store(true,std::memory_order_release);
     });
     waiting.wait(0,std::memory_order_acquire);
-    Shared first(1,0,0,6), last(2,0,0,6);
+    Shared first(1,0,0,6,scope), last(2,0,0,6,scope);
     assert(first.read(1).at(0,0)==11);
     assert(!finished.load(std::memory_order_acquire));
     assert(last.read(1).at(0,0)==11);
@@ -126,18 +129,18 @@ void overwrite_wait() {
 }
 void context_errors() {
     using Shared=wse::SharedTile<wse::Tile<2,3>>;
-    rejects([&]{Shared s(4,0,0,1);});
-    rejects([&]{Shared s(0,64,0,1);});
-    rejects([&]{Shared s(0,0,4,1);});
-    rejects([&]{Shared s(0,0,0,16);});
-    Shared s(0,0,0,1);wse::Tile<2,3> t;
+    rejects([&]{Shared s(4,0,0,1,scope);});
+    rejects([&]{Shared s(0,64,0,1,scope);});
+    rejects([&]{Shared s(0,0,4,1,scope);});
+    rejects([&]{Shared s(0,0,0,16,scope);});
+    Shared s(0,0,0,1,scope);wse::Tile<2,3> t;
     rejects([&]{s.publish(2,t);});
     rejects([&]{s.read(2);});
     s.publish(1,t);
     auto value=s.read(1);rejects([&]{s.read(1);});
-    rejects([&]{Shared mismatch(0,0,0,3);});
-    rejects([&]{wse::SharedTile<wse::Tile<3,2>> mismatch(0,0,0,1);});
-    Shared other(0,1,0,1);other.publish(1,t);assert(other.read(1).at(0,0)==0);
+    rejects([&]{Shared mismatch(0,0,0,3,scope);});
+    rejects([&]{wse::SharedTile<wse::Tile<3,2>> mismatch(0,0,0,1,scope);});
+    Shared other(0,1,0,1,scope);other.publish(1,t);assert(other.read(1).at(0,0)==0);
 }
 void lifecycle() {
     using Shared=wse::SharedTile<wse::Tile<2,3>>;
@@ -146,19 +149,45 @@ void lifecycle() {
             pto_cpu_sim_acquire_device(device);
             assert(pto_cpu_sim_bind_device_checked(device)==0);
             sim_context_set_cluster_id(0);
-            Shared slot(0,0,0,1);
+            Shared slot(0,0,0,1,scope);
             wse::Tile<2,3> value;value.at(0,0)=device+repeat*10;
             slot.publish(1,value);
         }
         for(int device=0;device<2;++device) {
             assert(pto_cpu_sim_bind_device_checked(device)==0);
-            Shared slot(0,0,0,1);
+            Shared slot(0,0,0,1,scope);
             assert(slot.read(1).at(0,0)==device+repeat*10);
             clear_cpu_sim_shared_storage();
         }
     }
     pto_cpu_sim_release_device(1);
     assert(pto_cpu_sim_bind_device_checked(0)==0);
+}
+void block_lifetime() {
+    uint64_t run_epoch=1, block_serial=1;
+    wse::BlockScope recorded{&block_serial,1,&run_epoch,1};
+    recorded.validate();
+    run_epoch=(uint64_t{1}<<32)+1;
+    rejects([&]{recorded.validate();});
+    uint64_t epochs[2]{1,1};
+    using Shared=wse::SharedTile<wse::Tile<2,3>>;
+    Shared old(0,0,0,1,{&epochs[0],1});
+    wse::Tile<2,3> value;value.at(0,0)=17;old.publish(1,value);
+    sim_context_set_cluster_id(1);
+    Shared other(0,0,0,1,{&epochs[1],1});
+    value.at(0,0)=23;other.publish(1,value);
+    __atomic_store_n(&epochs[0],0,__ATOMIC_RELEASE);
+    clear_cpu_sim_core_pipe_states(0,0x5753455300000000ULL,0xFFFFFFFF00000000ULL);
+    rejects([&]{old.read(1);});
+    assert(other.read(1).at(0,0)==23);
+    sim_context_set_cluster_id(0);
+    __atomic_store_n(&epochs[0],2,__ATOMIC_RELEASE);
+    // Reusing the same slot may change its shape and starts at generation one.
+    wse::SharedTile<wse::Tile<3,2>> next(0,0,0,1,{&epochs[0],2});
+    wse::Tile<3,2> fresh;fresh.at(0,0)=41;next.publish(1,fresh);
+    assert(next.read(1).at(0,0)==41);
+    rejects([&]{old.publish(1,value);});
+    rejects([&]{Shared invalid(0,1,0,1,{&epochs[0],1});});
 }
 int main(int argc,char **argv) {
     assert(argc==2);
@@ -173,6 +202,7 @@ int main(int argc,char **argv) {
     else if(test=="context")context_errors();
     else if(test=="overwrite")overwrite_wait();
     else if(test=="lifecycle")lifecycle();
+    else if(test=="block")block_lifetime();
     else return 1;
     pto_cpu_sim_release_device(0);
 }
@@ -208,7 +238,9 @@ def operation_binary(tmp_path_factory):
     return binary
 
 
-@pytest.mark.parametrize("case", ["numerical", "fractional", "ranges", "shared", "context", "lifecycle", "overwrite"])
+@pytest.mark.parametrize(
+    "case", ["numerical", "fractional", "ranges", "shared", "context", "lifecycle", "overwrite", "block"]
+)
 def test_operation_contracts(operation_binary, case):
     subprocess.run([str(operation_binary), case], check=True, timeout=15)
 

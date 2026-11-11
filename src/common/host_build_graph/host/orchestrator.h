@@ -44,6 +44,7 @@
 #include "host_build_graph/types.h"
 
 struct GraphHostState;
+struct DepInputs;
 
 // =============================================================================
 // Orchestrator State
@@ -173,7 +174,8 @@ struct OrchestratorState final {
     bool report_fatal_owned(int32_t error_code, const char *func, const char *fmt, ...);
     void begin_scope(ScopeMode mode = ScopeMode::AUTO);
     void end_scope();
-    TaskOutputTensors submit_task(const MixedKernels &mixed_kernels, const CoreTaskArgs &args);
+    TaskOutputTensors
+    submit_task(const MixedKernels &mixed_kernels, const CoreTaskArgs &args, const DepInputs *dependencies = nullptr);
     TaskOutputTensors submit_dummy_task(const CoreTaskArgs &args);
     TaskOutputTensors alloc_tensors(const CoreTaskArgs &args);
     GraphScopeResult graph_begin(uint64_t graph_key, const GraphTaskArgs &args);
