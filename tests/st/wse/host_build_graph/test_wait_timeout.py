@@ -131,7 +131,7 @@ def test_wait_timeout_retains_buffer_until_real_completion(tmp_path, st_platform
     try:
         worker.init()
         handle = worker.register(chip)
-        buffer = worker.malloc(4)
+        buffer = worker.malloc(4, core_id=39)
         args = TaskArgs()
         args.add_tensor(buffer.tensor(shapes=(1,), dtype=DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
         publications = worker.scheduler_mode_publish_count

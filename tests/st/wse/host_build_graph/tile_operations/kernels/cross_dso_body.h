@@ -28,6 +28,7 @@ inline void probe_trace(void *owner, wse::OperationEvent event, uint32_t slot, u
     }
 }
 inline void cross_dso_compute(int64_t *args, bool producer) {
+    if (get_core_id(args) != 0) return;
     const auto pe = get_pe_id(args);
     if (!producer && pe == 0) return;
     ProbeTrace trace{get_wse_operation_trace(args), static_cast<uint32_t>(pe)};

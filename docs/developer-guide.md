@@ -331,7 +331,8 @@ CPU operation backend: static FP32 Tiles up to 32x32, row/column-major logical
 storage, bounded strided views, TLOAD/TSTORE, TMATMUL/TMATMUL_ACC and TRELU.
 This does not implement physical CUBE packing. Legacy `<pto/pto-inst.hpp>`
 fixtures explicitly retain pinned A5 CPU operations; there is no implicit fallback
-from an unsupported WSE operation to A5. GM and Graph data representations remain.
+from an unsupported WSE operation to A5. WSE device data uses finite per-core SRAM with explicit allocation ownership;
+Graph preparation templates remain on the Host.
 
 SharedTile uses Core-local slots S0..S63 in the existing CPU simulator context.
 The temporary backend resolves `pto_sim_get_pipe_shared_state`; the PE executor

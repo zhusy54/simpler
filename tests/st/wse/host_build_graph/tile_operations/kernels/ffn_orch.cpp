@@ -17,24 +17,24 @@ void layer(const GraphTaskArgs &a) {
     first.add_input(a.tensor(1).ref());
     first.add_output(a.tensor(3).ref());
     first.add_output(a.tensor(6).ref());
-    first.launch_spec.set_block_num(16);
+    first.launch_spec.set_block_num(160);
     rt_submit_wse_task(0, first);
     CoreTaskArgs relu;
     relu.add_input(a.tensor(3).ref());
     relu.add_output(a.tensor(4).ref());
-    relu.launch_spec.set_block_num(16);
+    relu.launch_spec.set_block_num(160);
     rt_submit_wse_task(1, relu);
     CoreTaskArgs second;
     second.add_input(a.tensor(4).ref());
     second.add_input(a.tensor(2).ref());
     second.add_output(a.tensor(5).ref());
-    second.launch_spec.set_block_num(16);
+    second.launch_spec.set_block_num(160);
     rt_submit_wse_task(2, second);
 }
 }  // namespace
 extern "C" OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &) { return {.expected_arg_count = 7}; }
 extern "C" void aicpu_orchestration_entry(const ChipTaskArgs &a) {
-    if (rt_available_core_count() != 4) throw std::invalid_argument("FFN qualification requires four cores");
+    if (rt_available_core_count() != 40) throw std::invalid_argument("FFN qualification requires forty cores");
     GraphTaskArgs graph;
     for (int i = 0; i < 3; ++i)
         graph.add_input(a.tensor(i).ref());

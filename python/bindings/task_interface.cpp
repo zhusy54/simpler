@@ -4105,10 +4105,11 @@ NB_MODULE(_task_interface, m) {
         )
         .def_prop_ro(
             "committed_device_memory", &ChipWorker::committed_device_memory,
-            "Total device HBM (bytes) currently committed by this worker's "
+            "Total device backing bytes committed by this worker. WSE reports "
+            "the physical per-core SRAM backing; other platforms report their "
             "MemoryAllocator (user tensors + pooled arenas + runtime buffers). "
             "Excludes HCCL/VMM comm windows. 0 when not "
-            "initialized. Lets downstream runtimes subtract simpler's own HBM "
+            "initialized. On HBM platforms, downstream runtimes subtract simpler's own HBM "
             "from their cache budget (it may be invisible to aclrtGetMemInfo)."
         )
         .def(
@@ -4124,9 +4125,8 @@ NB_MODULE(_task_interface, m) {
             "Return the ACL_HBM_MEM free/total byte snapshot for this worker's device."
         )
         .def("configure_wse", &ChipWorker::configure_wse)
-        .def("malloc_sram", &ChipWorker::malloc_sram)
         .def("sram_query", &ChipWorker::sram_query)
-        .def("malloc", &ChipWorker::malloc, nb::arg("size"))
+        .def("malloc", &ChipWorker::malloc, nb::arg("size"), nb::arg("core_id") = UINT32_MAX, nb::arg("alignment") = 64)
         .def("free", &ChipWorker::free, nb::arg("ptr"))
         .def("copy_to", &ChipWorker::copy_to, nb::arg("dst"), nb::arg("src"), nb::arg("size"))
         .def("copy_from", &ChipWorker::copy_from, nb::arg("dst"), nb::arg("src"), nb::arg("size"))

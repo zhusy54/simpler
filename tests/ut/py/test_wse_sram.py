@@ -89,6 +89,7 @@ def test_sram_native_contracts(tmp_path):
     source = tmp_path / "contract.cpp"
     source.write_text(r"""
 #include "sram_storage.h"
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 #include <stdexcept>
@@ -98,20 +99,24 @@ template <class F> void rejected(F f) {
 }
 int main() {
     wse::SramStorage storage;
-    uint64_t capacity[]={1024,2048}, reserve[]={256,512};
-    storage.configure(2,4,capacity,reserve);
+    uint64_t capacity[40], reserve[40];
+    std::fill_n(capacity,40,1024); std::fill_n(reserve,40,256);
+    capacity[1]=2048; reserve[1]=512;
+    storage.configure(40,4,capacity,reserve);
     auto initial=storage.configuration();
-    rejected([&]{storage.configure(2,3,capacity,reserve);});
-    uint64_t bad[]={1024,0};
-    rejected([&]{storage.configure(2,4,capacity,bad);});
+    rejected([&]{storage.configure(40,3,capacity,reserve);});
+    uint64_t bad[40]{};
+    rejected([&]{storage.configure(40,4,capacity,bad);});
     assert(storage.configuration()==initial);
+    assert(storage.committed_bytes()==0);
     auto *a=storage.allocate(256,0,128);
     auto *b=storage.allocate(512,0,128);
     assert(storage.info(0)[3]==768 && storage.info(0)[4]==0);
     rejected([&]{storage.allocate(1,0,1);});
-    rejected([&]{storage.configure(2,4,capacity,reserve);});
+    rejected([&]{storage.configure(40,4,capacity,reserve);});
     auto regions=storage.regions();
-    assert(regions.size()==2 && regions[0].base!=regions[1].base);
+    assert(regions.size()==40 && regions[0].base!=regions[1].base);
+    assert(storage.committed_bytes()==41*1024);
     storage.check_application(reinterpret_cast<uint64_t>(a)+8,248);
     rejected([&]{storage.check_application(reinterpret_cast<uint64_t>(a)+8,249);});
     rejected([&]{storage.check_application(regions[0].base+768,1);});
@@ -127,14 +132,14 @@ int main() {
     storage.release(whole);storage.release(remote);
     assert(storage.info(0)[3]==0 && storage.info(1)[3]==0);
     rejected([&]{storage.check_application(reinterpret_cast<uint64_t>(whole),1);});
-    storage.set_runtime_used({256,512});
+    storage.set_runtime_used(std::vector<uint64_t>(40,256));
     rejected([&]{storage.set_runtime_used({257,0});});
     assert(storage.info(0)[6]==256);
-    wse::SramStorage other;other.configure(2,4,capacity,reserve);other.freeze();
+    wse::SramStorage other;other.configure(40,4,capacity,reserve);other.freeze();
     assert(other.regions()[0].base!=regions[0].base);
     wse::SramStorage overflow;
-    uint64_t huge[]={UINT64_MAX-127,UINT64_MAX-127};
-    rejected([&]{overflow.configure(2,4,huge,reserve);});
+    uint64_t huge[40]; std::fill_n(huge,40,UINT64_MAX-127);
+    rejected([&]{overflow.configure(40,4,huge,reserve);});
 }
 """)
     binary = tmp_path / "contract"
@@ -177,7 +182,7 @@ def test_sram_default_config_generation(tmp_path):
         "simpler_configure_wse_hardware(probe)\n"
     )
     config = {
-        "hardware": {"core_count": 2, "pe_per_core": 4, "sram_bytes_per_core": [4096, 8192]},
+        "hardware": {"core_count": 40, "pe_per_core": 4, "sram_bytes_per_core": [4096, 8192] + [4096] * 38},
         "runtime": {"sram_reserve_bytes_per_core": 1024},
     }
     path = platform / "config/default_simulation.json"
@@ -191,7 +196,7 @@ def test_sram_default_config_generation(tmp_path):
     rejected = subprocess.run(command, check=False, capture_output=True, text=True, timeout=60)
     assert rejected.returncode != 0 and "Unknown WSE hardware field" in rejected.stderr
     del config["hardware"]["unknown"]
-    config["hardware"]["core_count"] = 3
+    config["hardware"]["sram_bytes_per_core"] = [4096]
     path.write_text(json.dumps(config))
     rejected = subprocess.run(command, check=False, capture_output=True, text=True, timeout=60)
     assert rejected.returncode != 0 and "array must match core_count" in rejected.stderr

@@ -26,7 +26,6 @@ public:
     uint32_t core_count() const;
     void *allocate(size_t bytes, uint32_t core, size_t alignment);
     void release(void *ptr);
-    bool touches(uint64_t address, uint64_t bytes) const;
     void check_application(uint64_t address, uint64_t bytes) const;
     std::vector<SramAllocation> allocations() const;
     std::vector<SramRegion> regions() const;
@@ -34,6 +33,7 @@ public:
     void set_runtime_used(const std::vector<uint64_t> &used);
     void reset_runtime_used() noexcept;
     void clear();
+    size_t committed_bytes() const;
 
 private:
     struct Free {

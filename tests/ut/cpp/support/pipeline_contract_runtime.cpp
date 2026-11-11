@@ -33,7 +33,7 @@ DeviceContextHandle create_device_context(void) {
 
 void destroy_device_context(DeviceContextHandle ctx) {}
 
-void *device_malloc_ctx(DeviceContextHandle ctx, size_t size) { return nullptr; }
+void *device_malloc_ctx(DeviceContextHandle ctx, size_t size, uint32_t core, size_t alignment) { return nullptr; }
 
 void device_free_ctx(DeviceContextHandle ctx, void *dev_ptr) {}
 

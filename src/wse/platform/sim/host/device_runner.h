@@ -18,7 +18,13 @@ class DeviceRunner : public SimDeviceRunnerBase {
 public:
     DeviceRunner();
     void configure_sram(uint32_t cores, uint32_t pes, const uint64_t *capacities, const uint64_t *reserves);
-    void *allocate_sram(size_t bytes, uint32_t core, size_t alignment);
+    void *allocate_tensor(size_t bytes) override;
+    void *allocate_caller_storage(size_t bytes, uint32_t core, size_t alignment) override;
+    void *allocate_graph_storage(size_t bytes) override;
+    void free_graph_storage(void *ptr) override;
+    size_t committed_device_memory() const override;
+    void *acquire_child_memory_host_view(void *ptr, size_t bytes) override;
+    int device_memset(void *ptr, int value, size_t bytes) override;
     std::vector<uint64_t> sram_query(uint32_t core) const;
     void free_tensor(void *ptr) override;
     int copy_to_device(void *ptr, const void *host, size_t bytes) override;
@@ -42,6 +48,7 @@ private:
     void cleanup_run() noexcept;
     void unload_executor();
     wse::SramStorage sram_;
+    MemoryAllocator host_graph_storage_;
     struct ActiveRun;
     std::unique_ptr<ActiveRun> active_run_;
     simpler::common::sim_host::SimRunCompletion completion_;

@@ -375,9 +375,8 @@ public:
     void configure_wse(
         uint32_t cores, uint32_t pes, const std::vector<uint64_t> &capacities, const std::vector<uint64_t> &reserves
     );
-    uint64_t malloc_sram(size_t bytes, uint32_t core, size_t alignment);
     std::vector<uint64_t> sram_query(uint32_t core);
-    uint64_t malloc(size_t size);
+    uint64_t malloc(size_t size, uint32_t core = UINT32_MAX, size_t alignment = 64);
     void free(uint64_t ptr);
     void copy_to(uint64_t dst, uint64_t src, size_t size);
     void copy_from(uint64_t dst, uint64_t src, size_t size);
@@ -592,7 +591,7 @@ public:
 private:
     using CreateDeviceContextFn = void *(*)();
     using DestroyDeviceContextFn = void (*)(void *);
-    using DeviceMallocCtxFn = void *(*)(void *, size_t);
+    using DeviceMallocCtxFn = void *(*)(void *, size_t, uint32_t, size_t);
     using DeviceFreeCtxFn = void (*)(void *, void *);
     using DeviceFreeCallerBufferCtxFn = decltype(&device_free_caller_buffer_ctx);
     using DeviceBorrowCallerBuffersCtxFn = decltype(&device_borrow_caller_buffers_ctx);

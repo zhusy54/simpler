@@ -165,7 +165,7 @@ SimDeviceRunnerBase::RunResourceStaging SimDeviceRunnerBase::build_run_resources
     // after a resize, so the table is never visible holding a null entry.
     staged.arena_banks = RunResourceSlots<std::unique_ptr<ArenaBank>>::build(granted);
     for (std::unique_ptr<ArenaBank> &bank : staged.arena_banks) {
-        bank = std::make_unique<ArenaBank>(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_);
+        bank = std::make_unique<ArenaBank>(this);
     }
     return staged;
 }
@@ -528,8 +528,13 @@ int SimDeviceRunnerBase::prepare_launch_shape(Runtime &runtime, const CallConfig
 
 void *SimDeviceRunnerBase::allocate_tensor(size_t bytes) { return mem_alloc_.alloc(bytes); }
 
-void *SimDeviceRunnerBase::allocate_caller_buffer(size_t bytes) {
-    void *ptr = allocate_tensor(bytes);
+void *SimDeviceRunnerBase::allocate_caller_storage(size_t bytes, uint32_t core, size_t alignment) {
+    if (core != UINT32_MAX || alignment != 64) throw std::invalid_argument("core placement requires WSEsim");
+    return allocate_tensor(bytes);
+}
+
+void *SimDeviceRunnerBase::allocate_caller_buffer(size_t bytes, uint32_t core, size_t alignment) {
+    void *ptr = allocate_caller_storage(bytes, core, alignment);
     if (ptr == nullptr) return nullptr;
     try {
         caller_device_buffers_.record(ptr, bytes);
@@ -764,10 +769,11 @@ int SimDeviceRunnerBase::acquire_scheduler_state_storage(
     const RetainedSchedulerStorage::Status status = scheduler_state_storage_[pipeline_slot].acquire(
         bytes, alignment,
         [this](size_t raw_bytes) {
-            return mem_alloc_.alloc(raw_bytes);
+            return allocate_graph_storage(raw_bytes);
         },
         [this](void *ptr) {
-            return mem_alloc_.free(ptr);
+            free_graph_storage(ptr);
+            return 0;
         },
         device_out, host_out
     );
@@ -783,7 +789,8 @@ int SimDeviceRunnerBase::release_scheduler_state_storage() {
     int first_error = 0;
     for (RetainedSchedulerStorage &entry : scheduler_state_storage_) {
         const int rc = entry.release([this](void *ptr) {
-            return mem_alloc_.free(ptr);
+            free_graph_storage(ptr);
+            return 0;
         });
         if (rc != 0 && first_error == 0) first_error = rc;
     }
@@ -834,7 +841,7 @@ void SimDeviceRunnerBase::release_graph_definition_staging() {
 void SimDeviceRunnerBase::clear_temporary_buffer() {
     for (size_t slot = 0; slot < retained_temp_addrs_.size(); ++slot) {
         if (retained_temp_addrs_[slot] == nullptr) continue;
-        mem_alloc_.free(retained_temp_addrs_[slot]);
+        free_tensor(retained_temp_addrs_[slot]);
         retained_temp_addrs_[slot] = nullptr;
         retained_temp_sizes_[slot] = 0;
     }

@@ -82,7 +82,7 @@ def prepare(worker, tensors):
     args = TaskArgs()
     buffers = []
     for i, t in enumerate(tensors):
-        b = worker.malloc(t.nbytes)
+        b = worker.malloc(t.nbytes, core_id=i % 40)
         buffers.append(b)
         worker.copy_to(b, t)
         args.add_tensor(
@@ -92,7 +92,9 @@ def prepare(worker, tensors):
     return args, buffers
 
 
-@pytest.mark.parametrize("cores,blocks", [(1, 1), (1, 5), (4, 3), (4, 16), (4, 19), (0, 40), (0, 160), (0, 163)])
+@pytest.mark.parametrize(
+    "cores,blocks", [(40, 1), (40, 5), (40, 39), (40, 40), (40, 159), (0, 160), (40, 161), (0, 323)]
+)
 def test_temporary_operations_keep_independent_blocks(tmp_path, st_platform, cores, blocks):
     worker = Worker(level=2, platform=st_platform, runtime="host_build_graph", device_id=0)
     try:
@@ -128,12 +130,12 @@ def test_one_waiting_pe_does_not_stall_sibling_waves(tmp_path, st_platform):
     try:
         worker.init()
         handle = worker.register(build_probe(st_platform))
-        tensors = [torch.tensor([[-2.0, 1.0], [3.0, -4.0]]), torch.full((8, 2, 2), -99.0), torch.full((8, 2), -1.0)]
+        tensors = [torch.tensor([[-2.0, 1.0], [3.0, -4.0]]), torch.full((320, 2, 2), -99.0), torch.full((320, 2), -1.0)]
         args, buffers = prepare(worker, tensors)
-        args.add_scalar(8)
+        args.add_scalar(320)
         args.add_scalar(1)
         config = CallConfig()
-        config.core_count = 1
+        config.core_count = 40
         config.output_prefix = str(tmp_path)
         run = worker.submit(handle, args, config)
         assert gate.wait_probe(), "sibling PEs did not reach their second wave while PE0 was held"
@@ -142,11 +144,11 @@ def test_one_waiting_pe_does_not_stall_sibling_waves(tmp_path, st_platform):
         gate.release_probe()
         run.wait()
         worker.copy_from(tensors[1], buffers[1])
-        torch.testing.assert_close(tensors[1], torch.relu(tensors[0] @ tensors[0]).expand(8, 2, 2), rtol=0, atol=0)
+        torch.testing.assert_close(tensors[1], torch.relu(tensors[0] @ tensors[0]).expand(320, 2, 2), rtol=0, atol=0)
         events = [json.loads(line) for line in (tmp_path / "wse_events.jsonl").read_text().splitlines()][1:]
         end = {e["block"]: e["seq"] for e in events if e["kind"] == 5}
-        assert all(end[b] < end[0] for b in (1, 2, 3))
-        assert next(e["seq"] for e in events if e["kind"] == 4 and e["block"] == 4) > end[0]
+        assert all(end[b] < end[0] for b in (40, 80, 120))
+        assert next(e["seq"] for e in events if e["kind"] == 4 and e["block"] == 160) > end[0]
         for b in buffers:
             worker.free(b)
         worker.unregister(handle)
@@ -161,10 +163,10 @@ def test_shared_state_between_independent_kernel_dsos(tmp_path, st_platform):
     try:
         worker.init()
         handle = worker.register(build_probe(st_platform, True))
-        tensors = [torch.tensor([[11.0, 12.0], [13.0, 14.0]]), torch.full((4, 2, 2), -99.0)]
+        tensors = [torch.tensor([[11.0, 12.0], [13.0, 14.0]]), torch.full((160, 2, 2), -99.0)]
         args, buffers = prepare(worker, tensors)
         config = CallConfig()
-        config.core_count = 1
+        config.core_count = 40
         config.output_prefix = str(tmp_path)
         run = worker.submit(handle, args, config)
         assert gate.wait_probe(), "consumers did not acknowledge real waits before producer publication"
@@ -175,7 +177,7 @@ def test_shared_state_between_independent_kernel_dsos(tmp_path, st_platform):
         gate.release_probe()
         run.wait()
         worker.copy_from(tensors[1], buffers[1])
-        torch.testing.assert_close(tensors[1][1:], tensors[0].expand(3, 2, 2), rtol=0, atol=0)
+        torch.testing.assert_close(tensors[1][[40, 80, 120]], tensors[0].expand(3, 2, 2), rtol=0, atol=0)
         assert torch.all(tensors[1][0] == -99)
         events = [json.loads(line) for line in (tmp_path / "wse_events.jsonl").read_text().splitlines()][1:]
         publication = next(e["seq"] for e in events if e["kind"] == 12)

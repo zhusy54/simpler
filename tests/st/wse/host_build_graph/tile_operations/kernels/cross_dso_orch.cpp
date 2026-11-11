@@ -12,12 +12,12 @@
 #include <stdexcept>
 extern "C" OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &) { return {.expected_arg_count = 2}; }
 extern "C" void aicpu_orchestration_entry(const ChipTaskArgs &a) {
-    if (rt_available_core_count() != 1) throw std::invalid_argument("probe requires one core");
+    if (rt_available_core_count() != 40) throw std::invalid_argument("probe requires forty cores");
     CoreTaskArgs producer;
     producer.add_input(a.tensor(0).ref());
     rt_submit_wse_task(0, producer);
     CoreTaskArgs consumer;
     consumer.add_output(a.tensor(1).ref());
-    consumer.launch_spec.set_block_num(4);
+    consumer.launch_spec.set_block_num(160);
     rt_submit_wse_task(1, consumer);
 }

@@ -349,9 +349,12 @@ public:
     std::thread create_thread(std::function<void()> fn, std::string name = {});
     int attach_current_thread(int device_id);
 
-    void *allocate_tensor(size_t bytes);
-    /** Total device memory (bytes) currently committed by this runner's MemoryAllocator. */
-    size_t committed_device_memory() const { return mem_alloc_.committed_bytes(); }
+    virtual void *allocate_tensor(size_t bytes);
+    virtual void *allocate_caller_storage(size_t bytes, uint32_t core, size_t alignment);
+    virtual void *allocate_graph_storage(size_t bytes) { return allocate_tensor(bytes); }
+    virtual void free_graph_storage(void *ptr) { free_tensor(ptr); }
+    /** Total physical device backing committed by this runner. */
+    virtual size_t committed_device_memory() const { return mem_alloc_.committed_bytes(); }
     virtual void free_tensor(void *dev_ptr);
     virtual int copy_to_device(void *dev_ptr, const void *host_ptr, size_t bytes);
     virtual int copy_from_device(void *host_ptr, const void *dev_ptr, size_t bytes);
@@ -362,7 +365,7 @@ public:
      * host/caller_device_buffers.h. A run's arguments may name only what a caller minted, so this
      * runner's own regions keep going through `allocate_tensor` and stay unrecorded.
      */
-    void *allocate_caller_buffer(size_t bytes);
+    void *allocate_caller_buffer(size_t bytes, uint32_t core = UINT32_MAX, size_t alignment = 64);
     int free_caller_buffer(void *dev_ptr);
 
     bool borrow_caller_buffers(uint64_t identity, const CallerDeviceBuffers::Span *spans, size_t count);
@@ -387,7 +390,7 @@ public:
     size_t caller_buffer_borrow_count() const { return caller_device_buffers_.borrow_count(); }
     size_t caller_buffer_retained_count() const { return caller_device_buffers_.retained_count(); }
 
-    int device_memset(void *dev_ptr, int value, size_t bytes);
+    virtual int device_memset(void *dev_ptr, int value, size_t bytes);
 
     /**
      * This slot's run-result region, as the address a run's device side
@@ -477,7 +480,7 @@ public:
      * containment check still runs, so a span outside every tracked allocation
      * fails closed exactly as it does onboard.
      */
-    void *acquire_child_memory_host_view(void *dev_ptr, size_t bytes);
+    virtual void *acquire_child_memory_host_view(void *dev_ptr, size_t bytes);
 
     int record_device_orch_callable(
         int32_t callable_id, uint64_t chip_buffer_hash, uint64_t chip_dev, const void *orch_so_data,
@@ -1037,9 +1040,15 @@ protected:
     // A bank's runtime pool stays unreserved when setup_static_arena was
     // invoked with runtime_arena_size == 0 (hbg path).
     static void *arena_alloc_trampoline(void *ctx, size_t size) {
-        return static_cast<MemoryAllocator *>(ctx)->alloc(size);
+        return static_cast<SimDeviceRunnerBase *>(ctx)->allocate_tensor(size);
     }
-    static void arena_free_trampoline(void *ctx, void *p) { static_cast<MemoryAllocator *>(ctx)->free(p); }
+    static void arena_free_trampoline(void *ctx, void *p) { static_cast<SimDeviceRunnerBase *>(ctx)->free_tensor(p); }
+    static void *graph_alloc_trampoline(void *ctx, size_t size) {
+        return static_cast<SimDeviceRunnerBase *>(ctx)->allocate_graph_storage(size);
+    }
+    static void graph_free_trampoline(void *ctx, void *p) {
+        static_cast<SimDeviceRunnerBase *>(ctx)->free_graph_storage(p);
+    }
     // One independently committed set of the three pooled regions per pipeline
     // slot, so preparing one bank never mutates a region the active run is
     // executing out of. `cached_*` back setup_static_arena's "fits" check —
@@ -1048,10 +1057,10 @@ protected:
     // nor movable, so the array cannot be brace-initialised without naming
     // every bank.
     struct ArenaBank {
-        ArenaBank(DeviceArena::AllocFn alloc, DeviceArena::FreeFn free_fn, void *ctx) :
-            gm_heap(alloc, free_fn, ctx),
-            gm_sm(alloc, free_fn, ctx),
-            runtime_pool(alloc, free_fn, ctx) {}
+        ArenaBank(void *ctx) :
+            gm_heap(&arena_alloc_trampoline, &arena_free_trampoline, ctx),
+            gm_sm(&graph_alloc_trampoline, &graph_free_trampoline, ctx),
+            runtime_pool(&graph_alloc_trampoline, &graph_free_trampoline, ctx) {}
 
         DeviceArena gm_heap;
         DeviceArena gm_sm;

@@ -48,19 +48,19 @@ def ffn_inputs(seed):
     row = torch.arange(128).reshape(-1, 1)
     k = torch.arange(32).reshape(1, -1)
     x = ((row + 2 * k + seed) % 5 - 2).float()
-    w1 = ((2 * torch.arange(32).reshape(-1, 1) + 3 * torch.arange(128).reshape(1, -1) + seed) % 7 - 3).float()
-    w2 = ((3 * row + torch.arange(128).reshape(1, -1) + seed) % 5 - 2).float()
+    w1 = ((2 * torch.arange(32).reshape(-1, 1) + 3 * torch.arange(1280).reshape(1, -1) + seed) % 7 - 3).float()
+    w2 = ((3 * torch.arange(1280).reshape(-1, 1) + torch.arange(1280).reshape(1, -1) + seed) % 5 - 2).float()
     h = x @ w1
     a = torch.relu(h)
     y = a @ w2
 
     def shard(t):
-        return t.reshape(128, 4, 32).permute(1, 0, 2).contiguous()
+        return t.reshape(128, 40, 32).permute(1, 0, 2).contiguous()
 
     inputs = [
         x,
-        w1.reshape(32, 4, 32).permute(1, 2, 0).contiguous(),
-        w2.reshape(4, 32, 4, 32).permute(2, 0, 3, 1).contiguous(),
+        w1.reshape(32, 40, 32).permute(1, 2, 0).contiguous(),
+        w2.reshape(40, 32, 40, 32).permute(2, 0, 3, 1).contiguous(),
     ]
     return inputs, [shard(t) for t in (h, a, y)]
 
@@ -68,19 +68,19 @@ def ffn_inputs(seed):
 def audit_ffn(path):
     rows = [json.loads(line) for line in path.read_text().splitlines()]
     header, events = rows[0], rows[1:]
-    assert header["core_count"] == 4 and header["expected_tasks"] == 5
+    assert header["core_count"] == 40 and header["expected_tasks"] == 5
     done = [e for e in events if e["kind"] == 6]
     assert len(done) == 5 and sorted(e["value"] for e in done) == [1, 2, 3, 4, 5]
     for task in (1, 2, 3):
         for kind in (4, 5):
             actual = [e for e in events if e["kind"] == kind and e["task"] == task]
-            assert sorted(e["block"] for e in actual) == list(range(16))
-            assert {(e["core"], e["pe"]) for e in actual} == {(c, p) for c in range(4) for p in range(4)}
+            assert sorted(e["block"] for e in actual) == list(range(160))
+            assert {(e["core"], e["pe"]) for e in actual} == {(c, p) for c in range(40) for p in range(4)}
     for previous, following in ((1, 2), (2, 3)):
         completed = next(e["seq"] for e in done if e["task"] == previous)
         assert completed < min(e["seq"] for e in events if e["kind"] == 4 and e["task"] == following)
-    for task, generations in ((1, 1), (3, 4)):
-        for core in range(4):
+    for task, generations in ((1, 1), (3, 40)):
+        for core in range(40):
             last_consumed = -1
             for generation in range(1, generations + 1):
                 group = [
@@ -111,10 +111,10 @@ def test_ffn_independent_pe_graph_replay(tmp_path, st_platform):
         epochs = []
         for seed in (0, 1):
             inputs, golden = ffn_inputs(seed)
-            tensors = inputs + [torch.full_like(t, -12345) for t in golden] + [torch.full((16, 2), -1.0)]
+            tensors = inputs + [torch.full_like(t, -12345) for t in golden] + [torch.full((160, 2), -1.0)]
             args = TaskArgs()
             for index, tensor in enumerate(tensors):
-                buffer = worker.malloc(tensor.nbytes)
+                buffer = worker.malloc(tensor.nbytes, core_id=len(buffers) % 40)
                 buffers.append(buffer)
                 worker.copy_to(buffer, tensor)
                 args.add_tensor(
@@ -122,7 +122,7 @@ def test_ffn_independent_pe_graph_replay(tmp_path, st_platform):
                     TensorArgType.INPUT if index < 3 else TensorArgType.OUTPUT_EXISTING,
                 )
             config = CallConfig()
-            config.core_count = 4
+            config.core_count = 40
             config.output_prefix = str(tmp_path / str(seed))
             config.enable_dep_gen = True
             worker.run(handle, args, config)
@@ -130,7 +130,7 @@ def test_ffn_independent_pe_graph_replay(tmp_path, st_platform):
                 worker.copy_from(tensors[index], buffers[index])
                 torch.testing.assert_close(tensors[index], expected, rtol=0, atol=0)
             worker.copy_from(tensors[6], buffers[6])
-            assert tensors[6].tolist() == [[b % 4, b // 4] for b in range(16)]
+            assert tensors[6].tolist() == [[b % 40, b // 40] for b in range(160)]
             epochs.append(audit_ffn(tmp_path / str(seed) / "wse_events.jsonl"))
             assert (tmp_path / str(seed) / "deps.json").is_file()
             for buffer in buffers:
@@ -150,11 +150,11 @@ def test_ffn_pending_runs_keep_separate_shared_state(tmp_path, st_platform):
         handle = worker.register(build_ffn(st_platform))
         for seed in (3, 4):
             inputs, golden = ffn_inputs(seed)
-            tensors = inputs + [torch.full_like(t, -12345) for t in golden] + [torch.full((16, 2), -1.0)]
+            tensors = inputs + [torch.full_like(t, -12345) for t in golden] + [torch.full((160, 2), -1.0)]
             args = TaskArgs()
             buffers = []
             for index, tensor in enumerate(tensors):
-                buffer = worker.malloc(tensor.nbytes)
+                buffer = worker.malloc(tensor.nbytes, core_id=len(buffers) % 40)
                 buffers.append(buffer)
                 worker.copy_to(buffer, tensor)
                 args.add_tensor(
@@ -162,7 +162,7 @@ def test_ffn_pending_runs_keep_separate_shared_state(tmp_path, st_platform):
                     TensorArgType.INPUT if index < 3 else TensorArgType.OUTPUT_EXISTING,
                 )
             config = CallConfig()
-            config.core_count = 4
+            config.core_count = 40
             config.output_prefix = str(tmp_path / str(seed))
             run = worker.submit(handle, args, config)
             pending.append((seed, run, args, buffers, tensors, golden))

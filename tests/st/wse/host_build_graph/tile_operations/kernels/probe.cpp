@@ -31,5 +31,5 @@ extern "C" void kernel_entry(int64_t *args) {
     wse::TSTORE({pointer(1) + block * 4, 4, 2, 2, 2, 1}, c);
     pointer(2)[block * 2] = get_core_id(args);
     pointer(2)[block * 2 + 1] = get_pe_id(args);
-    if (gated && block != 0) hook(block);
+    if (gated && get_core_id(args) == 0 && block != 0) hook(block / 40);
 }

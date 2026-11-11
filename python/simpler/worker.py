@@ -12830,23 +12830,34 @@ class Worker:
         )
         return {name: int(value) for name, value in zip(names, values, strict=True)}
 
-    def malloc_sram(self, size: int, *, core_id: int, alignment: int = 64) -> Buffer:
-        """Allocate a caller-owned buffer in one WSE core's SRAM application partition."""
+    def malloc(self, size: int, *, core_id: int | None = None, alignment: int = 64) -> Buffer:
+        """Allocate a device Buffer; WSE requires an explicit SRAM core owner.
+
+        Name task arguments with ``buffer.tensor(...)`` and release with ``free``.
+        Other platforms retain their device-wide allocation without a core owner.
+        """
         if self.level != 2:
-            raise TypeError("SRAM allocation requires a direct L2 Worker")
-        if any(type(v) is not int for v in (size, core_id, alignment)) or size <= 0 or core_id < 0:
-            raise ValueError("invalid SRAM size/core/alignment")
-        if alignment <= 0 or alignment & (alignment - 1):
-            raise ValueError("SRAM alignment must be a positive power of two")
-        with self._operation_lease("malloc_sram"), self._device_control_admission("malloc_sram"):
-            identity = self._burn_buffer_identity()
+            raise TypeError("worker.malloc is L2-only; at L3+ use worker.alloc_child_tensor(worker_id, ...)")
+        if self._config.get("platform") == "wsesim" and core_id is None:
+            raise ValueError("WSE malloc requires an explicit core_id owner")
+        if core_id is not None and (type(core_id) is not int or not 0 <= core_id < 0xFFFFFFFF):
+            raise ValueError("invalid allocation core_id")
+        if type(alignment) is not int or alignment <= 0 or alignment & (alignment - 1):
+            raise ValueError("alignment must be a positive power of two")
+        with self._operation_lease("malloc"), self._device_control_admission("malloc"):
             assert self._chip_worker is not None
+            identity = self._burn_buffer_identity()
             with self._child_prov_lock:
-                ptr = int(self._chip_worker.malloc_sram(size, core_id, alignment))
+                if core_id is None and alignment == 64:
+                    ptr = int(self._chip_worker.malloc(int(size)))
+                else:
+                    ptr = int(
+                        self._chip_worker.malloc(int(size), core_id if core_id is not None else 0xFFFFFFFF, alignment)
+                    )
                 try:
                     handle = wrap_device_malloc(
                         ptr,
-                        size,
+                        int(size),
                         bytes(identity.owner_instance_id),
                         int(identity.buffer_id),
                         f"L{self.level}",
@@ -12858,35 +12869,6 @@ class Worker:
                     self._drop_device_alloc(identity)
                     self._chip_worker.free(ptr)
                     raise
-        return handle
-
-    def malloc(self, size: int) -> Buffer:
-        """Allocate device memory on this L2 worker's own chip; returns a DEVICE_MALLOC ``Buffer``.
-
-        Name a task arg with ``handle.tensor(shapes, dtype)`` and release with ``worker.free(handle)``. L3+
-        allocates child device memory with ``alloc_child_tensor(worker_id, ...)`` instead — a Worker is
-        the only allocator, the Orchestrator never allocates.
-        """
-        if self.level != 2:
-            raise TypeError("worker.malloc is L2-only; at L3+ use worker.alloc_child_tensor(worker_id, ...)")
-        with self._operation_lease("malloc"):
-            assert self._chip_worker is not None
-            # Burned before native malloc. A failed malloc leaves that id unused.
-            identity = self._burn_buffer_identity()
-            # L2 is a single chip; worker_id is meaningless there, so the provenance is keyed
-            # on the canonical worker 0.
-            with self._child_prov_lock:
-                ptr = int(self._chip_worker.malloc(int(size)))
-                handle = wrap_device_malloc(
-                    ptr,
-                    int(size),
-                    bytes(identity.owner_instance_id),
-                    int(identity.buffer_id),
-                    f"L{self.level}",
-                    generation=int(identity.generation),
-                    owner_worker_id=0,
-                )
-                self._record_device_alloc(handle)
         return handle
 
     def alloc_child_tensor(self, worker_id: int, shapes: tuple[int, ...], dtype) -> Buffer:

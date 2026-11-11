@@ -706,8 +706,8 @@ size_t get_runtime_size(void) { return sizeof(OnboardNativeRunContext); }
 
 size_t get_runtime_alignment(void) { return alignof(OnboardNativeRunContext); }
 
-void *device_malloc_ctx(DeviceContextHandle ctx, size_t size) {
-    if (ctx == NULL) return NULL;
+void *device_malloc_ctx(DeviceContextHandle ctx, size_t size, uint32_t core, size_t alignment) {
+    if (ctx == NULL || core != UINT32_MAX || alignment != 64) return NULL;
     try {
         return static_cast<DeviceRunnerBase *>(ctx)->allocate_caller_buffer(size);
     } catch (...) {

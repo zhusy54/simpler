@@ -110,15 +110,6 @@ void SramStorage::release(void *ptr) {
     regions_[a.core].available.swap(next);
     allocations_.erase(it);
 }
-bool SramStorage::touches(uint64_t address, uint64_t bytes) const {
-    std::scoped_lock lock(mutex_);
-    if (bytes > UINT64_MAX - address) throw std::invalid_argument("address overflow");
-    for (size_t i = 0; i < regions_.size(); ++i) {
-        const auto base = reinterpret_cast<uint64_t>(regions_[i].data.get());
-        if (address < base + capacities_[i] && (address >= base || address + bytes > base)) return true;
-    }
-    return false;
-}
 void SramStorage::check_application(uint64_t address, uint64_t bytes) const {
     std::scoped_lock lock(mutex_);
     auto it = allocations_.upper_bound(address);
@@ -174,6 +165,14 @@ void SramStorage::reset_runtime_used() noexcept {
     std::scoped_lock lock(mutex_);
     for (auto &region : regions_)
         region.runtime_used = 0;
+}
+size_t SramStorage::committed_bytes() const {
+    std::scoped_lock lock(mutex_);
+    size_t bytes = 0;
+    if (!regions_.empty())
+        for (auto capacity : capacities_)
+            bytes += capacity;
+    return bytes;
 }
 void SramStorage::clear() {
     std::scoped_lock lock(mutex_);

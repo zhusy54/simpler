@@ -449,7 +449,7 @@ def kernel_symbol_runtime(tmp_path_factory):
                     "static int memory_calls = 0, allocated = 0;\n"
                     "static unsigned char backing[64][64];\n"
                     'extern "C" int test_memory_calls() { return memory_calls; }\n'
-                    "void *device_malloc_ctx(DeviceContextHandle, size_t bytes) {\n"
+                    "void *device_malloc_ctx(DeviceContextHandle, size_t bytes, uint32_t, size_t) {\n"
                     "    ++memory_calls; if (bytes > 64 || allocated == 64) std::abort();\n"
                     "    return backing[allocated++];\n"
                     "}\n"

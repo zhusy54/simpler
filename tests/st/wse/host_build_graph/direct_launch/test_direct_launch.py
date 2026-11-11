@@ -63,7 +63,7 @@ def audit_events(path, cores, blocks):
 
 
 @pytest.mark.parametrize(
-    "cores,blocks", [(1, 1), (1, 4), (1, 9), (4, 4), (4, 16), (4, 19), (0, 40), (0, 160), (0, 163)]
+    "cores,blocks", [(40, 1), (40, 4), (40, 9), (40, 39), (40, 40), (40, 159), (0, 160), (40, 161), (0, 323)]
 )
 def test_mixed_entry_and_independent_blocks(tmp_path, cores, blocks, st_platform):
     worker = Worker(level=2, platform=st_platform, runtime="host_build_graph", device_id=0)
@@ -76,7 +76,7 @@ def test_mixed_entry_and_independent_blocks(tmp_path, cores, blocks, st_platform
         tensors = [a, b, torch.full((blocks, 32, 32), -1.0), torch.full((blocks, 2), -1.0)]
         args = TaskArgs()
         for index, tensor in enumerate(tensors):
-            buffer = worker.malloc(tensor.nbytes)
+            buffer = worker.malloc(tensor.nbytes, core_id=len(buffers) % 40)
             buffers.append(buffer)
             worker.copy_to(buffer, tensor)
             args.add_tensor(
@@ -123,7 +123,7 @@ def build_graph(platform):
     )
 
 
-@pytest.mark.parametrize("cores", [4, 40])
+@pytest.mark.parametrize("cores", [40])
 def test_graph_record_replay_and_rebinding(tmp_path, cores, st_platform):
     worker = Worker(level=2, platform=st_platform, runtime="host_build_graph", device_id=0)
     try:
@@ -135,7 +135,7 @@ def test_graph_record_replay_and_rebinding(tmp_path, cores, st_platform):
             buffers = []
             args = TaskArgs()
             for tensor in tensors:
-                buffer = worker.malloc(tensor.nbytes)
+                buffer = worker.malloc(tensor.nbytes, core_id=len(buffers) % 40)
                 buffers.append(buffer)
                 worker.copy_to(buffer, tensor)
                 args.add_tensor(buffer.tensor(shapes=tuple(tensor.shape), dtype=DataType.FLOAT32), TensorArgType.INOUT)
@@ -185,12 +185,12 @@ def test_empty_graph_retires_all_members(tmp_path, st_platform):
         worker.init()
         handle = worker.register(chip)
         config = CallConfig()
-        config.core_count = 4
+        config.core_count = 40
         config.output_prefix = str(tmp_path)
         worker.run(handle, TaskArgs(), config)
         rows = [json.loads(line) for line in (tmp_path / "wse_events.jsonl").read_text().splitlines()]
         assert rows[0]["expected_tasks"] == 0
-        assert len([row for row in rows[1:] if row["kind"] == 7]) == 16
+        assert len([row for row in rows[1:] if row["kind"] == 7]) == 160
         assert not [row for row in rows[1:] if row["kind"] in (4, 5, 6)]
         assert len([row for row in rows[1:] if row["kind"] == 9]) == 1
         worker.unregister(handle)

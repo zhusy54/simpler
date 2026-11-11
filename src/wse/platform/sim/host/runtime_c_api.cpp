@@ -82,12 +82,6 @@ extern "C" int wse_configure_ctx(
         static_cast<DeviceRunner *>(ctx)->configure_sram(cores, pes, capacities, reserves);
     });
 }
-extern "C" int
-wse_malloc_sram_ctx(void *ctx, size_t bytes, uint32_t core, size_t alignment, uint64_t *out, char *error, size_t size) {
-    return sram_call(error, size, [&] {
-        *out = reinterpret_cast<uint64_t>(static_cast<DeviceRunner *>(ctx)->allocate_sram(bytes, core, alignment));
-    });
-}
 extern "C" int wse_sram_query_ctx(void *ctx, uint32_t core, uint64_t *out, size_t count, char *error, size_t size) {
     int needed = 0;
     const int rc = sram_call(error, size, [&] {

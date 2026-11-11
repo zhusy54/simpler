@@ -610,7 +610,8 @@ size_t get_runtime_alignment(void);
  * makes `device_free_caller_buffer_ctx` able to refuse a release a run still needs. Memory the
  * context allocates for itself does not come through here and is not nameable by a run.
  */
-void *device_malloc_ctx(DeviceContextHandle ctx, size_t size);
+// WSE requires an explicit core owner; device-wide platforms use UINT32_MAX and alignment 64.
+void *device_malloc_ctx(DeviceContextHandle ctx, size_t size, uint32_t core, size_t alignment);
 
 /** Free device memory previously allocated in the given device context. */
 void device_free_ctx(DeviceContextHandle ctx, void *dev_ptr);

@@ -42,31 +42,36 @@ void DeviceRunner::arm_host_dep_gen_capture(bool enabled) { dep_gen_host_graph_s
 void DeviceRunner::configure_sram(uint32_t cores, uint32_t pes, const uint64_t *capacities, const uint64_t *reserves) {
     sram_.configure(cores, pes, capacities, reserves);
 }
-void *DeviceRunner::allocate_sram(size_t bytes, uint32_t core, size_t alignment) {
-    auto *ptr = sram_.allocate(bytes, core, alignment);
-    try {
-        caller_device_buffers_.record(ptr, bytes);
-    } catch (...) {
-        sram_.release(ptr);
-        throw;
-    }
+void *DeviceRunner::allocate_tensor(size_t bytes) {
+    // Internal tensor temporaries and graph-created data have Core0 application ownership.
+    return sram_.allocate(bytes, 0, 1024);
+}
+void *DeviceRunner::allocate_caller_storage(size_t bytes, uint32_t core, size_t alignment) {
+    return sram_.allocate(bytes, core, alignment);
+}
+void *DeviceRunner::allocate_graph_storage(size_t bytes) { return host_graph_storage_.alloc(bytes); }
+void DeviceRunner::free_graph_storage(void *ptr) { host_graph_storage_.free(ptr); }
+size_t DeviceRunner::committed_device_memory() const { return sram_.committed_bytes(); }
+void *DeviceRunner::acquire_child_memory_host_view(void *ptr, size_t bytes) {
+    sram_.check_application(reinterpret_cast<uint64_t>(ptr), bytes);
     return ptr;
+}
+int DeviceRunner::device_memset(void *ptr, int value, size_t bytes) {
+    sram_.check_application(reinterpret_cast<uint64_t>(ptr), bytes);
+    return SimDeviceRunnerBase::device_memset(ptr, value, bytes);
 }
 std::vector<uint64_t> DeviceRunner::sram_query(uint32_t core) const {
     return core == UINT32_MAX ? sram_.configuration() : sram_.info(core);
 }
 void DeviceRunner::free_tensor(void *ptr) {
-    if (sram_.touches(reinterpret_cast<uint64_t>(ptr), 1)) sram_.release(ptr);
-    else SimDeviceRunnerBase::free_tensor(ptr);
+    if (ptr) sram_.release(ptr);
 }
 int DeviceRunner::copy_to_device(void *ptr, const void *host, size_t bytes) {
-    if (sram_.touches(reinterpret_cast<uint64_t>(ptr), bytes))
-        sram_.check_application(reinterpret_cast<uint64_t>(ptr), bytes);
+    sram_.check_application(reinterpret_cast<uint64_t>(ptr), bytes);
     return SimDeviceRunnerBase::copy_to_device(ptr, host, bytes);
 }
 int DeviceRunner::copy_from_device(void *host, const void *ptr, size_t bytes) {
-    if (sram_.touches(reinterpret_cast<uint64_t>(ptr), bytes))
-        sram_.check_application(reinterpret_cast<uint64_t>(ptr), bytes);
+    sram_.check_application(reinterpret_cast<uint64_t>(ptr), bytes);
     return SimDeviceRunnerBase::copy_from_device(host, ptr, bytes);
 }
 
@@ -329,7 +334,7 @@ int DeviceRunner::finalize() {
     }
 
     sram_.clear();
-    mem_alloc_.finalize();
+    host_graph_storage_.finalize();
     clear_cpu_sim_shared_storage();
 
     device_id_ = -1;

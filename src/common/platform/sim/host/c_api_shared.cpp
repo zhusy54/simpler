@@ -585,10 +585,10 @@ size_t get_runtime_size(void) { return sizeof(SimNativeRunContext); }
 
 size_t get_runtime_alignment(void) { return alignof(SimNativeRunContext); }
 
-void *device_malloc_ctx(DeviceContextHandle ctx, size_t size) {
+void *device_malloc_ctx(DeviceContextHandle ctx, size_t size, uint32_t core, size_t alignment) {
     if (ctx == NULL) return NULL;
     try {
-        return static_cast<SimDeviceRunnerBase *>(ctx)->allocate_caller_buffer(size);
+        return static_cast<SimDeviceRunnerBase *>(ctx)->allocate_caller_buffer(size, core, alignment);
     } catch (...) {
         return NULL;
     }

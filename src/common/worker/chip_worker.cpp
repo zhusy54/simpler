@@ -2450,17 +2450,6 @@ void ChipWorker::configure_wse(
     if (fn(device_ctx_, cores, pes, capacities.data(), reserves.data(), error, sizeof(error)) != 0)
         throw std::runtime_error(error);
 }
-uint64_t ChipWorker::malloc_sram(size_t bytes, uint32_t core, size_t alignment) {
-    if (!initialized_) throw std::runtime_error("ChipWorker is not initialized");
-    validate_execution_context();
-    using Fn = int (*)(void *, size_t, uint32_t, size_t, uint64_t *, char *, size_t);
-    auto fn = runtime_module_->optional<Fn>("wse_malloc_sram_ctx");
-    if (!fn) throw std::runtime_error("SRAM allocation requires WSEsim");
-    uint64_t ptr = 0;
-    char error[512]{};
-    if (fn(device_ctx_, bytes, core, alignment, &ptr, error, sizeof(error)) != 0) throw std::runtime_error(error);
-    return ptr;
-}
 std::vector<uint64_t> ChipWorker::sram_query(uint32_t core) {
     if (!initialized_) throw std::runtime_error("ChipWorker is not initialized");
     validate_execution_context();
@@ -2475,12 +2464,12 @@ std::vector<uint64_t> ChipWorker::sram_query(uint32_t core) {
     return result;
 }
 
-uint64_t ChipWorker::malloc(size_t size) {
+uint64_t ChipWorker::malloc(size_t size, uint32_t core, size_t alignment) {
     if (!initialized_) {
         throw std::runtime_error("ChipWorker not initialized; call init() first");
     }
     validate_execution_context();
-    void *ptr = device_malloc_ctx_fn_(device_ctx_, size);
+    void *ptr = device_malloc_ctx_fn_(device_ctx_, size, core, alignment);
     if (ptr == nullptr) {
         throw std::runtime_error("malloc failed");
     }

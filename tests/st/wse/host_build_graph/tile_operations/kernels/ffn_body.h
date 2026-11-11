@@ -26,7 +26,7 @@ ffn_view(int64_t *args, int index, size_t offset, size_t row_stride = 32, size_t
 }
 inline void ffn_compute(int64_t *args, int stage) {
     const auto block = get_block_idx(args);
-    const size_t row = block / 4, column = block % 4;
+    const size_t row = block / 40, column = block % 40;
     const size_t output_offset = column * 128 * 32 + row * 32 * 32;
     using Tile = wse::Tile<32, 32>;
     Tile a, result;
@@ -37,7 +37,7 @@ inline void ffn_compute(int64_t *args, int stage) {
         return;
     }
     wse::SharedTile<Tile> weights(get_pe_id(args), stage == 0 ? 0 : 1, 0, 15, get_wse_operation_trace(args));
-    const size_t chunks = stage == 0 ? 1 : 4;
+    const size_t chunks = stage == 0 ? 1 : 40;
     for (size_t k = 0; k < chunks; ++k) {
         if (row == 0) {
             Tile weight;

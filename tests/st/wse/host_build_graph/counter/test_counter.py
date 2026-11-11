@@ -53,7 +53,7 @@ def prepare(worker, base, split, gated=False):
     ]
     args, buffers = TaskArgs(), []
     for index, tensor in enumerate(tensors):
-        buffer = worker.malloc(tensor.nbytes)
+        buffer = worker.malloc(tensor.nbytes, core_id=len(buffers) % 40)
         worker.copy_to(buffer, tensor)
         buffers.append(buffer)
         view = buffer.tensor(
@@ -120,7 +120,7 @@ def config_for(path, cores):
     return config
 
 
-@pytest.mark.parametrize("cores,split", [(1, False), (2, False), (4, False), (0, False), (1, True), (4, True)])
+@pytest.mark.parametrize("cores,split", [(40, False), (0, False), (40, True)])
 def test_counter_graph_rebind_and_reuse(tmp_path, st_platform, cores, split):
     worker = Worker(level=2, platform=st_platform, runtime="host_build_graph", device_id=0)
     try:
@@ -162,7 +162,7 @@ def test_counter_wait_timeout_and_close(tmp_path, st_platform):
         handle = worker.register(build_counter(st_platform))
         args, buffers, tensors = prepare(worker, 29, True, gated=True)
         path = tmp_path / "run"
-        run = worker.submit(handle, args, config_for(path, 1))
+        run = worker.submit(handle, args, config_for(path, 40))
         assert gate.wait_probe(), "producer and consumers must be simultaneously active"
         with pytest.raises(TimeoutError):
             run.wait(timeout=0.01)
@@ -171,14 +171,14 @@ def test_counter_wait_timeout_and_close(tmp_path, st_platform):
                 worker.free(buffer)
         gate.release_probe()
         run.wait()
-        check(worker, buffers, tensors, 29, 1, path, True)
+        check(worker, buffers, tensors, 29, 40, path, True)
         args2, _, _ = prepare(worker, 41, False)
-        worker.submit(handle, args2, config_for(tmp_path / "close", 1))
+        worker.submit(handle, args2, config_for(tmp_path / "close", 40))
         worker.close()
         closed = [json.loads(line) for line in (tmp_path / "close/wse_events.jsonl").read_text().splitlines()][1:]
         assert len([e for e in closed if e["kind"] == 9]) == 1
-        assert len([e for e in closed if e["kind"] == 8]) == 1
-        assert len([e for e in closed if e["kind"] == 7]) == 4
+        assert len([e for e in closed if e["kind"] == 8]) == 40
+        assert len([e for e in closed if e["kind"] == 7]) == 160
     finally:
         gate.release_probe()
         worker.close()
@@ -195,10 +195,10 @@ def test_counter_pending_runs_and_device_isolation(tmp_path, st_platform):
                 base = 50 * device + index * 7
                 args, buffers, tensors = prepare(worker, base, True)
                 path = tmp_path / f"{device}-{index}"
-                pending.append((worker.submit(handle, args, config_for(path, 4)), buffers, tensors, base, path))
+                pending.append((worker.submit(handle, args, config_for(path, 40)), buffers, tensors, base, path))
             for run, buffers, tensors, base, path in reversed(pending):
                 run.wait()
-                check(worker, buffers, tensors, base, 4, path, True)
+                check(worker, buffers, tensors, base, 40, path, True)
                 for buffer in buffers:
                     worker.free(buffer)
             worker.unregister(handle)
@@ -213,7 +213,7 @@ def test_counter_rejects_round_target_overflow(tmp_path, st_platform):
         handle = worker.register(build_counter(st_platform))
         base = (1 << 64) - 2
         args, buffers, tensors = prepare(worker, base, False)
-        worker.run(handle, args, config_for(tmp_path, 1))
+        worker.run(handle, args, config_for(tmp_path, 40))
         for buffer, tensor in zip(buffers, tensors, strict=True):
             worker.copy_from(tensor, buffer)
         assert tensors[0].tolist() == [991, 992, base, 0, 0, 993]

@@ -461,11 +461,7 @@ static int32_t read_runtime_status(const Runtime *runtime, const HostApi *api, S
         return 0;
     }
 
-    int hdr_rc = api->copy_from_device(host_header, device_sm, sizeof(SharedMemoryHeader));
-    if (hdr_rc != 0) {
-        LOG_WARN("Failed to copy the shared-memory header from device");
-        return 0;
-    }
+    std::memcpy(host_header, device_sm, sizeof(SharedMemoryHeader));
 
     int32_t sched_error_code = host_header->sched_error_code.load(std::memory_order_relaxed);
     return runtime_status_from_error_code(sched_error_code);
@@ -1841,29 +1837,12 @@ extern "C" int publish_run_image_impl(Runtime *runtime, const HostApi *api) {
         LOG_ERROR("publish_run_image_impl: no prepared runtime image to publish");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    // The slot owns snapshots before this local record is destroyed. Onboard launch
-    // publishes them on its AICPU stream before the descriptor and entry fork;
-    // the large execution image stays on the prepare path to overlap execution.
-    std::vector<HostMetadataRegion> metadata;
-    metadata.reserve(publication.prerequisites.size());
+    // Host templates remain valid through SRAM execution-image construction.
     for (const auto &region : publication.prerequisites)
-        metadata.push_back({region.device_target, region.source, region.bytes});
-    const int metadata_rc = api->stage_launch_metadata(metadata.data(), metadata.size());
-    if (metadata_rc != 0) {
-        LOG_ERROR("host-orch: launch metadata staging failed: %d", metadata_rc);
-        return metadata_rc;
-    }
+        std::memcpy(region.device_target, region.source, region.bytes);
     const BindPhaseMark h2d_phase = bind_phase_begin();
-    if (api->copy_to_device(publication.device_target, publication.source, publication.bytes) != 0) {
-        // A failed copy is not a copy that did nothing: how much of the
-        // destination it modified is unknown, so the bytes there are neither
-        // this run's image nor whatever preceded it.
-        LOG_ERROR(
-            "host-orch: H2D of the runtime image failed; [%p, +%" PRIu64 ") is left in an unknown state",
-            publication.device_target, publication.bytes
-        );
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
+    // This is the Host preparation template; the PE executor builds its SRAM image before GO.
+    std::memcpy(publication.device_target, publication.source, publication.bytes);
     {
         // The image size and the task count are on the descriptor this bind
         // filled, and the copied zone is what the length has left over, so only

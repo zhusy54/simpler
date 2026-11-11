@@ -72,7 +72,7 @@
       "source": "src/a5/platform/sim/host/device_runner.cpp",
       "destination": "src/wse/platform/sim/host/device_runner.cpp",
       "baseline_sha256": "620853d3e8e64d9021935b82921c5a1a8a3eb1bfe7fb4eb3922c38c914ff671e",
-      "sha256": "2caf090d6cd11490b9f79e56e022cf9e6a951eb05860f09ae584efe411b6fde7",
+      "sha256": "8182259346ef3b2a770f225a4eb8cb3683d5472e9416a4a8c8fcfa3502c5703b",
       "reason": "derived WSE implementation with configurable topology and finite SRAM execution",
       "step00_sha256": "620853d3e8e64d9021935b82921c5a1a8a3eb1bfe7fb4eb3922c38c914ff671e",
       "step01_sha256": "865c801d8ee2201a672f6185a58586d57fc27c4bc627118fa3929692b7a1825a"
@@ -81,7 +81,7 @@
       "source": "src/a5/platform/sim/host/device_runner.h",
       "destination": "src/wse/platform/sim/host/device_runner.h",
       "baseline_sha256": "54f7b460fe979734167abd8ababe9a6391ad25108ee20e4ef9716b10c010862f",
-      "sha256": "b1de5aae6503e99dbb45bfffca310132e1db022a81cd75e202805f72bb73ee54",
+      "sha256": "d5dccfa354b60c98b9f57c4c726d9d8792ec277f6172526316d5352f2846bd80",
       "reason": "derived WSE implementation with configurable topology and finite SRAM execution",
       "step00_sha256": "4d9a687a4b5a63e66089e4b7a1b89c10264287de4d045b36b192de2cd595d64d"
     },
@@ -96,7 +96,7 @@
       "source": "src/a5/platform/sim/host/runtime_c_api.cpp",
       "destination": "src/wse/platform/sim/host/runtime_c_api.cpp",
       "baseline_sha256": "09c7ab9a3b4b7e76a4e4c55b7c070b1b17e168d2f12cf667135e01b5c5e88087",
-      "sha256": "78be8eb1b46c9203df264a35098610d7a8d9e5634a92a8014829e4a300b86f67",
+      "sha256": "2b7625d7732f3ff3b44e838085fc484ba4e087e3f200e518d5d114020f678212",
       "reason": "derived WSE implementation with configurable topology and finite SRAM execution",
       "step00_sha256": "09c7ab9a3b4b7e76a4e4c55b7c070b1b17e168d2f12cf667135e01b5c5e88087"
     },
@@ -143,7 +143,7 @@
       "source": "src/a5/runtime/host_build_graph/host/runtime_maker.cpp",
       "destination": "src/wse/runtime/host_build_graph/host/runtime_maker.cpp",
       "baseline_sha256": "f9a3d1817a6068f12f2097c8f85818a8a3e28a2027024de5354479b2fed56660",
-      "sha256": "4356e3f39f0080ab9da96150df190ace11706900c3759e75d2a06f27085e16c7",
+      "sha256": "1130c3cf18c1de9f30f686f2529db9a820bd7200a7a4157cbe30d38f33664f72",
       "reason": "derived WSE implementation; common Host layout declarations retained where required",
       "step00_sha256": "f9a3d1817a6068f12f2097c8f85818a8a3e28a2027024de5354479b2fed56660"
     },

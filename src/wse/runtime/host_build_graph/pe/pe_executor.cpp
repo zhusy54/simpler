@@ -143,7 +143,7 @@ struct WseRun {
                 const auto &r = storage[i];
                 if (address < r.base + r.capacity && (address >= r.base || address + bytes > r.base)) is_sram = true;
             }
-            if (!is_sram) return;
+            if (!is_sram) throw std::invalid_argument("WSE tensor must reside in SRAM");
             for (uint32_t i = 0; i < allocation_count; ++i) {
                 const auto &a = allocations[i];
                 if (address < a.base || address - a.base > a.bytes || bytes > a.bytes - (address - a.base)) continue;
